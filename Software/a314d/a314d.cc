@@ -51,7 +51,7 @@
 #define LOGLEVEL_WARNING    40
 #define LOGLEVEL_ERROR      50
 
-static int loglevel = LOGLEVEL_INFO;
+static int loglevel = LOGLEVEL_TRACE;
 
 #define logger_trace(...) do { if (loglevel <= LOGLEVEL_TRACE) fprintf(stdout, __VA_ARGS__); } while (0)
 #define logger_debug(...) do { if (loglevel <= LOGLEVEL_DEBUG) fprintf(stdout, __VA_ARGS__); } while (0)
