@@ -446,6 +446,8 @@ static void load_config_file(const char *filename)
 #define S_D2 S_WP
 #define S_D3 S_HOLD
 
+void DumpBuffer(const uint8_t* buffer, uint32_t size);
+
 static int init_spi()
 {
     if (gpioInitialise() < 0)
@@ -483,14 +485,24 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
+    logger_trace("spi_transfer(%ld bytes)\n", len);
+    logger_trace("{\n");
+
     spiBegin(spi);
+
+    logger_trace("  TX:\n");
+    DumpBuffer(tx_buf, len);
 
     for (int i=0; i<len; i++)
     {
         rx_buf[i] = spiXfer(spi, tx_buf[i]);
     }
 
+    logger_trace("  RX:\n");
+    DumpBuffer(rx_buf, len);
+
     spiEnd(spi);
+    logger_trace("}\n");
     return 0;
 }
 #else
@@ -2225,3 +2237,56 @@ int main(int argc, char **argv)
     shutdown_driver();
     return 0;
 }
+
+#if defined(TF4060)
+void DumpBuffer(const uint8_t* buffer, uint32_t size)
+{
+    uint32_t i, j, len;
+    char format[150];
+    char alphas[27];
+    strcpy(format, "    [%03lx]: %04lx %04lx %04lx %04lx %04lx %04lx %04lx %04lx ");
+
+    for (i = 0; i < size; i += 16) {
+        len = size - i;
+
+        // last line is less than 16 bytes? rewrite the format string
+        if (len < 16) {
+            strcpy(format, "    [%03lx]: ");
+
+            for (j = 0; j < 16; j+=2) {
+                if (j < len) {
+                    strcat(format, "%04lx");
+
+                } else {
+                    strcat(format, "____");
+                }
+
+                strcat(format, " ");
+            }
+
+        } else {
+            len = 16;
+        }
+
+        // create the ascii representation
+        for (j = 0; j < len; ++j) {
+            alphas[j] = (isalnum(buffer[i + j]) ? buffer[i + j] : '.');
+        }
+
+        for (; j < 16; ++j) {
+            alphas[j] = '_';
+        }
+
+        alphas[j] = 0;
+
+        j = strlen(format);
+        sprintf(format + j, "'%s'\n", alphas);
+
+        uint16_t* p = (uint16_t*)&buffer[i];
+        logger_trace(format, i,
+           htons(p[0]), htons(p[1]), htons(p[2]), htons(p[3]), htons(p[4]), htons(p[5]), htons(p[6]), htons(p[7]));
+
+        format[j] = '\0';
+    }
+}
+#endif
