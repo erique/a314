@@ -6,3 +6,4 @@ if [[ ! -n "$result" ]]; then
 fi
 
 docker run --volume "$PWD":/host --workdir /host -it --rm a314 /bin/bash -c "make -C Software"
+docker run --volume "$PWD":/host --workdir /host -it --rm a314 /bin/bash -c "make -C Software -f Makefile-amiga"
