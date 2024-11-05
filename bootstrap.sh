@@ -9,9 +9,13 @@ cd /tmp/vbcc
 
 wget http://aminet.net/dev/misc/NDK3.2.lha
 7z x NDK3.2.lha -obuild/ndk32
+chmod -R 755 build/ndk32
 
 sudo cp -r build/vbcc  /opt/vbcc
 sudo cp -r build/ndk32 /opt/ndk32
+
+sudo chown -R $USER /opt/vbcc
+sudo chown -R $USER /opt/ndk32
 
 cd ~
 rm -rf /tmp/vbcc
