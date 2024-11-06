@@ -40,13 +40,18 @@
 #error The MODEL_XX flags cannot be combined
 #endif
 
+#if defined(TF4060)
+#include "fomu-flash/rpi.h"
+#include "fomu-flash/spi.h"
+#endif
+
 #define LOGLEVEL_TRACE      10
 #define LOGLEVEL_DEBUG      20
 #define LOGLEVEL_INFO       30
 #define LOGLEVEL_WARNING    40
 #define LOGLEVEL_ERROR      50
 
-static int loglevel = LOGLEVEL_INFO;
+static int loglevel = LOGLEVEL_TRACE;
 
 #define logger_trace(...) do { if (loglevel <= LOGLEVEL_TRACE) fprintf(stdout, __VA_ARGS__); } while (0)
 #define logger_debug(...) do { if (loglevel <= LOGLEVEL_DEBUG) fprintf(stdout, __VA_ARGS__); } while (0)
@@ -245,7 +250,11 @@ static uint8_t mode = SPI_CS_HIGH;
 static uint8_t bits = 8;
 static uint32_t speed = 67000000;
 
+#if defined(TF4060)
+struct ff_spi* spi = NULL;
+#else
 static int spi_fd = -1;
+#endif
 static int spi_proto_ver = 0;
 #elif defined(MODEL_FE)
 static unsigned int current_address;
@@ -422,6 +431,81 @@ static void load_config_file(const char *filename)
 }
 
 #if defined(MODEL_TD)
+
+#if defined(TF4060)
+
+#define S_MOSI 10
+#define S_MISO 9
+#define S_CLK 11
+#define S_CE0 8
+#define S_CE1 7
+#define S_HOLD 25
+#define S_WP 24
+#define S_D0 S_MOSI
+#define S_D1 S_MISO
+#define S_D2 S_WP
+#define S_D3 S_HOLD
+
+void DumpBuffer(const uint8_t* buffer, uint32_t size);
+
+static int init_spi()
+{
+    if (gpioInitialise() < 0)
+    {
+        logger_error("Unable to initialize GPIO\n");
+        return 1;
+    }
+    if ((spi = spiAlloc()) == NULL)
+    {
+        logger_error("Unable to allocate SPI\n");
+        return 1;
+    }
+
+    spiSetPin(spi, SP_CLK, S_CLK);
+    spiSetPin(spi, SP_D0, S_D0);
+    spiSetPin(spi, SP_D1, S_D1);
+    spiSetPin(spi, SP_D2, S_D2);
+    spiSetPin(spi, SP_D3, S_D3);
+    spiSetPin(spi, SP_MISO, S_MISO);
+    spiSetPin(spi, SP_MOSI, S_MOSI);
+    spiSetPin(spi, SP_HOLD, S_HOLD);
+    spiSetPin(spi, SP_WP, S_WP);
+    spiSetPin(spi, SP_CS, S_CE1);
+
+    return spiInit(spi);
+}
+static void shutdown_spi()
+{
+    spiFree(&spi);
+}
+static int check_spidev_bufsiz()
+{
+    return 0;
+}
+
+static int spi_transfer(int len)
+{
+    logger_trace("spi_transfer(%ld bytes)\n", len);
+    logger_trace("{\n");
+
+    spiBegin(spi);
+
+    logger_trace("  TX:\n");
+    DumpBuffer(tx_buf, len);
+
+    for (int i=0; i<len; i++)
+    {
+        rx_buf[i] = spiXfer(spi, tx_buf[i]);
+    }
+
+    logger_trace("  RX:\n");
+    DumpBuffer(rx_buf, len);
+
+    spiEnd(spi);
+    logger_trace("}\n");
+    return 0;
+}
+#else
 static int init_spi()
 {
     spi_fd = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
@@ -475,6 +559,7 @@ static int spi_transfer(int len)
 
     return ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
 }
+#endif
 
 static int spi_protocol_version()
 {
@@ -2152,3 +2237,56 @@ int main(int argc, char **argv)
     shutdown_driver();
     return 0;
 }
+
+#if defined(TF4060)
+void DumpBuffer(const uint8_t* buffer, uint32_t size)
+{
+    uint32_t i, j, len;
+    char format[150];
+    char alphas[27];
+    strcpy(format, "    [%03lx]: %04lx %04lx %04lx %04lx %04lx %04lx %04lx %04lx ");
+
+    for (i = 0; i < size; i += 16) {
+        len = size - i;
+
+        // last line is less than 16 bytes? rewrite the format string
+        if (len < 16) {
+            strcpy(format, "    [%03lx]: ");
+
+            for (j = 0; j < 16; j+=2) {
+                if (j < len) {
+                    strcat(format, "%04lx");
+
+                } else {
+                    strcat(format, "____");
+                }
+
+                strcat(format, " ");
+            }
+
+        } else {
+            len = 16;
+        }
+
+        // create the ascii representation
+        for (j = 0; j < len; ++j) {
+            alphas[j] = (isalnum(buffer[i + j]) ? buffer[i + j] : '.');
+        }
+
+        for (; j < 16; ++j) {
+            alphas[j] = '_';
+        }
+
+        alphas[j] = 0;
+
+        j = strlen(format);
+        sprintf(format + j, "'%s'\n", alphas);
+
+        uint16_t* p = (uint16_t*)&buffer[i];
+        logger_trace(format, i,
+           htons(p[0]), htons(p[1]), htons(p[2]), htons(p[3]), htons(p[4]), htons(p[5]), htons(p[6]), htons(p[7]));
+
+        format[j] = '\0';
+    }
+}
+#endif
