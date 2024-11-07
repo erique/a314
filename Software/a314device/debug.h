@@ -1,4 +1,6 @@
-#define DEBUG 0
+#define DEBUG 1
+
+#include "kprintf.h"
 
 extern void dbg_init();
 extern void dbg(const char* fmt, ...);

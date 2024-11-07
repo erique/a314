@@ -165,6 +165,9 @@ void dbg(const char* fmt, ...)
         }
     }
     *q++ = '\n';
+    *q = '\0';
+
+    kprintf("%s", msg_bufs[my_slot]);
 
     Disable();
     msg_lengths[my_slot] = q - msg_bufs[my_slot];
@@ -177,3 +180,5 @@ void dbg(const char* fmt, ...)
         Signal(&debug_process->pr_Task, SIGBREAKF_CTRL_D);
 }
 #endif
+
+#include "kprintf.c"
