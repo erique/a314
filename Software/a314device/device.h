@@ -30,6 +30,8 @@ struct A314Device
 	UWORD is_a600;
 
 	ULONG fw_flags;
+
+	APTR tf_config; // TF4060
 #elif defined(MODEL_FE)
 	ULONG a314_mem_address;
 #endif
