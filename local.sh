@@ -1,4 +1,9 @@
 #!/bin/bash
 
-make -C Software
-VBCC=/opt/vbcc PATH=$PATH:$VBCC/bin NDK32=/opt/ndk32 make -C Software -f Makefile-amiga
+VBCC=/opt/vbcc
+NDK32=/opt/ndk32
+
+PATH=$PATH:$VBCC/bin
+
+make -j -C Software
+VBCC=$VBCC NDK32=$NDK32 make -j -C Software -f Makefile-amiga -j
