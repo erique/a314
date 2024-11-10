@@ -614,14 +614,21 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
 
 static uint8_t spi_read_cmem(unsigned int address)
 {
+    int tx_len =
+#if defined(TF4060)
+    3;
+#else
+    2;
+#endif
     if (spi_proto_ver == 1)
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 5) | (address & 0xf));
     else
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 4) | (address & 0xf));
     tx_buf[1] = 0;
-    spi_transfer(2);
-    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[1]);
-    return rx_buf[1];
+    tx_buf[2] = 0;
+    spi_transfer(tx_len);
+    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[tx_len-1]);
+    return rx_buf[tx_len-1];
 }
 
 static void spi_write_cmem(unsigned int address, unsigned int data)
