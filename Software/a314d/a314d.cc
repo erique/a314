@@ -1506,6 +1506,8 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
 
     std::string service_name((char *)data, plen);
 
+    logger_trace("service_name = %s\n", service_name.c_str());
+
     for (auto &srv : services)
     {
         if (srv.name == service_name)
@@ -1553,6 +1555,8 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
                 for (auto &arg : args)
                     args_arr.push_back(arg.c_str());
                 args_arr.push_back(nullptr);
+
+                logger_trace("execvp('%s')\n", on_demand.program.c_str());
 
                 execvp(on_demand.program.c_str(), (char* const*) &args_arr[0]);
             }
@@ -1611,6 +1615,8 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
             }
         }
     }
+
+    logger_trace("service_name unknown\n");
 
     uint8_t response = CONNECT_UNKNOWN_SERVICE;
     create_and_enqueue_packet(&ch, PKT_CONNECT_RESPONSE, &response, 1);
@@ -2153,6 +2159,8 @@ static void main_loop()
         else if (n == 0)
         {
             // Timeout. Handle below.
+            logger_trace("############################################ timeout...\n");
+            handle_a314_irq();
         }
         else
         {
