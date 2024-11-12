@@ -2,9 +2,11 @@
 #include <exec/tasks.h>
 #include <exec/ports.h>
 
+#define SIGB_TIMER 13
 #define SIGB_INT 14
 #define SIGB_MSGPORT 15
 
+#define SIGF_TIMER (1 << SIGB_TIMER)
 #define SIGF_INT (1 << SIGB_INT)
 #define SIGF_MSGPORT (1 << SIGB_MSGPORT)
 
