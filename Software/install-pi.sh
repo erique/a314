@@ -44,23 +44,37 @@ install_common() {
 	/opt/a314/venv/bin/pip install pyudev "websockets>=14" python-pytun bpls2gif/
 
 	# Add tap0 interface
-	modinstall ethernet/pi-config/tap0 /etc/network/interfaces.d
+#	modinstall ethernet/pi-config/tap0 /etc/network/interfaces.d
 
 	# Enable IP forwarding
-	echo net.ipv4.ip_forward=1 > /etc/sysctl.d/a314eth.conf
+#	echo net.ipv4.ip_forward=1 > /etc/sysctl.d/a314eth.conf
 
 	# Add service that sets iptable rules
-	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
+#	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
 
-	systemctl daemon-reload
-	systemctl enable a314d
-	systemctl enable a314net
+#	systemctl daemon-reload
+#	systemctl enable a314d
+#	systemctl enable a314net
 
 	tic picmd/amiga-color.ti
 
 	echo
 	echo "Installation complete"
 	echo "Restart the Raspberry Pi (sudo reboot now) to automatically start a314 software"
+}
+
+install_tf4060() {
+	sudo -u $A314_USER mkdir -p ${BIN}
+	sudo -u $A314_USER make ${BIN}/a314d-tf4060
+
+	install -d /opt/a314
+	install -d /etc/opt/a314
+	install ${BIN}/a314d-tf4060 /opt/a314/a314d
+
+#	modinstall a314d/a314d-td.service /lib/systemd/system
+#	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
+
+	install_common
 }
 
 install_trapdoor() {
@@ -162,6 +176,8 @@ install_frontexpansion() {
 }
 
 case "$1" in
+	tf | TF) install_tf4060
+		;;
 	td | TD) install_trapdoor
 		;;
 	cp | CP) install_clockport
@@ -170,6 +186,7 @@ case "$1" in
 		;;
 	*)	echo "Usage: sudo ./install-pi.sh <model>"
 		echo "       <model> is one of:"
+		echo "         tf   (terriblefire)      A314-4060"
 		echo "         td   (trapdoor)          A314-500, A314-600"
 		echo "         cp   (clockport)         A314-cp"
 		echo "         fe   (front expansion)   A314-1000"
