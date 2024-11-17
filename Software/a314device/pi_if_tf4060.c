@@ -35,6 +35,18 @@ static volatile UBYTE* cmem = 0;
 #define SRAM_END   0x4000
 
 
+void flush_tf(struct A314Device *dev)
+{
+    cmem = (void*)(((intptr_t)dev->tf_config) + CMEM);
+    const ULONG mem_size = SRAM_END - CMEM;
+	CacheClearE(cmem, mem_size, CACRF_ClearD);
+}
+
+#define MAPP_CACHEINHIBIT     (1<<6)
+#define MAPP_IO               (1<<30)
+
+uint32_t SetMMU(__reg("a0") void* addr, __reg("d0") uint32_t size, __reg("d1") uint32_t flags, __reg("a6") struct ExecBase*);
+
 int probe_pi_interface(struct A314Device *dev)
 {
     dev->tf_config = NULL;
@@ -78,6 +90,8 @@ int probe_pi_interface(struct A314Device *dev)
 
 	AddMemList( sram_size, MEMF_A314, -128, sram, "A314-TF4060" );
 
+	SetMMU(dev->tf_config, 0x4000, MAPP_IO|MAPP_CACHEINHIBIT, SysBase);
+
 	dev->ca = (struct ComArea *)AllocMem(sizeof(struct ComArea), MEMF_A314 | MEMF_CLEAR);
 	if (dev->ca == NULL)
 	{
@@ -101,15 +115,16 @@ static void add_interrupt_handlers(struct A314Device *dev)
 
 	AddIntServer(INTB_VERTB, &dev->vertb_interrupt);
 
-	memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
-	dev->int_x_interrupt.is_Node.ln_Type = NT_INTERRUPT;
-	dev->int_x_interrupt.is_Node.ln_Pri = 0;
-	dev->int_x_interrupt.is_Node.ln_Name = device_name;
-	dev->int_x_interrupt.is_Data = (APTR)&dev->task;
-	dev->int_x_interrupt.is_Code = IntServer;
+	// memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
+	// dev->int_x_interrupt.is_Node.ln_Type = NT_INTERRUPT;
+	// dev->int_x_interrupt.is_Node.ln_Pri = 0;
+	// dev->int_x_interrupt.is_Node.ln_Name = device_name;
+	// dev->int_x_interrupt.is_Data = (APTR)&dev->task;
+	// dev->int_x_interrupt.is_Code = IntServer;
 
-	LONG int_num = dev->interrupt_number == 6 ? INTB_EXTER : INTB_PORTS;
-	AddIntServer(int_num, &dev->int_x_interrupt);
+	// dev->interrupt_number = 2;
+	// LONG int_num = dev->interrupt_number == 6 ? INTB_EXTER : INTB_PORTS;
+	// AddIntServer(int_num, &dev->int_x_interrupt);
 }
 
 void setup_pi_interface(struct A314Device *dev)
@@ -129,17 +144,17 @@ void setup_pi_interface(struct A314Device *dev)
 
 void read_from_r2a(struct A314Device *dev, UBYTE *dst, UBYTE offset, int length)
 {
-	kprintf("read_from_r2a: length = %ld ; dst = %lx\n", length, dst);
+	// kprintf("read_from_r2a: length = %ld ; dst = %lx\n", length, dst);
 	UBYTE *r2a_buffer = dev->ca->r2a_buffer;
-	DumpBuffer(&r2a_buffer[offset], length);
+	// DumpBuffer(&r2a_buffer[offset], length);
 	for (int i = 0; i < length; i++)
 		*dst++ = r2a_buffer[offset++];
 }
 
 void write_to_a2r(struct A314Device *dev, UBYTE type, UBYTE stream_id, UBYTE length, UBYTE *data)
 {
-	kprintf("write_to_a2r: type=%lx ; stream=%lx ; length = %ld ; data = %lx\n", type, stream_id, length, data);
-	DumpBuffer(data, length);
+	// kprintf("write_to_a2r: type=%lx ; stream=%lx ; length = %ld ; data = %lx\n", type, stream_id, length, data);
+	// DumpBuffer(data, length);
 
 	struct ComArea *ca = dev->ca;
 	UBYTE index = ca->cap.a2r_tail;
@@ -210,18 +225,18 @@ void a314base_free_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG add
 
 void a314base_write_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address, __reg("a0") UBYTE *src, __reg("d1") ULONG length)
 {
-	kprintf("a314base_write_mem: %08lx / %ld bytes\n", address, length);
+	// kprintf("a314base_write_mem: %08lx / %ld bytes\n", address, length);
 	UBYTE *dst = a314_to_cpu_address(dev, address);
 	memcpy(dst, src, length);
-	DumpBuffer(dst, length);
+	// DumpBuffer(dst, length);
 }
 
 void a314base_read_mem(__reg("a6") struct A314Device *dev, __reg("a0") UBYTE *dst, __reg("d0") ULONG address, __reg("d1") ULONG length)
 {
-	kprintf("a314base_read_mem: %08lx / %ld bytes\n", address, length);
+	// kprintf("a314base_read_mem: %08lx / %ld bytes\n", address, length);
 	UBYTE *src = a314_to_cpu_address(dev, address);
 	memcpy(dst, src, length);
-	DumpBuffer(dst, length);
+	// DumpBuffer(dst, length);
 }
 
 // unused? (cp version)
@@ -230,7 +245,7 @@ void a314base_read_mem(__reg("a6") struct A314Device *dev, __reg("a0") UBYTE *ds
 
 void write_cp_nibble(int index, UBYTE value)
 {
-	kprintf("write_cp_nibble: [%ld] <= %lx\n", index, value);
+	// kprintf("write_cp_nibble: [%ld] <= %lx\n", index, value);
 	volatile UBYTE *p = cmem;
 	p += index;
 	*p = value & 0xf;
@@ -240,7 +255,7 @@ UBYTE read_cp_nibble(int index)
 	volatile UBYTE *p = cmem;
 	p += index;
 	UBYTE ret = *p & 0xf;
-	kprintf("read_cp_nibble: [%ld] => %lx\n", index, ret);
+	// kprintf("read_cp_nibble: [%ld] => %lx\n", index, ret);
 	return ret;
 }
 
