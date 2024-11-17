@@ -16,7 +16,7 @@
 #define SysBase (*(struct ExecBase **)4)
 
 #define TASK_PRIORITY 80
-#define TASK_STACK_SIZE 1024
+#define TASK_STACK_SIZE (1024*10)
 
 extern void task_main();
 extern void init_sockets(struct A314Device *dev);

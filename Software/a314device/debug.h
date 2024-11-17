@@ -7,10 +7,10 @@ extern void dbg(const char* fmt, ...);
 
 #if !DEBUG
 
-#define dbg_error(...)
-#define dbg_warning(...)
-#define dbg_info(...)
-#define dbg_trace(...)
+#define dbg_error(...)      do{} while(0)
+#define dbg_warning(...)    do{} while(0)
+#define dbg_info(...)       do{} while(0)
+#define dbg_trace(...)      do{} while(0)
 
 #else
 
