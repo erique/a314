@@ -20,7 +20,7 @@ void dbg(const char* fmt, ...)
 }
 #else
 
-#define LOG_SIZE 16
+#define LOG_SIZE 128
 
 extern void debug_process_seglist();
 static const char debug_process_name[] = "logger-process";
@@ -179,6 +179,7 @@ void dbg(const char* fmt, ...)
     if (debug_process)
         Signal(&debug_process->pr_Task, SIGBREAKF_CTRL_D);
 }
+
 #endif
 
 #include "kprintf.c"
