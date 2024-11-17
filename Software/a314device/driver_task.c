@@ -228,9 +228,26 @@ static void handle_pkt_eos(struct A314Device *dev, struct Socket *s)
 
 static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_id, UBYTE offset, UBYTE length)
 {
-	dbg_trace("Enter: handle_r2a_packet, type=$b, stream_id=$b, offset=$b, length=$b");
+	dbg_trace("Enter: handle_r2a_packet, type=$b, stream_id=$b, offset=$b, length=$b", type, stream_id, offset, length);
 
 	struct Socket *s = find_socket_by_stream_id(dev, stream_id);
+
+	if (!(PKT_DRIVER_STARTED <= type && type <= PKT_RESET && s != NULL))
+	{
+		dbg_error("\nThis is BAD\n");
+
+		kprintf("ComAreaPtrs (a2r_tail, r2a_head, r2a_tail, a2r_head):\n");
+		DumpBuffer((uint8_t*)&dev->ca->cap, sizeof(dev->ca->cap));
+		// kprintf("A2R:\n");
+		// DumpBuffer(dev->ca->a2r_buffer, sizeof(dev->ca->a2r_buffer));
+		kprintf("R2A:\n");
+		DumpBuffer(dev->ca->r2a_buffer, sizeof(dev->ca->r2a_buffer));
+		CacheClearU();
+		kprintf("R2A again:\n");
+		DumpBuffer(dev->ca->r2a_buffer, sizeof(dev->ca->r2a_buffer));
+		while(1)
+			;
+	}
 
 	if (s != NULL && type == PKT_RESET)
 	{
@@ -573,7 +590,7 @@ static void set_timeout(struct A314Device *dev)
 	struct timerequest* tr = &dev->timer_req;
 	tr->tr_node.io_Message.mn_ReplyPort = &dev->timer_mp;
 	tr->tr_node.io_Command = TR_ADDREQUEST;
-	tr->tr_time.tv_secs = 10;
+	tr->tr_time.tv_secs = 2;
 	tr->tr_time.tv_micro = 0;
 
 	dbg_trace("set timeout $l:$l", tr->tr_time.tv_secs, tr->tr_time.tv_micro);
@@ -582,12 +599,14 @@ static void set_timeout(struct A314Device *dev)
 
 #if defined(MODEL_TD)
 
+void flush_tf(struct A314Device *dev);
+
 void task_main()
 {
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
 	struct ComAreaPtrs *cap = CAP_PTR(dev);
 
-	set_timeout(dev);
+//	set_timeout(dev);
 
 	while (TRUE)
 	{
@@ -596,6 +615,19 @@ void task_main()
 		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT | SIGF_TIMER);
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
+
+		flush_tf(dev);
+
+		{
+			uint8_t a2r_head = cap->a2r_head;
+			uint8_t a2r_tail = cap->a2r_tail;
+			uint8_t r2a_head = cap->r2a_head;
+			uint8_t r2a_tail = cap->r2a_tail;
+			int a2r_len = (a2r_tail - a2r_head) & 255;
+			int r2a_len = (r2a_tail - r2a_head) & 255;
+
+			dbg_trace("RD: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+		}
 
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
@@ -632,6 +664,10 @@ void task_main()
 			if (cap->r2a_head != prev_r2a_head)
 				r_events |= R_EVENT_R2A_HEAD;
 
+			{
+				dbg_trace("CH: $s / $s", r_events & R_EVENT_A2R_TAIL ? "A2R_TAIL_UPDATED" : "", r_events & R_EVENT_R2A_HEAD ? "R2A_HEAD_UPDATED" : "");
+			}
+
 			Disable();
 			UBYTE prev_regd = read_cp_nibble(13);
 			write_cp_nibble(13, prev_regd | 8);
@@ -652,8 +688,21 @@ void task_main()
 				}
 			}
 
+			{
+				uint8_t a2r_head = cap->a2r_head;
+				uint8_t a2r_tail = cap->a2r_tail;
+				uint8_t r2a_head = cap->r2a_head;
+				uint8_t r2a_tail = cap->r2a_tail;
+				int a2r_len = (a2r_tail - a2r_head) & 255;
+				int r2a_len = (r2a_tail - r2a_head) & 255;
+
+				dbg_trace("WR: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+			}
+
 			write_cp_nibble(13, prev_regd);
 			Enable();
+
+			flush_tf(dev);
 		}
 	}
 

@@ -485,24 +485,24 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
-    logger_trace("spi_transfer(%ld bytes)\n", len);
-    logger_trace("{\n");
+    // logger_trace("spi_transfer(%ld bytes)\n", len);
+    // logger_trace("{\n");
 
     spiBegin(spi);
 
-    logger_trace("  TX:\n");
-    DumpBuffer(tx_buf, len);
+    // logger_trace("  TX:\n");
+    // DumpBuffer(tx_buf, len);
 
     for (int i=0; i<len; i++)
     {
         rx_buf[i] = spiXfer(spi, tx_buf[i]);
     }
 
-    logger_trace("  RX:\n");
-    DumpBuffer(rx_buf, len);
+    // logger_trace("  RX:\n");
+    // DumpBuffer(rx_buf, len);
 
     spiEnd(spi);
-    logger_trace("}\n");
+    // logger_trace("}\n");
     return 0;
 }
 #else
@@ -610,6 +610,16 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
 
     memcpy(&tx_buf[3], buf, length);
     spi_transfer(length + 3);
+
+    DumpBuffer(buf, length);
+
+    spi_read_shm_rxbuf(address, length);
+    if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
+    {
+        logger_error("#\n");
+        logger_error("  WRITE FAILED!\n");
+        logger_error("#\n");
+    }
 }
 
 static uint8_t spi_read_cmem(unsigned int address)
@@ -1805,6 +1815,14 @@ static void write_channel_status()
     if (channel_status_updated != 0)
     {
         write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
+        {
+            uint8_t verify[2];
+            read_shm(&verify[0], BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, 2);
+            if (channel_status[R2A_TAIL_OFFSET] != verify[0])
+                logger_error("WRITE FAILED (%02x != %02x)\n", channel_status[R2A_TAIL_OFFSET], verify[0]);
+            if (channel_status[R2A_TAIL_OFFSET+1] != verify[1])
+                logger_error("WRITE FAILED (%02x != %02x)\n", channel_status[R2A_TAIL_OFFSET+1], verify[1]);
+        }
 
 #if defined(MODEL_TD)
         unsigned int events = 0;
@@ -1857,7 +1875,19 @@ static void handle_a314_irq()
 {
     uint8_t events = spi_ack_irq();
     if (events == 0)
-        return;
+    {
+        // return;
+        uint8_t new_channel_status[4];
+        read_shm(new_channel_status, BASE_ADDRESS + CAP_BASE, 4);
+        if (memcmp(channel_status, new_channel_status, 4) == 0)
+        {
+            logger_trace("spurious wakeup.. \n");
+            return;
+        }
+        logger_trace("#\n");
+        logger_trace("  CMEM[12] read zero -- BUT THE CHANNEL STATUS IS UPDATED!\n");
+        logger_trace("#\n");
+    }
 
     if ((events & R_EVENT_BASE_ADDRESS) || !have_base_address)
     {
@@ -1873,10 +1903,36 @@ static void handle_a314_irq()
 
     read_channel_status();
 
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_debug("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
+
     receive_from_a2r();
     flush_send_queue();
 
+    {
+        logger_debug("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
+    }
+
     write_channel_status();
+
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_debug("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
 }
 #elif defined(MODEL_FE)
 static void handle_a314_irq()
@@ -2130,7 +2186,7 @@ static void main_loop()
     while (!done)
     {
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, 250, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)
@@ -2159,7 +2215,7 @@ static void main_loop()
         else if (n == 0)
         {
             // Timeout. Handle below.
-            logger_trace("############################################ timeout...\n");
+            // logger_trace("############################################ timeout...\n");
             handle_a314_irq();
         }
         else

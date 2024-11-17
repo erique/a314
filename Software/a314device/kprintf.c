@@ -5,7 +5,7 @@
 
 #include <inline/exec_protos.h>
 
-#ifdef DEBUG
+#if DEBUG
 
 static void set_uart_speed(__reg("d0") uint32_t c) = "\tmove.w\td0,$dff032\n";
 static void RawPutChar(__reg("d0") uint32_t c, __reg("a6") struct ExecBase* SysBase) = "\tjsr\t-516(a6)\n";
@@ -20,7 +20,7 @@ void kprintf(const char *format, ...)
     va_list args;
     struct ExecBase* SysBase = *((struct ExecBase **) (4L));
 
-    // set_uart_speed(3546895/115200);
+    set_uart_speed(3546895/115200);
 
     va_start(args, format);
 
