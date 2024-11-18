@@ -599,6 +599,7 @@ static void set_timeout(struct A314Device *dev)
 
 #if defined(MODEL_TD)
 
+void signal_tf(struct A314Device *dev);
 void flush_tf(struct A314Device *dev);
 
 void task_main()
@@ -684,7 +685,10 @@ void task_main()
 				{
 					write_cp_nibble(A_ENABLE_ADDRESS, a_enable);
 					if (r_events != 0)
+					{
 						write_cp_nibble(R_EVENTS_ADDRESS, r_events);
+						signal_tf(dev);
+					}
 				}
 			}
 
