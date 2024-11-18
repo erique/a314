@@ -34,6 +34,19 @@ static volatile UBYTE* cmem = 0;
 #define SRAM_START 0x0400
 #define SRAM_END   0x4000
 
+static void spiBegin(struct TFConfig* tfConfig)             { tfConfig->TF_SpiCtrl = 0x00; }
+static void spiEnd(struct TFConfig* tfConfig)               { tfConfig->TF_SpiCtrl = 0xFF; }
+
+void signal_tf(struct A314Device *dev)
+{
+	struct TFConfig* tf = (struct TFConfig*)dev->tf_config;
+	if (!tf)
+		return;
+	// Disable();	// already disabled
+	spiBegin(tf);
+	spiEnd(tf);
+	// Enable();
+}
 
 void flush_tf(struct A314Device *dev)
 {

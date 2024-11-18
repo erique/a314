@@ -46,17 +46,17 @@ install_common() {
 	/opt/a314/venv/bin/pip install pyudev websockets python-pytun bpls2gif/
 
 	# Add tap0 interface
-#	modinstall ethernet/pi-config/tap0 /etc/network/interfaces.d
+	modinstall ethernet/pi-config/tap0 /etc/network/interfaces.d
 
 	# Enable IP forwarding
-#	echo net.ipv4.ip_forward=1 > /etc/sysctl.d/a314eth.conf
+	echo net.ipv4.ip_forward=1 > /etc/sysctl.d/a314eth.conf
 
 	# Add service that sets iptable rules
-#	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
+	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
 
-#	systemctl daemon-reload
-#	systemctl enable a314d
-#	systemctl enable a314net
+	systemctl daemon-reload
+	systemctl enable a314d
+	systemctl enable a314net
 
 	echo
 	echo "Installation complete"
@@ -74,8 +74,8 @@ install_tf4060() {
 	install -d /etc/opt/a314
 	install ${BIN}/a314d-tf4060 /opt/a314/a314d
 
-#	modinstall a314d/a314d-td.service /lib/systemd/system
-#	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
+	modinstall a314d/a314d-td.service /lib/systemd/system
+	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
 
 	echo "common..."
 	install_common
