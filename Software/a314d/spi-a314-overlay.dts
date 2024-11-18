@@ -4,10 +4,28 @@
 / {
         compatible = "brcm,bcm2835";
 
+        /*
+          GPIO8 (normal SPI0-CE0) is used when the ICE is bus master, accessing the ROM.
+          To not have conflicting pulls, we change the CE0 to use GPIO25 instead (which isn't connected to anything).
+        */
         fragment@0 {
+                target = <&spi0_cs_pins>;
+                frag0: __overlay__ {
+                        brcm,pins = <25 7>;
+                };
+        };
+
+        fragment@1 {
                 target = <&spidev0>;
-                __overlay__ {
-                        spi-cs-high;
+                frag1: __overlay__ {
+                        status = "disabled";
+                };
+        };
+
+        fragment@2 {
+                target = <&spi0>;
+                frag2: __overlay__ {
+                        cs-gpios = <&gpio 25 1>, <&gpio 7 1>;
                 };
         };
 };
