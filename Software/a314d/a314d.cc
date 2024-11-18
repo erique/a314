@@ -130,8 +130,8 @@ static int loglevel = LOGLEVEL_TRACE;
 #endif
 
 #if defined(MODEL_TD)
-#define IRQ_GPIO                25
-#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EDGE_FALLING
+#define IRQ_GPIO                8
+#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
 #elif defined(MODEL_FE)
 #define IRQ_GPIO                23
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
@@ -487,8 +487,23 @@ static int spi_transfer(int len)
 {
     // logger_trace("spi_transfer(%ld bytes)\n", len);
     // logger_trace("{\n");
-
+again:
+    __useconds_t timeout = 10;
+    while (!gpioRead(S_CE0))
+    {
+        logger_warning("CE0 is asserted; backing off\r"); fflush(stdout);
+        usleep(timeout);
+        if (timeout < 100*1000)
+            timeout *= 2;
+    }
     spiBegin(spi);
+
+    if(!gpioRead(S_CE0))
+    {
+        spiEnd(spi);
+        logger_warning("CE0 became asserted; lost the bus\n");
+        goto again;
+    }
 
     // logger_trace("  TX:\n");
     // DumpBuffer(tx_buf, len);
@@ -679,6 +694,15 @@ static void spi_read_base_address()
             base_address = ba1 & ~1;
         }
     }
+
+#if defined(TF4060)
+    if (base_address > 15 * 1024)
+    {
+        logger_warning("Illegal base address (%x); discarding...\n", base_address);
+        base_address = 0;
+        have_base_address = false;
+    }
+#endif
 }
 
 #define read_shm spi_read_shm
@@ -1157,6 +1181,14 @@ static int init_driver()
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
     spi_proto_ver = spi_protocol_version();
+#if defined(TF4060)
+    while (spi_proto_ver != 1)
+    {
+        logger_warning("Bad SPI protocol version (%02x); retrying...\r", spi_proto_ver);
+        usleep(1000);
+        spi_proto_ver = spi_protocol_version();
+    }
+#endif
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     if (init_gpio() != 0)
         return -1;
@@ -1877,6 +1909,9 @@ static void handle_a314_irq()
     if (events == 0)
     {
         // return;
+        if (!have_base_address)
+            return;
+
         uint8_t new_channel_status[4];
         read_shm(new_channel_status, BASE_ADDRESS + CAP_BASE, 4);
         if (memcmp(channel_status, new_channel_status, 4) == 0)
@@ -2186,7 +2221,7 @@ static void main_loop()
     while (!done)
     {
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 250, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)
