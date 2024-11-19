@@ -200,8 +200,8 @@ static ULONG cpu_to_a314_address(__reg("a6") struct A314Device *dev, __reg("a0")
 
 static void *a314_to_cpu_address(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address)
 {
-    const ULONG sram_lo = SRAM_START;
-    const ULONG sram_hi = SRAM_END;
+    const ULONG sram_lo = 0;
+    const ULONG sram_hi = SRAM_END - SRAM_START;
 
 	if (sram_lo <= address && address < sram_hi)
 	{
