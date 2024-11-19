@@ -179,7 +179,6 @@ void dbg(const char* fmt, ...)
     if (debug_process)
         Signal(&debug_process->pr_Task, SIGBREAKF_CTRL_D);
 }
-
 #endif
 
 #include "kprintf.c"
