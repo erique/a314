@@ -130,8 +130,13 @@ static int loglevel = LOGLEVEL_TRACE;
 #endif
 
 #if defined(MODEL_TD)
+#if defined(TF4060)
 #define IRQ_GPIO                8
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
+#else
+#define IRQ_GPIO                25
+#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EDGE_FALLING
+#endif
 #elif defined(MODEL_FE)
 #define IRQ_GPIO                23
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
@@ -626,15 +631,17 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
     memcpy(&tx_buf[3], buf, length);
     spi_transfer(length + 3);
 
-    DumpBuffer(buf, length);
-
+#if defined(TF4060)
     spi_read_shm_rxbuf(address, length);
     if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
     {
         logger_error("#\n");
         logger_error("  WRITE FAILED!\n");
         logger_error("#\n");
+
+        DumpBuffer(buf, length);
     }
+#endif
 }
 
 static uint8_t spi_read_cmem(unsigned int address)
@@ -1847,6 +1854,7 @@ static void write_channel_status()
     if (channel_status_updated != 0)
     {
         write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
+#if defined(TF4060)
         {
             uint8_t verify[2];
             read_shm(&verify[0], BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, 2);
@@ -1855,6 +1863,7 @@ static void write_channel_status()
             if (channel_status[R2A_TAIL_OFFSET+1] != verify[1])
                 logger_error("WRITE FAILED (%02x != %02x)\n", channel_status[R2A_TAIL_OFFSET+1], verify[1]);
         }
+#endif
 
 #if defined(MODEL_TD)
         unsigned int events = 0;
@@ -1907,8 +1916,8 @@ static void handle_a314_irq()
 {
     uint8_t events = spi_ack_irq();
     if (events == 0)
+#if defined(TF4060)
     {
-        // return;
         if (!have_base_address)
             return;
 
@@ -1923,6 +1932,9 @@ static void handle_a314_irq()
         logger_trace("  CMEM[12] read zero -- BUT THE CHANNEL STATUS IS UPDATED!\n");
         logger_trace("#\n");
     }
+#else
+        return;
+#endif
 
     if ((events & R_EVENT_BASE_ADDRESS) || !have_base_address)
     {
@@ -1938,6 +1950,8 @@ static void handle_a314_irq()
 
     read_channel_status();
 
+
+#if defined(TF4060)
     {
         uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
         uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
@@ -1948,16 +1962,20 @@ static void handle_a314_irq()
 
         logger_debug("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
     }
+#endif
 
     receive_from_a2r();
     flush_send_queue();
 
+#if defined(TF4060)
     {
         logger_debug("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
     }
+#endif
 
     write_channel_status();
 
+#if defined(TF4060)
     {
         uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
         uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
@@ -1968,6 +1986,7 @@ static void handle_a314_irq()
 
         logger_debug("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
     }
+#endif
 }
 #elif defined(MODEL_FE)
 static void handle_a314_irq()
