@@ -599,8 +599,13 @@ static void set_timeout(struct A314Device *dev)
 
 #if defined(MODEL_TD)
 
+#if defined(TF4060)
 void signal_tf(struct A314Device *dev);
 void flush_tf(struct A314Device *dev);
+#else
+void signal_tf(struct A314Device *dev){}
+void flush_tf(struct A314Device *dev){}
+#endif
 
 void task_main()
 {
