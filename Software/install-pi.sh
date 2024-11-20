@@ -55,7 +55,7 @@ install_common() {
 	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
 
 	systemctl daemon-reload
-	systemctl enable a314d
+#	systemctl enable a314d
 	systemctl enable a314net
 
 	echo
