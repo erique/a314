@@ -51,7 +51,7 @@
 #define LOGLEVEL_WARNING    40
 #define LOGLEVEL_ERROR      50
 
-static int loglevel = LOGLEVEL_TRACE;
+static int loglevel = LOGLEVEL_INFO;
 
 #define logger_trace(...) do { if (loglevel <= LOGLEVEL_TRACE) fprintf(stdout, __VA_ARGS__); } while (0)
 #define logger_debug(...) do { if (loglevel <= LOGLEVEL_DEBUG) fprintf(stdout, __VA_ARGS__); } while (0)
@@ -492,10 +492,12 @@ static int spi_transfer(int len)
 {
     // logger_trace("spi_transfer(%ld bytes)\n", len);
     // logger_trace("{\n");
+    bool add_lf = false;
 again:
     __useconds_t timeout = 10;
     while (!gpioRead(S_CE0))
     {
+        add_lf = true;
         logger_warning("CE0 is asserted; backing off\r"); fflush(stdout);
         usleep(timeout);
         if (timeout < 100*1000)
@@ -509,6 +511,8 @@ again:
         logger_warning("CE0 became asserted; lost the bus\n");
         goto again;
     }
+    if (add_lf)
+        logger_warning("\n");
 
     // logger_trace("  TX:\n");
     // DumpBuffer(tx_buf, len);
@@ -586,7 +590,7 @@ static int spi_protocol_version()
     tx_buf[0] = (uint8_t)SPI_PROTO_VER_CMD;
     tx_buf[1] = 0;
     spi_transfer(2);
-    logger_trace("SPI protocol version = %d\n", rx_buf[1]);
+    logger_info("SPI protocol version = %d\n", rx_buf[1]);
     return (int)rx_buf[1];
 }
 
@@ -1555,7 +1559,7 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
 
     std::string service_name((char *)data, plen);
 
-    logger_trace("service_name = %s\n", service_name.c_str());
+    logger_debug("service_name = %s\n", service_name.c_str());
 
     for (auto &srv : services)
     {
@@ -1605,7 +1609,7 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
                     args_arr.push_back(arg.c_str());
                 args_arr.push_back(nullptr);
 
-                logger_trace("execvp('%s')\n", on_demand.program.c_str());
+                logger_debug("execvp('%s')\n", on_demand.program.c_str());
 
                 execvp(on_demand.program.c_str(), (char* const*) &args_arr[0]);
             }
@@ -1665,7 +1669,7 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
         }
     }
 
-    logger_trace("service_name unknown\n");
+    logger_warning("service_name unknown\n");
 
     uint8_t response = CONNECT_UNKNOWN_SERVICE;
     create_and_enqueue_packet(&ch, PKT_CONNECT_RESPONSE, &response, 1);
@@ -1960,7 +1964,7 @@ static void handle_a314_irq()
         int a2r_len = (a2r_tail - a2r_head) & 255;
         int r2a_len = (r2a_tail - r2a_head) & 255;
 
-        logger_debug("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
     }
 #endif
 
@@ -1969,7 +1973,7 @@ static void handle_a314_irq()
 
 #if defined(TF4060)
     {
-        logger_debug("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
+        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
     }
 #endif
 
@@ -1984,7 +1988,7 @@ static void handle_a314_irq()
         int a2r_len = (a2r_tail - a2r_head) & 255;
         int r2a_len = (r2a_tail - r2a_head) & 255;
 
-        logger_debug("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
     }
 #endif
 }
@@ -2235,7 +2239,7 @@ static void main_loop()
     auto_clear_irq_after = time(NULL) + 3;
 #endif
 
-    logger_trace("Entering main loop\n");
+    logger_debug("Entering main loop\n");
 
     while (!done)
     {
@@ -2270,6 +2274,7 @@ static void main_loop()
         {
             // Timeout. Handle below.
             // logger_trace("############################################ timeout...\n");
+            logger_debug("Timer timeout\n");
             handle_a314_irq();
         }
         else
@@ -2285,17 +2290,17 @@ static void main_loop()
                     exit(-1);
                 }
 
-                logger_trace("GPIO interupted\n");
+                logger_debug("GPIO interupted\n");
                 handle_a314_irq();
             }
             else if (ev.data.fd == server_socket)
             {
-                logger_trace("Epoll event: server socket is ready, events = %d\n", ev.events);
+                logger_debug("Epoll event: server socket is ready, events = %d\n", ev.events);
                 handle_server_socket_ready();
             }
             else
             {
-                logger_trace("Epoll event: client socket is ready, events = %d\n", ev.events);
+                logger_debug("Epoll event: client socket is ready, events = %d\n", ev.events);
 
                 auto it = connections.begin();
                 for (; it != connections.end(); it++)
