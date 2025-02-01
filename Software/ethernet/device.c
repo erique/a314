@@ -150,7 +150,6 @@ extern void device_process_seglist();
 
 static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg("a0") BPTR seg_list, __reg("d0") struct Library *dev)
 {
-;;	TRACE("init_device");
 
 	saved_seg_list = seg_list;
 
@@ -169,7 +168,6 @@ static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg(
 
 static BPTR expunge(__reg("a6") struct Library *dev)
 {
-;;	TRACE("expunge");
 
 	if (dev->lib_OpenCnt)
 	{
@@ -189,7 +187,6 @@ static BPTR expunge(__reg("a6") struct Library *dev)
 
 static void send_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int length)
 {
-;;	TRACE("send_a314_cmd");
 
 	ior->a314_Request.io_Command = cmd;
 	ior->a314_Request.io_Error = 0;
@@ -201,7 +198,6 @@ static void send_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, i
 
 static void do_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int length)
 {
-;;	TRACE("do_a314_cmd");
 
 	ior->a314_Request.io_Command = cmd;
 	ior->a314_Request.io_Error = 0;
@@ -213,12 +209,12 @@ static void do_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int
 
 static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 {
-;;	TRACE("copy_from_bd_and_reply");
 
 	// TODO: Use S2_DMACopyToBuff32 instead of S2_CopyToBuff (if possible).
 	// This will avoid copying from A314 shared memory to shadow buffer
 	// before copying to stack's buffer.
 
+    kprintf("[r] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	if (!bd->buffer_is_mapped)
 		ReadMemA314(bd->bd_Buffer, bd->bd_BufferAddress, bd->bd_Length);
 
@@ -263,7 +259,6 @@ static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 
 static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 {
-;;	TRACE("copy_to_bd_and_reply");
 
 		kprintf("A314eth: ios2 = %08lx\n", ios2);
 	// TODO: Use S2_DMACopyFromBuff32 instead of S2_CopyFromBuff (if possible).
@@ -293,12 +288,13 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 		bd->bd_Length = ios2->ios2_DataLength + sizeof(struct EthHdr);
 	}
 
-	kprintf("About to copy\n");
+	// kprintf("About to copy\n");
 
+    kprintf("[w] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	if (!bd->buffer_is_mapped)
 		WriteMemA314(bd->bd_BufferAddress, bd->bd_Buffer, bd->bd_Length);
 
-	kprintf("About to reply\n");
+	// kprintf("About to reply\n");
 
 	ios2->ios2_Req.io_Error = 0;
 	ReplyMsg(&ios2->ios2_Req.io_Message);
@@ -308,7 +304,6 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 
 static void handle_a314_reply(struct A314_IORequest *ior)
 {
-;;	TRACE("handle_a314_reply");
 
 	if (ior == &write_ior)
 	{
@@ -357,7 +352,6 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 
 static struct IOSana2Req *remove_matching_rbuf(ULONG type)
 {
-;;	TRACE("remove_matching_rbuf");
 
 	struct Node *node = ut_rbuf_list.lh_Head;
 	while (node->ln_Succ)
@@ -375,7 +369,6 @@ static struct IOSana2Req *remove_matching_rbuf(ULONG type)
 
 static void complete_read_reqs()
 {
-;;	TRACE("complete_read_reqs");
 
 	struct Node *node = et_rbuf_has_data_list.lh_Head;
 	if (!node->ln_Succ)
@@ -388,6 +381,7 @@ static void complete_read_reqs()
 
 		UWORD eh_type;
 		// Hardcoded offset (12) and size (2) of eh_Type in EthHdr.
+	    // kprintf("[r] 0x%08lx %ld bytes (complete)\n", bd->bd_BufferAddress, bd->bd_Length);
 		ReadMemA314(&eh_type, bd->bd_BufferAddress + 12, 2);
 
 		node = node->ln_Succ;
@@ -406,7 +400,6 @@ static void complete_read_reqs()
 
 static void maybe_write_req()
 {
-;;	TRACE("maybe_write_req");
 
 	if (pending_a314_write)
 		return;
@@ -467,7 +460,6 @@ static void maybe_write_req()
 
 void device_process_run()
 {
-;;	TRACE("device_process_run");
 
 	ULONG sana2_signal = AllocSignal(-1);
 	sana2_sigmask = 1UL << sana2_signal;
@@ -523,7 +515,6 @@ void device_process_run()
 
 static struct TagItem *FindTagItem(Tag tagVal, struct TagItem *tagList)
 {
-;;	TRACE("FindTagItem");
 
 	struct TagItem *ti = tagList;
 	while (ti && ti->ti_Tag != tagVal)
@@ -549,14 +540,12 @@ static struct TagItem *FindTagItem(Tag tagVal, struct TagItem *tagList)
 
 static ULONG GetTagData(Tag tagVal, ULONG defaultData, struct TagItem *tagList)
 {
-;;	TRACE("GetTagData");
 	struct TagItem *ti = FindTagItem(tagVal, tagList);
 	return ti ? ti->ti_Data : defaultData;
 }
 
 void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2, __reg("d0") ULONG unitnum, __reg("d1") ULONG flags)
 {
-;;	TRACE("open");
 
 	ios2->ios2_Req.io_Error = IOERR_OPENFAIL;
 	ios2->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
@@ -685,7 +674,6 @@ error:
 
 static BPTR close(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-;;	TRACE("close");
 
 	init_task = FindTask(NULL);
 	Signal(&device_process->pr_Task, shutdown_sigmask);
@@ -713,7 +701,6 @@ static BPTR close(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req
 
 static void device_query(struct IOSana2Req *req)
 {
-;;	TRACE("device_query");
 
 	struct Sana2DeviceQuery *query;
 
@@ -738,7 +725,6 @@ static void device_query(struct IOSana2Req *req)
 
 static void set_last_start()
 {
-;;	TRACE("set_last_start");
 
 	struct IORequest req;
 	memset(&req, 0, sizeof(req));
@@ -754,7 +740,6 @@ static void set_last_start()
 
 static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-;;	TRACE("begin_io");
 
 	ios2->ios2_Req.io_Error = S2ERR_NO_ERROR;
 	ios2->ios2_WireError = S2WERR_GENERIC_ERROR;
@@ -762,7 +747,6 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 	switch (ios2->ios2_Req.io_Command)
 	{
 	case CMD_READ:
-;;	TRACE("CMD_READ");
 		if (!ios2->ios2_BufferManagement)
 		{
 			ios2->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
@@ -781,12 +765,10 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 		break;
 
 	case S2_BROADCAST:
-;;	TRACE("S2_BROADCAST");
 		memset(ios2->ios2_DstAddr, 0xff, MACADDR_SIZE);
 		/* Fall through */
 
 	case CMD_WRITE:
-;;	TRACE("CMD_WRITE");
 		if (((ios2->ios2_Req.io_Flags & SANA2IOF_RAW) != 0 && ios2->ios2_DataLength > RAW_MTU) ||
 			((ios2->ios2_Req.io_Flags & SANA2IOF_RAW) == 0 && ios2->ios2_DataLength > ETH_MTU))
 		{
@@ -812,28 +794,23 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 		break;
 
 	case S2_CONFIGINTERFACE:
-;;	TRACE("S2_CONFIGIFACE");
 		/* Fall through */
 
 	case S2_ONLINE:
-;;	TRACE("S2_ONLINE");
 		set_last_start();
 		is_online = TRUE;
 		break;
 
 	case S2_OFFLINE:
-;;	TRACE("S2_OFFLINE");
 		is_online = FALSE;
 		break;
 
 	case S2_GETSTATIONADDRESS:
-;;	TRACE("S2_GETSTATIONADDRESS");
 		memcpy(ios2->ios2_SrcAddr, macaddr, sizeof(macaddr));
 		memcpy(ios2->ios2_DstAddr, macaddr, sizeof(macaddr));
 		break;
 
 	case S2_DEVICEQUERY:
-;;	TRACE("S2_DEVICEQUERY");
 		device_query(ios2);
 		break;
 
@@ -843,17 +820,14 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 	case S2_GETTYPESTATS:
 	case S2_READORPHAN:
 	case S2_GETSPECIALSTATS:
-;;	TRACE("S2_tracking...");
 		break;
 
 	case S2_GETGLOBALSTATS:
-;;	TRACE("S2_GETBLOBALSTATS");
 		if (ios2->ios2_StatData)
 			memcpy(ios2->ios2_StatData, &global_stats, sizeof(struct Sana2DeviceStats));
 		break;
 
 	default:
-;;	TRACE("DEFAULT NOCMD");
 		ios2->ios2_Req.io_Error = IOERR_NOCMD;
 		ios2->ios2_WireError = S2WERR_GENERIC_ERROR;
 		break;
@@ -861,25 +835,20 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 
 	if (ios2)
 	{
-;;	TRACE("  ios2");
 		if (ios2->ios2_Req.io_Flags & SANA2IOF_QUICK)
 		{
-;;	TRACE("     quick");
 			ios2->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
 		}
 		else
 		{
-;;	TRACE("     reply");
 			ReplyMsg(&ios2->ios2_Req.io_Message);
 		}
 
 	}
-;;	TRACE("< done");
 }
 
 static void remove_from_list(struct List *list, struct Node *node)
 {
-;;	TRACE("remove_from_list");
 
 	for (struct Node *n = list->lh_Head; n->ln_Succ; n = n->ln_Succ)
 	{
@@ -893,7 +862,6 @@ static void remove_from_list(struct List *list, struct Node *node)
 
 static ULONG abort_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-;;	TRACE("abort_io");
 
 	Forbid();
 	remove_from_list((struct List *)&ut_rbuf_list, &ios2->ios2_Req.io_Message.mn_Node);

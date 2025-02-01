@@ -597,6 +597,7 @@ static int spi_protocol_version()
 static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 {
     logger_trace("SPI read mem address = %d length = %d\n", address, length);
+    logger_info("[r] 0x%08lx %ld bytes\n", address, length);
 
     unsigned int header;
     if (spi_proto_ver == 1)
@@ -615,12 +616,24 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int length)
 {
     spi_read_shm_rxbuf(address, length);
+    if (length == 98)
+    {
+        logger_info("{PING}\n");
+        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
+    }
     memcpy(data, &rx_buf[READ_SRAM_HDR_LEN], length);
 }
 
 static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int length)
 {
     logger_trace("SPI write mem address = %d length = %d\n", address, length);
+    logger_info("[w] 0x%08lx %ld bytes\n", address, length);
+
+    if (length == 98)
+    {
+        logger_info("{PONG}\n");
+        DumpBuffer(buf, length);
+    }
 
     unsigned int header;
     if (spi_proto_ver == 1)
@@ -643,7 +656,30 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
         logger_error("  WRITE FAILED!\n");
         logger_error("#\n");
 
+        logger_error("{OUT}\n");
         DumpBuffer(buf, length);
+        logger_error("{READ}\n");
+        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
+
+        spi_read_shm_rxbuf(address, length);
+        if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
+        {
+            logger_error("#\n");
+            logger_error("  WRITE FAILED 2nd time!\n");
+            logger_error("#\n");
+
+            logger_error("{OUT}\n");
+            DumpBuffer(buf, length);
+            logger_error("{READ}\n");
+            DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
+        }
+        else
+        {
+            logger_error("#\n");
+            logger_error("  WRITE FAILED single fail only?!?!\n");
+            logger_error("#\n");
+        }        
+
     }
 #endif
 }
@@ -1343,6 +1379,11 @@ static void handle_msg_read_mem_req(ClientConnection *cc)
 #if defined(MODEL_TD)
     // This is an optimization to save a memcpy.
     spi_read_shm_rxbuf(address, length);
+    if (length == 98)
+    {
+        logger_info("{PING}\n");
+        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
+    }
     create_and_send_msg(cc, MSG_READ_MEM_RES, 0, &rx_buf[READ_SRAM_HDR_LEN], length);
 #else
     read_shm(rx_buf, address, length);
@@ -2413,7 +2454,7 @@ void DumpBuffer(const uint8_t* buffer, uint32_t size)
         sprintf(format + j, "'%s'\n", alphas);
 
         uint16_t* p = (uint16_t*)&buffer[i];
-        logger_trace(format, i,
+        logger_info(format, i,
            htons(p[0]), htons(p[1]), htons(p[2]), htons(p[3]), htons(p[4]), htons(p[5]), htons(p[6]), htons(p[7]));
 
         format[j] = '\0';
