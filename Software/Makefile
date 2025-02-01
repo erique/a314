@@ -10,7 +10,8 @@ BIN=bin_pi
 
 $(shell mkdir -p $(BIN) > /dev/null)
 
-all: ${BIN}/a314d-tf4060 ${BIN}/spi-a314.dtbo ${BIN}/a314d-td ${BIN}/a314d-cp ${BIN}/a314d-fe ${BIN}/spi-a314.dtbo ${BIN}/start_gpclk
+all: ${BIN}/a314d-tf4060
+# ${BIN}/spi-a314.dtbo ${BIN}/a314d-td ${BIN}/a314d-cp ${BIN}/a314d-fe ${BIN}/spi-a314.dtbo ${BIN}/start_gpclk
 
 clean:
 	rm -f ${BIN}/a314d-td
