@@ -60,6 +60,8 @@ void flush_tf(struct A314Device *dev)
 
 uint32_t SetMMU(__reg("a0") void* addr, __reg("d0") uint32_t size, __reg("d1") uint32_t flags, __reg("a6") struct ExecBase*);
 
+static void *a314_to_cpu_address(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address);
+
 int probe_pi_interface(struct A314Device *dev)
 {
     dev->tf_config = NULL;
@@ -105,7 +107,8 @@ int probe_pi_interface(struct A314Device *dev)
 
 	SetMMU(dev->tf_config, 0x4000, MAPP_IO|MAPP_CACHEINHIBIT, SysBase);
 
-	dev->ca = (struct ComArea *)AllocMem(sizeof(struct ComArea), MEMF_A314 | MEMF_CLEAR);
+	// dev->ca = (struct ComArea *)AllocMem(sizeof(struct ComArea), MEMF_A314 | MEMF_CLEAR);
+	dev->ca = (struct ComArea *)a314_to_cpu_address(dev, a314base_alloc_mem(dev, sizeof(struct ComArea)));
 	if (dev->ca == NULL)
 	{
 		dbg_error("Unable to allocate A314 memory for com area\n");
@@ -203,6 +206,12 @@ static void *a314_to_cpu_address(__reg("a6") struct A314Device *dev, __reg("d0")
     const ULONG sram_lo = 0;
     const ULONG sram_hi = SRAM_END - SRAM_START;
 
+	if (address == INVALID_A314_ADDRESS)
+	{
+		kprintf("a314_to_cpu: using %08lx is not valid!\n", address);
+		return 0;
+	}
+
 	if (sram_lo <= address && address < sram_hi)
 	{
 		void* ret = (void*)((intptr_t)dev->tf_config + SRAM_START + address);
@@ -223,16 +232,36 @@ ULONG a314base_translate_address(__reg("a6") struct A314Device *dev, __reg("a0")
 ULONG a314base_alloc_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG length)
 {
 	kprintf("a314base_alloc_mem: %ld bytes\n", length);
-	void *p = AllocMem(length, MEMF_A314);
+	length = ( length + 63 ) & (~63);
+	length += 256;
+	void *p = AllocMem(length, MEMF_A314 | MEMF_CLEAR);
 	if (!p)
 		return INVALID_A314_ADDRESS;
-	return cpu_to_a314_address(dev, p);
+	memset(p, 0xcd, length);
+	uint32_t* g = (uint32_t*)p;
+	*g++ = (uint32_t)p;
+	*g++ = length;
+	g += (128 / sizeof(uint32_t)) - 2;
+	return cpu_to_a314_address(dev, g);
 }
 
 void a314base_free_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address, __reg("d1") ULONG length)
 {
 	kprintf("a314base_free_mem: %08lx / %ld bytes\n", address, length);
+	length = ( length + 63 ) & (~63);
+	length += 256;
 	void *p = a314_to_cpu_address(dev, address);
+	uint32_t* g = (uint32_t*)p;
+	g -= (128 / sizeof(uint32_t));
+	if (g[0] != (uint32_t)p)
+	{
+		kprintf("***************** %08lx != %08lx\n", p, g[0]);
+	}
+	if (g[1] != length)
+	{
+		kprintf("***************** %ld != %ld\n", length, g[1]);
+	}
+	p = (void*)*g;
 	FreeMem(p, length);
 }
 
@@ -275,20 +304,20 @@ UBYTE read_cp_nibble(int index)
 void write_cmem_safe(int index, UBYTE value)
 {
 	Disable();
-	UBYTE prev_regd = read_cp_nibble(13);
-	write_cp_nibble(13, prev_regd | 8);
+	// UBYTE prev_regd = read_cp_nibble(13);
+	// write_cp_nibble(13, prev_regd | 8);
 	write_cp_nibble(index, value);
-	write_cp_nibble(13, prev_regd);
+	// write_cp_nibble(13, prev_regd);
 	Enable();
 }
 
 UBYTE read_cmem_safe(int index)
 {
 	Disable();
-	UBYTE prev_regd = read_cp_nibble(13);
-	write_cp_nibble(13, prev_regd | 8);
+	// UBYTE prev_regd = read_cp_nibble(13);
+	// write_cp_nibble(13, prev_regd | 8);
 	UBYTE value = read_cp_nibble(index);
-	write_cp_nibble(13, prev_regd);
+	// write_cp_nibble(13, prev_regd);
 	Enable();
 	return value;
 }
@@ -300,8 +329,8 @@ void write_base_address(ULONG ba)
 	ba |= 1;
 
 	Disable();
-	UBYTE prev_regd = read_cp_nibble(13);
-	write_cp_nibble(13, prev_regd | 8);
+	// UBYTE prev_regd = read_cp_nibble(13);
+	// write_cp_nibble(13, prev_regd | 8);
 
 	write_cp_nibble(0, 0);
 
@@ -311,15 +340,15 @@ void write_base_address(ULONG ba)
 		write_cp_nibble(i, (UBYTE)v);
 	}
 
-	write_cp_nibble(13, prev_regd);
+	// write_cp_nibble(13, prev_regd);
 	Enable();
 }
 
 ULONG read_fw_flags()
 {
 	Disable();
-	UBYTE prev_regd = read_cp_nibble(13);
-	write_cp_nibble(13, prev_regd | 8);
+	// UBYTE prev_regd = read_cp_nibble(13);
+	// write_cp_nibble(13, prev_regd | 8);
 
 	write_cp_nibble(10, 0);
 
@@ -327,7 +356,7 @@ ULONG read_fw_flags()
 	for (int i = 0; i < 4; i++)
 		flags |= ((ULONG)read_cp_nibble(10)) << (4 * i);
 
-	write_cp_nibble(13, prev_regd);
+	// write_cp_nibble(13, prev_regd);
 	Enable();
 
 	return flags;
