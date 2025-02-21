@@ -153,7 +153,7 @@ static int loglevel = LOGLEVEL_INFO;
 #define WRITE_CMEM_CMD          3
 #define SPI_PROTO_VER_CMD       255
 
-#define READ_SRAM_HDR_LEN       4
+#define READ_SRAM_HDR_LEN       5
 
 // Addresses to variables in CMEM.
 #define BASE_ADDRESS_LEN        6
@@ -255,7 +255,7 @@ static uint8_t mode = SPI_CS_HIGH;
 static uint8_t bits = 8;
 static uint32_t speed = 67000000;
 
-#if defined(TF4060)
+#if 0 //defined(TF4060)
 struct ff_spi* spi = NULL;
 #else
 static int spi_fd = -1;
@@ -437,7 +437,9 @@ static void load_config_file(const char *filename)
 
 #if defined(MODEL_TD)
 
-#if defined(TF4060)
+void DumpBuffer(const uint8_t* buffer, uint32_t size);
+
+#if 0 //defined(TF4060)
 
 #define S_MOSI 10
 #define S_MISO 9
@@ -450,8 +452,6 @@ static void load_config_file(const char *filename)
 #define S_D1 S_MISO
 #define S_D2 S_WP
 #define S_D3 S_HOLD
-
-void DumpBuffer(const uint8_t* buffer, uint32_t size);
 
 static int init_spi()
 {
@@ -524,7 +524,7 @@ again:
 
     // logger_trace("  RX:\n");
     // DumpBuffer(rx_buf, len);
-
+    usleep(10);
     spiEnd(spi);
     // logger_trace("}\n");
     return 0;
@@ -532,7 +532,7 @@ again:
 #else
 static int init_spi()
 {
-    spi_fd = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
+    spi_fd = open("/dev/spidev0.1", O_RDWR | O_CLOEXEC);
     if (spi_fd < 0)
         return -1;
 
@@ -541,6 +541,14 @@ static int init_spi()
     ret |= ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
     if (ret != 0)
         return ret;
+
+    logger_info("spi speed = %d\n", speed);
+    const uint32_t limit = 6*1000*1000;
+    if (speed > limit)
+    {
+        speed = limit;
+        logger_info("spi speed limited to %d\n", speed);
+    }
 
     return 0;
 }
@@ -589,15 +597,17 @@ static int spi_protocol_version()
 {
     tx_buf[0] = (uint8_t)SPI_PROTO_VER_CMD;
     tx_buf[1] = 0;
-    spi_transfer(2);
-    logger_info("SPI protocol version = %d\n", rx_buf[1]);
-    return (int)rx_buf[1];
+    tx_buf[2] = 0;
+    spi_transfer(3);
+    logger_info("SPI protocol version = %d\n", rx_buf[2]);
+    return (int)rx_buf[2];
 }
 
 static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 {
     logger_trace("SPI read mem address = %d length = %d\n", address, length);
-    logger_info("[r] 0x%08lx %ld bytes\n", address, length);
+    if (!(address == 0xa0 && length == 4))
+        logger_debug("[r] 0x%08lx %ld bytes\n", address, length);
 
     unsigned int header;
     if (spi_proto_ver == 1)
@@ -609,8 +619,9 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
     tx_buf[1] = (uint8_t)((header >> 8) & 0xff);
     tx_buf[2] = (uint8_t)(header & 0xff);
 	tx_buf[3] = 0;
+	tx_buf[4] = 0;
 
-    spi_transfer(length + 4);
+    spi_transfer(length + 5);
 }
 
 static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int length)
@@ -627,7 +638,7 @@ static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int
 static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int length)
 {
     logger_trace("SPI write mem address = %d length = %d\n", address, length);
-    logger_info("[w] 0x%08lx %ld bytes\n", address, length);
+    logger_debug("[w] 0x%08lx %ld bytes\n", address, length);
 
     if (length == 98)
     {
@@ -648,7 +659,7 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
     memcpy(&tx_buf[3], buf, length);
     spi_transfer(length + 3);
 
-#if defined(TF4060)
+#if 0 //defined(TF4060)
     spi_read_shm_rxbuf(address, length);
     if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
     {
@@ -1135,7 +1146,10 @@ static int init_gpio_irq()
 {
     int chip_fd = open("/dev/gpiochip0", O_RDWR);
     if (chip_fd < 0)
+    {
+        logger_error("/dev/gpiochip0 failed\n");
         return -1;
+    }
 
     struct gpio_v2_line_request line_req = {
         .offsets = {IRQ_GPIO},
@@ -1148,11 +1162,17 @@ static int init_gpio_irq()
 
     int err = ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &line_req);
     if (err == -1)
+    {
+        logger_error("ioctl() failed\n");
         return -2;
+    }
 
     gpio_irq_fd = line_req.fd;
     if (gpio_irq_fd < 0)
+    {
+        logger_error("gpio_irq_fd failed\n");
         return -3;
+    }
 
     return 0;
 }
@@ -1242,7 +1262,10 @@ static int init_driver()
 #endif
 
     if (init_gpio_irq() != 0)
+    {
+        logger_warning("init_gpio_irq() failed\n");
         return -1;
+    }
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1)
@@ -2285,7 +2308,7 @@ static void main_loop()
     while (!done)
     {
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 1000, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, 0, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)
