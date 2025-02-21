@@ -161,7 +161,7 @@ static void spi_set_state(struct ff_spi *spi, enum spi_state state) {
 
 void spiPause(struct ff_spi *spi) {
 	(void)spi;
-	usleep(10);
+	// usleep(10);
 	return;
 }
 
