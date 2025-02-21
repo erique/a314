@@ -43,8 +43,8 @@ void signal_tf(struct A314Device *dev)
 	if (!tf)
 		return;
 	// Disable();	// already disabled
-	spiBegin(tf);
-	spiEnd(tf);
+	// spiBegin(tf);
+	// spiEnd(tf);
 	// Enable();
 }
 
