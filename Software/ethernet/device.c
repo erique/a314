@@ -25,6 +25,8 @@
 #include "../a314device/proto_a314.h"
 #include "../a314device/kprintf.h"
 
+//#define kprintf(...) do {} while(0)
+
 #define TRACE(func) do{ kprintf("A314eth: [%s:%ld]\n", func, __LINE__); }while(0)
 
 // Defines.
@@ -213,7 +215,7 @@ static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 	// This will avoid copying from A314 shared memory to shadow buffer
 	// before copying to stack's buffer.
 
-    kprintf("[r] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
+    // kprintf("[r] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	ReadMemA314(bd->bd_Buffer, bd->bd_BufferAddress, bd->bd_Length);
 
 	struct EthHdr *eh = bd->bd_Buffer;
@@ -258,7 +260,7 @@ static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 {
 
-		kprintf("A314eth: ios2 = %08lx\n", ios2);
+		// kprintf("A314eth: ios2 = %08lx\n", ios2);
 	// TODO: Use S2_DMACopyFromBuff32 instead of S2_CopyFromBuff (if possible).
 	// This will avoid copying to shadow buffer before writing to
 	// A314 shared memory.
@@ -274,10 +276,10 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 	}
 	else
 	{
-		kprintf("A314eth: COOKED\n");
+		// kprintf("A314eth: COOKED\n");
 
-		kprintf("A314eth: eh = %08lx\n", eh);
-		kprintf("A314eth: ios2->ios2_Data = %08lx\n", ios2->ios2_Data);
+		// kprintf("A314eth: eh = %08lx\n", eh);
+		kprintf(/*A314eth: ios2->ios2_Data = */"%08lx\n", ios2->ios2_Data);
 
 		eh->eh_Type = ios2->ios2_PacketType;
 		memcpy(eh->eh_Src, macaddr, sizeof(macaddr));
@@ -288,7 +290,7 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 
 	// kprintf("About to copy\n");
 
-    kprintf("[w] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
+    // kprintf("[w] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	WriteMemA314(bd->bd_BufferAddress, bd->bd_Buffer, bd->bd_Length);
 
 	// kprintf("About to reply\n");
