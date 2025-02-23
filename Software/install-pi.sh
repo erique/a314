@@ -16,6 +16,8 @@ modinstall() {
 }
 
 install_common() {
+	apt install -y ifupdown
+
 	echo "services..."
 	install a314d/a314d.py /opt/a314
 	install picmd/picmd.py /opt/a314
