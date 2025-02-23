@@ -16,6 +16,8 @@ modinstall() {
 }
 
 install_common() {
+	apt install -y ifupdown
+
 	install a314d/a314d.py /opt/a314
 	install picmd/picmd.py /opt/a314
 	install a314fs/a314fs.py /opt/a314
