@@ -146,6 +146,38 @@ static int loglevel = LOGLEVEL_INFO;
 #endif
 
 #if defined(MODEL_TD)
+#if defined(TF4060)
+
+// SPI commands.
+#define READ_SRAM_CMD           0
+#define WRITE_SRAM_CMD          1
+#define READ_SINT_CMD           2
+#define WRITE_SINT_CMD          3
+#define SPI_PROTO_VER_CMD       255
+
+#define SPI_PROTO_HDR_LEN       3           // 1 cmd byte + 2 delay
+#define READ_SRAM_HDR_LEN       5           // 3 cmd bytes + 2 delay
+#define READ_CMEM_HDR_LEN       3           // 1 cmd byte + 2 delay
+#define READ_SINT_HDR_LEN       3           // 1 cmd byte + 2 delay
+
+// Bit 7 Set/Clear on write 
+// Bit 6 Amiga Interrupts Enabled (INT2). 1 = Enabled, 0 = Disabled
+// Bit 5 RPi (Remote Interrupt). 1 = Pending, 0 = Not Pending (Amiga Can set but not Clear, RPi Can clear but not set)
+// Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending (Amiga can clear but not set, RPi Can set but not clear)
+// Bit 3 Unused
+// Bit 2 Unused
+// Bit 1 Unused
+// Bit 0 Reset Event 
+
+#define REG_IRQ_SET             0x80
+#define REG_IRQ_CLR             0x00
+#define REG_IRQ_INTENA          0x40
+#define REG_IRQ_RPI             0x20
+#define REG_IRQ_AMIGA           0x10
+#define REG_IRQ_RESET           0x01
+
+#else // ! TF4060
+
 // SPI commands.
 #define READ_SRAM_CMD           0
 #define WRITE_SRAM_CMD          1
@@ -153,7 +185,10 @@ static int loglevel = LOGLEVEL_INFO;
 #define WRITE_CMEM_CMD          3
 #define SPI_PROTO_VER_CMD       255
 
-#define READ_SRAM_HDR_LEN       5
+#define SPI_PROTO_HDR_LEN       1
+#define READ_SRAM_HDR_LEN       4
+#define READ_CMEM_HDR_LEN       1
+#define READ_SINT_HDR_LEN       1
 
 // Addresses to variables in CMEM.
 #define BASE_ADDRESS_LEN        6
@@ -170,6 +205,8 @@ static int loglevel = LOGLEVEL_INFO;
 // Events that are communicated from Raspberry to Amiga.
 #define A_EVENT_R2A_TAIL        1
 #define A_EVENT_A2R_HEAD        2
+
+#endif // TF4060
 
 #elif defined(MODEL_FE)
 #define PIN_D(x)                (4 + x)
@@ -285,7 +322,11 @@ static bool have_base_address = false;
 static unsigned int base_address = 0;
 
 #if defined(MODEL_TD) || defined(MODEL_FE)
-#define BASE_ADDRESS base_address
+    #if defined(TF4060)
+        #define BASE_ADDRESS 0
+    #else
+        #define BASE_ADDRESS base_address
+    #endif
 #elif defined(MODEL_CP)
 #define BASE_ADDRESS 0
 #endif
@@ -598,9 +639,9 @@ static int spi_protocol_version()
     tx_buf[0] = (uint8_t)SPI_PROTO_VER_CMD;
     tx_buf[1] = 0;
     tx_buf[2] = 0;
-    spi_transfer(3);
-    logger_info("SPI protocol version = %d\n", rx_buf[2]);
-    return (int)rx_buf[2];
+    spi_transfer(1 /* 1 byte spi proto ver*/ + SPI_PROTO_HDR_LEN);
+    logger_info("SPI protocol version = %d\n", rx_buf[SPI_PROTO_HDR_LEN]);
+    return (int)rx_buf[SPI_PROTO_HDR_LEN];
 }
 
 static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
@@ -610,7 +651,7 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
         logger_debug("[r] 0x%08lx %ld bytes\n", address, length);
 
     unsigned int header;
-    if (spi_proto_ver == 1)
+    if (spi_proto_ver >= 1)
         header = (READ_SRAM_CMD << 21) | (address & 0x1fffff);
     else
         header = (READ_SRAM_CMD << 20) | (address & 0xfffff);
@@ -621,7 +662,7 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 	tx_buf[3] = 0;
 	tx_buf[4] = 0;
 
-    spi_transfer(length + 5);
+    spi_transfer(length + READ_SRAM_HDR_LEN);
 }
 
 static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int length)
@@ -647,7 +688,7 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
     }
 
     unsigned int header;
-    if (spi_proto_ver == 1)
+    if (spi_proto_ver >= 1)
         header = (WRITE_SRAM_CMD << 21) | (address & 0x1fffff);
     else
         header = (WRITE_SRAM_CMD << 20) | (address & 0xfffff);
@@ -695,30 +736,45 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
 #endif
 }
 
+#if defined(TF4060)
+static uint8_t spi_read_sint()
+{
+    logger_trace("SPI read sint");
+    tx_buf[0] = (uint8_t) (READ_SINT_CMD << 5);
+    spi_transfer(1 /* 1 byte cmd */ + READ_SINT_HDR_LEN);
+    logger_trace("SPI read sint returned = %d\n", rx_buf[READ_SINT_HDR_LEN]);
+    return rx_buf[READ_SINT_HDR_LEN];
+}
+
+static void spi_write_sint(unsigned int data)
+{
+    data &= 0xf0;       // only upper bits used
+    logger_trace("SPI write sint, data = %d\n", data);
+    data >>= 4;         // only upper bits sent
+    tx_buf[0] = (uint8_t) (WRITE_SINT_CMD << 5) | (data & 0xf);
+    spi_transfer(1);
+}
+
+#else
+
 static uint8_t spi_read_cmem(unsigned int address)
 {
-    int tx_len =
-#if defined(TF4060)
-    3;
-#else
-    2;
-#endif
-    if (spi_proto_ver == 1)
+    if (spi_proto_ver >= 1)
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 5) | (address & 0xf));
     else
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 4) | (address & 0xf));
     tx_buf[1] = 0;
     tx_buf[2] = 0;
-    spi_transfer(tx_len);
-    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[tx_len-1]);
-    return rx_buf[tx_len-1];
+    spi_transfer(1 /* 1 byte cmd */ + READ_CMEM_HDR_LEN);
+    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[READ_CMEM_HDR_LEN]);
+    return rx_buf[READ_CMEM_HDR_LEN];
 }
 
 static void spi_write_cmem(unsigned int address, unsigned int data)
 {
     logger_trace("SPI write cmem, address = %d, data = %d\n", address, data);
 
-    if (spi_proto_ver == 1)
+    if (spi_proto_ver >= 1)
         tx_buf[0] = (uint8_t)((WRITE_CMEM_CMD << 5) | (address & 0xf));
     else
         tx_buf[0] = (uint8_t)((WRITE_CMEM_CMD << 4) | (address & 0xf));
@@ -762,6 +818,7 @@ static void spi_read_base_address()
     }
 #endif
 }
+#endif
 
 #define read_shm spi_read_shm
 #define write_shm spi_write_shm
@@ -1249,7 +1306,7 @@ static int init_driver()
 
     spi_proto_ver = spi_protocol_version();
 #if defined(TF4060)
-    while (spi_proto_ver != 1)
+    while (spi_proto_ver != 2)
     {
         logger_warning("Bad SPI protocol version (%02x); retrying...\r", spi_proto_ver);
         usleep(1000);
@@ -1934,12 +1991,16 @@ static void write_channel_status()
 #endif
 
 #if defined(MODEL_TD)
+#if defined(TF4060)
+        spi_write_sint(REG_IRQ_SET | REG_IRQ_AMIGA);
+#else // !defined(TF4060)
         unsigned int events = 0;
         if (channel_status_updated & R2A_TAIL_UPDATED)
             events |= A_EVENT_R2A_TAIL;
         if (channel_status_updated & A2R_HEAD_UPDATED)
             events |= A_EVENT_A2R_HEAD;
         spi_write_cmem(A_EVENTS_ADDRESS, events);
+#endif // !defined(TF4060)
 #elif defined(MODEL_FE)
         uint32_t irq = 0;
         if (channel_status_updated & R2A_TAIL_UPDATED)
@@ -1980,29 +2041,65 @@ static void close_all_logical_channels()
 }
 
 #if defined(MODEL_TD)
+#if defined(TF4060)
+static void handle_a314_irq()
+{
+    uint8_t irq = spi_read_sint();
+
+    spi_write_sint(REG_IRQ_RPI);    // clear RPI regardless
+
+    if (irq & REG_IRQ_RESET)
+    {
+        if (channels.empty())
+            return;
+
+        logger_info("Base address was updated while logical channels are open -- closing channels\n");
+        close_all_logical_channels();
+        return;
+    }
+
+    if (!(irq & REG_IRQ_RPI))
+        return;
+
+    read_channel_status();
+
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
+
+    receive_from_a2r();
+    flush_send_queue();
+
+    {
+        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
+    }
+
+    write_channel_status();
+
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
+}
+#else // !defined(TF4060)
 static void handle_a314_irq()
 {
     uint8_t events = spi_ack_irq();
     if (events == 0)
-#if defined(TF4060)
-    {
-        if (!have_base_address)
-            return;
-
-        uint8_t new_channel_status[4];
-        read_shm(new_channel_status, BASE_ADDRESS + CAP_BASE, 4);
-        if (memcmp(channel_status, new_channel_status, 4) == 0)
-        {
-            logger_trace("spurious wakeup.. \n");
-            return;
-        }
-        logger_trace("#\n");
-        logger_trace("  CMEM[12] read zero -- BUT THE CHANNEL STATUS IS UPDATED!\n");
-        logger_trace("#\n");
-    }
-#else
         return;
-#endif
 
     if ((events & R_EVENT_BASE_ADDRESS) || !have_base_address)
     {
@@ -2018,44 +2115,12 @@ static void handle_a314_irq()
 
     read_channel_status();
 
-
-#if defined(TF4060)
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
-#endif
-
     receive_from_a2r();
     flush_send_queue();
 
-#if defined(TF4060)
-    {
-        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
-    }
-#endif
-
     write_channel_status();
-
-#if defined(TF4060)
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
-#endif
 }
+#endif // !defined(TF4060)
 #elif defined(MODEL_FE)
 static void handle_a314_irq()
 {
@@ -2432,7 +2497,7 @@ int main(int argc, char **argv)
     return 0;
 }
 
-#if defined(TF4060)
+#if defined(MODEL_TD) || defined(TF4060)
 void DumpBuffer(const uint8_t* buffer, uint32_t size)
 {
     uint32_t i, j, len;
