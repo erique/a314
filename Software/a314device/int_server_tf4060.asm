@@ -14,13 +14,13 @@ A_EVENT_R2A_TAIL        equ	1
 A_EVENT_A2R_HEAD        equ	2
 
 INTENA		equ	$dff09a
-CMEM		equ	$e903f0
+SINT		equ	$e903f4
 
 SIGB_INT	equ	14
 SIGF_INT	equ	(1<<SIGB_INT)
 
 		; a1 points to driver task
-_IntServer:	lea.l	CMEM,a5
+_IntServer:	lea.l	SINT,a5
 
 		move	#$4000,INTENA
 
@@ -33,9 +33,8 @@ _IntServer:	lea.l	CMEM,a5
 		move.l	#(1<<11),d1 ;CACRF_ClearD
 		jsr	    -642(a6)	; CacheClearE()
 
-		move.b	A_EVENTS_ADDRESS(a5),d0	; A_EVENTS
-		and.b	A_ENABLE_ADDRESS(a5),d0	; A_ENABLE
-		and.b	#$f,d0
+		move.b	(a5),d0
+		and.b	#1<<4,d0		; Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending
 		bne.s	should_signal
 
 		move	#$c000,INTENA
@@ -44,7 +43,7 @@ _IntServer:	lea.l	CMEM,a5
 
 should_signal:
 ;		kprintf "$$ irq %lx",d0
-		move.b	#0,A_ENABLE_ADDRESS(a5)	; A_ENABLE
+		move.b	#1<<4,(a5)		; clear bit 4
 
 		move	#$c000,INTENA
 
