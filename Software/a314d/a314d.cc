@@ -739,17 +739,17 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
 #if defined(TF4060)
 static uint8_t spi_read_sint()
 {
-    logger_trace("SPI read sint");
+//    logger_trace("SPI read sint");
     tx_buf[0] = (uint8_t) (READ_SINT_CMD << 5);
     spi_transfer(1 /* 1 byte cmd */ + READ_SINT_HDR_LEN);
-    logger_trace("SPI read sint returned = %d\n", rx_buf[READ_SINT_HDR_LEN]);
+//    logger_trace("SPI read sint returned = %d\n", rx_buf[READ_SINT_HDR_LEN]);
     return rx_buf[READ_SINT_HDR_LEN];
 }
 
 static void spi_write_sint(unsigned int data)
 {
     data &= 0xf0;       // only upper bits used
-    logger_trace("SPI write sint, data = %d\n", data);
+//    logger_trace("SPI write sint, data = %d\n", data);
     data >>= 4;         // only upper bits sent
     tx_buf[0] = (uint8_t) (WRITE_SINT_CMD << 5) | (data & 0xf);
     spi_transfer(1);
@@ -2058,6 +2058,8 @@ static void handle_a314_irq()
         return;
     }
 
+    logger_trace("irq = %02x\n", irq);
+
     if (!(irq & REG_IRQ_RPI))
         return;
 
@@ -2373,7 +2375,7 @@ static void main_loop()
     while (!done)
     {
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 0, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, 1, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)

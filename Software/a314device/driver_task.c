@@ -614,8 +614,6 @@ void task_main()
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
 
-		dbg_trace("Returned from Wait() with signal=$l", signal);
-
 		{
 			uint8_t a2r_head = cap->a2r_head;
 			uint8_t a2r_tail = cap->a2r_tail;
@@ -629,7 +627,7 @@ void task_main()
 
 		// read_pi_cap(dev);
 
-		dbg_trace("Read CAP, r2a_tail=$b, a2r_head=$b", dev->cap.r2a_tail, dev->cap.a2r_head);
+		// dbg_trace("Read CAP, r2a_tail=$b, a2r_head=$b", dev->cap.r2a_tail, dev->cap.a2r_head);
 
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
@@ -652,7 +650,7 @@ void task_main()
 
 		if (prev_a2r_tail != cap->a2r_tail || prev_r2a_head != cap->r2a_head)
 		{
-			dbg_trace("Writing CAP, a2r_tail=$b, r2a_head=$b", dev->cap.a2r_tail, dev->cap.r2a_head);
+			// dbg_trace("Writing CAP, a2r_tail=$b, r2a_head=$b", dev->cap.a2r_tail, dev->cap.r2a_head);
 
 			{
 				uint8_t a2r_head = cap->a2r_head;
