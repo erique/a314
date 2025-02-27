@@ -23,37 +23,52 @@
 #define SysBase (*(struct ExecBase **)4)
 
 /*
-0xE903F0 - 0E903FF  CMEM Registers (upper 4 bits only)
+0xE903F4            SINT
 0xE90400 - 0E93FFF  SRAM
 */
 
-static volatile UBYTE* cmem = 0;
-//#define CMEM_PTR(reg) ((volatile UBYTE *)(cpa + (reg << 2)))
-
-#define CMEM       0x03F0
+#define SINT       0x03F4
 #define SRAM_START 0x0400
 #define SRAM_END   0x4000
 
+// SINT:
+//
+// Bit 7 Set/Clear on write 
+// Bit 6 Amiga Interrupts Enabled (INT2). 1 = Enabled, 0 = Disabled
+// Bit 5 RPi (Remote Interrupt). 1 = Pending, 0 = Not Pending (Amiga Can set but not Clear, RPi Can clear but not set)
+// Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending (Amiga can clear but not set, RPi Can set but not clear)
+// Bit 3 Unused
+// Bit 2 Unused
+// Bit 1 Unused
+// Bit 0 Reset Event 
+
+#define REG_IRQ_SET             0x80
+#define REG_IRQ_CLR             0x00
+#define REG_IRQ_INTENA          0x40
+#define REG_IRQ_RPI             0x20
+#define REG_IRQ_AMIGA           0x10
+#define REG_IRQ_RESET           0x01
+
+void set_pi_irq(struct A314Device *dev)
+{
+	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
+	*sint = REG_IRQ_SET | REG_IRQ_RPI;
+}
+
+void clear_amiga_irq(struct A314Device *dev)
+{
+	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
+	*sint = REG_IRQ_AMIGA;
+}
+
+static void clear_reset(struct A314Device *dev)
+{
+	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
+	*sint = REG_IRQ_RESET;
+}
+
 static void spiBegin(struct TFConfig* tfConfig)             { tfConfig->TF_SpiCtrl = 0x00; }
 static void spiEnd(struct TFConfig* tfConfig)               { tfConfig->TF_SpiCtrl = 0xFF; }
-
-void signal_tf(struct A314Device *dev)
-{
-	struct TFConfig* tf = (struct TFConfig*)dev->tf_config;
-	if (!tf)
-		return;
-	// Disable();	// already disabled
-	// spiBegin(tf);
-	// spiEnd(tf);
-	// Enable();
-}
-
-void flush_tf(struct A314Device *dev)
-{
-    cmem = (void*)(((intptr_t)dev->tf_config) + CMEM);
-    const ULONG mem_size = SRAM_END - CMEM;
-	CacheClearE(cmem, mem_size, CACRF_ClearD);
-}
 
 #define MAPP_CACHEINHIBIT     (1<<6)
 #define MAPP_IO               (1<<30)
@@ -98,22 +113,30 @@ int probe_pi_interface(struct A314Device *dev)
     	return FALSE;
     }
 
-    cmem = (void*)(((intptr_t)dev->tf_config) + CMEM);
-
     const void* sram = (void*)(((intptr_t)dev->tf_config) + SRAM_START);
     const ULONG sram_size = SRAM_END - SRAM_START;
 
-	AddMemList( sram_size, MEMF_A314, -128, sram, "A314-TF4060" );
-
-	SetMMU(dev->tf_config, 0x4000, MAPP_IO|MAPP_CACHEINHIBIT, SysBase);
-
 	// dev->ca = (struct ComArea *)AllocMem(sizeof(struct ComArea), MEMF_A314 | MEMF_CLEAR);
-	dev->ca = (struct ComArea *)a314_to_cpu_address(dev, a314base_alloc_mem(dev, sizeof(struct ComArea)));
+	dev->ca = sram;
 	if (dev->ca == NULL)
 	{
 		dbg_error("Unable to allocate A314 memory for com area\n");
 		return FALSE;
 	}
+	memset(dev->ca, 0, sizeof(struct ComArea));
+
+	const uint32_t ca_cutout = 1024;
+	if (ca_cutout < sizeof(struct ComArea))
+	{
+		dbg_error("A314 memory for com area to big!\n");
+		return FALSE;
+	}
+
+	const void* memstart = (void*)((intptr_t)sram + ca_cutout);
+	const ULONG memsize = sram_size - ca_cutout;
+	AddMemList( memsize, MEMF_A314, -128, memstart, "A314-TF4060" );
+
+	SetMMU(dev->tf_config, 0x4000, MAPP_IO|MAPP_CACHEINHIBIT, SysBase);
 
 	return TRUE;
 }
@@ -145,16 +168,11 @@ static void add_interrupt_handlers(struct A314Device *dev)
 
 void setup_pi_interface(struct A314Device *dev)
 {
-	write_cmem_safe(A_ENABLE_ADDRESS, 0);
-	read_cmem_safe(A_EVENTS_ADDRESS);
-
-	write_base_address(a314base_translate_address(dev, dev->ca));
-
-	write_cmem_safe(R_EVENTS_ADDRESS, R_EVENT_BASE_ADDRESS);
+	clear_amiga_irq(dev);
 
 	add_interrupt_handlers(dev);
 
-	write_cmem_safe(A_ENABLE_ADDRESS, A_EVENT_R2A_TAIL);
+	clear_reset(dev);
 }
 
 
@@ -279,85 +297,4 @@ void a314base_read_mem(__reg("a6") struct A314Device *dev, __reg("a0") UBYTE *ds
 	UBYTE *src = a314_to_cpu_address(dev, address);
 	memcpy(dst, src, length);
 	// DumpBuffer(dst, length);
-}
-
-// unused? (cp version)
-// extern void read_pi_cap(struct A314Device *dev)
-// extern void write_amiga_cap(struct A314Device *dev);
-
-void write_cp_nibble(int index, UBYTE value)
-{
-	// kprintf("write_cp_nibble: [%ld] <= %lx\n", index, value);
-	volatile UBYTE *p = cmem;
-	p += index;
-	*p = value & 0xf;
-}
-UBYTE read_cp_nibble(int index)
-{
-	volatile UBYTE *p = cmem;
-	p += index;
-	UBYTE ret = *p & 0xf;
-	// kprintf("read_cp_nibble: [%ld] => %lx\n", index, ret);
-	return ret;
-}
-
-void write_cmem_safe(int index, UBYTE value)
-{
-	Disable();
-	// UBYTE prev_regd = read_cp_nibble(13);
-	// write_cp_nibble(13, prev_regd | 8);
-	write_cp_nibble(index, value);
-	// write_cp_nibble(13, prev_regd);
-	Enable();
-}
-
-UBYTE read_cmem_safe(int index)
-{
-	Disable();
-	// UBYTE prev_regd = read_cp_nibble(13);
-	// write_cp_nibble(13, prev_regd | 8);
-	UBYTE value = read_cp_nibble(index);
-	// write_cp_nibble(13, prev_regd);
-	Enable();
-	return value;
-}
-
-#define BASE_ADDRESS_LEN	6
-
-void write_base_address(ULONG ba)
-{
-	ba |= 1;
-
-	Disable();
-	// UBYTE prev_regd = read_cp_nibble(13);
-	// write_cp_nibble(13, prev_regd | 8);
-
-	write_cp_nibble(0, 0);
-
-	for (int i = BASE_ADDRESS_LEN - 1; i >= 0; i--)
-	{
-		ULONG v = (ba >> (i * 4)) & 0xf;
-		write_cp_nibble(i, (UBYTE)v);
-	}
-
-	// write_cp_nibble(13, prev_regd);
-	Enable();
-}
-
-ULONG read_fw_flags()
-{
-	Disable();
-	// UBYTE prev_regd = read_cp_nibble(13);
-	// write_cp_nibble(13, prev_regd | 8);
-
-	write_cp_nibble(10, 0);
-
-	ULONG flags = 0;
-	for (int i = 0; i < 4; i++)
-		flags |= ((ULONG)read_cp_nibble(10)) << (4 * i);
-
-	// write_cp_nibble(13, prev_regd);
-	Enable();
-
-	return flags;
 }
