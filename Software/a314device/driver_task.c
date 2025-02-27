@@ -600,12 +600,81 @@ static void set_timeout(struct A314Device *dev)
 #if defined(MODEL_TD)
 
 #if defined(TF4060)
-void signal_tf(struct A314Device *dev);
-void flush_tf(struct A314Device *dev);
-#else
-void signal_tf(struct A314Device *dev){}
-void flush_tf(struct A314Device *dev){}
-#endif
+
+void task_main()
+{
+	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
+	struct ComAreaPtrs *cap = CAP_PTR(dev);
+
+	while (TRUE)
+	{
+		dbg_trace("Invoking Wait()");
+
+		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT);
+
+		dbg_trace("Returned from Wait() with signal=$l", signal);
+
+		dbg_trace("Returned from Wait() with signal=$l", signal);
+
+		{
+			uint8_t a2r_head = cap->a2r_head;
+			uint8_t a2r_tail = cap->a2r_tail;
+			uint8_t r2a_head = cap->r2a_head;
+			uint8_t r2a_tail = cap->r2a_tail;
+			int a2r_len = (a2r_tail - a2r_head) & 255;
+			int r2a_len = (r2a_tail - r2a_head) & 255;
+
+			dbg_trace("RD: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+		}
+
+		// read_pi_cap(dev);
+
+		dbg_trace("Read CAP, r2a_tail=$b, a2r_head=$b", dev->cap.r2a_tail, dev->cap.a2r_head);
+
+		UBYTE prev_a2r_tail = cap->a2r_tail;
+		UBYTE prev_r2a_head = cap->r2a_head;
+
+		// TODO: Perhaps have two separate events for r2a_tail and a2r_head.
+		//       Perhaps also have enable/disable those events separately.
+
+		if (signal & SIGF_MSGPORT)
+		{
+			struct Message *msg;
+			while (msg = GetMsg(&dev->task_mp))
+				handle_app_request(dev, (struct A314_IORequest *)msg);
+		}
+
+		// TODO: May want to read r2a_tail and a2r_head from shared memory again,
+		// and process anything left, in order to interrupt less.
+
+		handle_packets_received_r2a(dev);
+		handle_room_in_a2r(dev);
+
+		if (prev_a2r_tail != cap->a2r_tail || prev_r2a_head != cap->r2a_head)
+		{
+			dbg_trace("Writing CAP, a2r_tail=$b, r2a_head=$b", dev->cap.a2r_tail, dev->cap.r2a_head);
+
+			{
+				uint8_t a2r_head = cap->a2r_head;
+				uint8_t a2r_tail = cap->a2r_tail;
+				uint8_t r2a_head = cap->r2a_head;
+				uint8_t r2a_tail = cap->r2a_tail;
+				int a2r_len = (a2r_tail - a2r_head) & 255;
+				int r2a_len = (r2a_tail - r2a_head) & 255;
+
+				dbg_trace("WR: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+			}
+
+			// write_amiga_cap(dev);
+
+			set_pi_irq(dev);
+		}
+	}
+
+	// There is currently no way to unload a314.device.
+}
+
+#else // defined(TF4060)
 
 void task_main()
 {
@@ -621,8 +690,6 @@ void task_main()
 		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT | SIGF_TIMER);
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
-
-		flush_tf(dev);
 
 		{
 			uint8_t a2r_head = cap->a2r_head;
@@ -717,6 +784,7 @@ void task_main()
 
 	// There is currently no way to unload a314.device.
 }
+#endif // defined(TF4060)
 
 #elif defined(MODEL_FE)
 
