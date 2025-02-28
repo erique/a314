@@ -20,7 +20,8 @@ class EchoService(object):
         self.current_stream_id = None
 
     def process_stream_data(self, stream_id: int, data: bytes):
-        logger.info('stream data from ' + stream_id + ' bytes ' + data.len)
+        logger.info('stream data from ' + str(stream_id) + ' bytes ' + str(len(data)))
+        self.a314d.send_data(self.current_stream_id, data)
 
     def process_a314d_msg(self, stream_id, ptype, payload):
         if ptype == self.a314d.MSG_CONNECT:
