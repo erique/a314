@@ -29,6 +29,7 @@ install_common() {
 	install hid/hid.py /opt/a314
 	install remote-mouse/remote-mouse.py /opt/a314
 	install videoplayer/videoplayer.py /opt/a314
+	install echo/echo.py /opt/a314
 
 	echo "config..."
 	# Write configuration files, but don't overwrite
