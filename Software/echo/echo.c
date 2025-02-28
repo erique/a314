@@ -38,6 +38,8 @@ static BOOL pending_a314_reset = FALSE;
 
 static BOOL stream_closed = FALSE;
 
+static ULONG ping_count = 0xbadc0ffe;
+
 #pragma pack(push, 1)
 struct EchoMessage
 {
@@ -96,8 +98,16 @@ static LONG sync_a314_reset()
 	return WaitIO((struct IORequest *)cmsg);
 }
 
-static void write_input_event()
+static void read_result()
 {
+	ULONG result = 
+		(arbuf[0] <<  0) |
+		(arbuf[1] <<  8) |
+		(arbuf[2] << 16) |
+		(arbuf[3] << 24);
+
+	printf("result = %08lx\n", result);
+
 #if 0
 	struct EventMessage *em = (struct EventMessage *)arbuf;
 
@@ -142,7 +152,7 @@ static void handle_a314_read_completed()
 	int res = rmsg->a314_Request.io_Error;
 	if (res == A314_READ_OK)
 	{
-		write_input_event();
+		read_result();
 		start_a314_read();
 	}
 	else if (res == A314_READ_EOS)
@@ -179,6 +189,12 @@ int main()
 	}
 
 	start_a314_read();
+
+	awbuf[0] = (ping_count >>  0) & 0xff;
+	awbuf[1] = (ping_count >>  8) & 0xff;
+	awbuf[2] = (ping_count >> 16) & 0xff;
+	awbuf[3] = (ping_count >> 24) & 0xff;
+	sync_a314_write(sizeof(ping_count));
 
 	ULONG portsig = 1 << mp->mp_SigBit;
 
