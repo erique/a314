@@ -584,7 +584,7 @@ static int init_spi()
         return ret;
 
     logger_info("spi speed = %d\n", speed);
-    const uint32_t limit = 6*1000*1000;
+    const uint32_t limit = 25*1000*1000;
     if (speed > limit)
     {
         speed = limit;
