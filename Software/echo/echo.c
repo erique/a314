@@ -98,48 +98,41 @@ static LONG sync_a314_reset()
 	return WaitIO((struct IORequest *)cmsg);
 }
 
-static void read_result()
+static void send_ping(ULONG ping)
 {
-	ULONG result = 
+	printf("sending = %08lx\n", ping); fflush(stdout);
+	awbuf[0] = (ping >>  0) & 0xff;
+	awbuf[1] = (ping >>  8) & 0xff;
+	awbuf[2] = (ping >> 16) & 0xff;
+	awbuf[3] = (ping >> 24) & 0xff;
+	sync_a314_write(4);
+}
+
+static ULONG read_pong()
+{
+	ULONG result =
 		(arbuf[0] <<  0) |
 		(arbuf[1] <<  8) |
 		(arbuf[2] << 16) |
 		(arbuf[3] << 24);
 
-	printf("result = %08lx\n", result);
+	printf("result = %08lx\n", result); fflush(stdout);
+	return result;
+}
 
-#if 0
-	struct EventMessage *em = (struct EventMessage *)arbuf;
-
-	UWORD qualifier = em->qualifier;
-	if (qualifier & IEQUALIFIER_INTERRUPT)
+static void handle_ping_pong()
+{
+	ULONG pong = read_pong();
+	if (pong != ping_count)
 	{
-		generated_event.ie_Class = IECLASS_RAWKEY;
-		qualifier = (qualifier & 0x7000) | (last_qualifier & 0x00ff);
+		printf("unexpected pong %08lx ; expected %08lx\n", pong, ping_count);
+		fflush(stdout);
 	}
-	else if (qualifier & IEQUALIFIER_RELATIVEMOUSE)
+	ping_count++;
+	if (ping_count < 10)
 	{
-		generated_event.ie_Class = IECLASS_RAWMOUSE;
-		qualifier |= last_qualifier & 0x00ff; // Last keyboard qualifiers.
+		send_ping(ping_count);
 	}
-	else
-	{
-		generated_event.ie_Class = IECLASS_RAWKEY;
-		qualifier |= last_qualifier & 0x7000; // Last mouse qualifiers.
-	}
-	generated_event.ie_Code = em->code;
-	generated_event.ie_Qualifier = qualifier;
-	generated_event.ie_X = em->dx;
-	generated_event.ie_Y = em->dy;
-
-	// Other fields in generated_event are zero.
-	// TODO: Would it be preferable to set ie_TimeStamp?
-
-	id_req->io_Data = (void *)&generated_event;
-	id_req->io_Command = IND_WRITEEVENT;
-	id_req->io_Length = sizeof(struct InputEvent);
-	DoIO((struct IORequest *)id_req);
-#endif
 }
 
 static void handle_a314_read_completed()
@@ -152,7 +145,7 @@ static void handle_a314_read_completed()
 	int res = rmsg->a314_Request.io_Error;
 	if (res == A314_READ_OK)
 	{
-		read_result();
+		handle_ping_pong();
 		start_a314_read();
 	}
 	else if (res == A314_READ_EOS)
@@ -163,6 +156,8 @@ static void handle_a314_read_completed()
 	else if (res == A314_READ_RESET)
 		stream_closed = TRUE;
 }
+
+
 
 int main()
 {
@@ -190,11 +185,8 @@ int main()
 
 	start_a314_read();
 
-	awbuf[0] = (ping_count >>  0) & 0xff;
-	awbuf[1] = (ping_count >>  8) & 0xff;
-	awbuf[2] = (ping_count >> 16) & 0xff;
-	awbuf[3] = (ping_count >> 24) & 0xff;
-	sync_a314_write(sizeof(ping_count));
+	ping_count = 0;
+	send_ping(ping_count);
 
 	ULONG portsig = 1 << mp->mp_SigBit;
 
