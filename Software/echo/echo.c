@@ -100,7 +100,7 @@ static LONG sync_a314_reset()
 
 static void send_ping(ULONG ping)
 {
-	printf("sending = %08lx\n", ping); fflush(stdout);
+//	printf("sending = %08lx\n", ping); fflush(stdout);
 	awbuf[0] = (ping >>  0) & 0xff;
 	awbuf[1] = (ping >>  8) & 0xff;
 	awbuf[2] = (ping >> 16) & 0xff;
@@ -116,7 +116,7 @@ static ULONG read_pong()
 		(arbuf[2] << 16) |
 		(arbuf[3] << 24);
 
-	printf("result = %08lx\n", result); fflush(stdout);
+//	printf("result = %08lx\n", result); fflush(stdout);
 	return result;
 }
 
@@ -129,7 +129,12 @@ static void handle_ping_pong()
 		fflush(stdout);
 	}
 	ping_count++;
-	if (ping_count < 10)
+	if ((ping_count & 0xff) == 0x0)
+	{
+		printf("ping count = %08lx\n", ping_count);
+		fflush(stdout);
+	}
+//	if (ping_count < 10)
 	{
 		send_ping(ping_count);
 	}
@@ -161,7 +166,7 @@ static void handle_a314_read_completed()
 
 int main()
 {
-	LONG old_priority = SetTaskPri(FindTask(NULL), 60);
+//	LONG old_priority = SetTaskPri(FindTask(NULL), 60);
 
 	mp = CreatePort(NULL, 0);
 	cmsg = (struct A314_IORequest *)CreateExtIO(mp, sizeof(struct A314_IORequest));
@@ -227,6 +232,6 @@ fail_out2:
 fail_out1:
 	DeleteExtIO((struct IORequest *)cmsg);
 	DeletePort(mp);
-	SetTaskPri(FindTask(NULL), old_priority);
+//	SetTaskPri(FindTask(NULL), old_priority);
 	return 0;
 }
