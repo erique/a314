@@ -2046,8 +2046,6 @@ static void handle_a314_irq()
 {
     uint8_t irq = spi_read_sint();
 
-    spi_write_sint(REG_IRQ_RPI);    // clear RPI regardless
-
     if (irq & REG_IRQ_RESET)
     {
         if (channels.empty())
@@ -2062,6 +2060,8 @@ static void handle_a314_irq()
 
     if (!(irq & REG_IRQ_RPI))
         return;
+
+    spi_write_sint(REG_IRQ_RPI);    
 
     read_channel_status();
 
@@ -2375,7 +2375,7 @@ static void main_loop()
     while (!done)
     {
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 1, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, 0, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)
@@ -2407,6 +2407,7 @@ static void main_loop()
             // logger_trace("############################################ timeout...\n");
             logger_debug("Timer timeout\n");
             handle_a314_irq();
+            usleep(2);
         }
         else
         {
