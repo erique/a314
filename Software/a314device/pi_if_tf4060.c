@@ -67,6 +67,12 @@ static void clear_reset(struct A314Device *dev)
 	*sint = REG_IRQ_RESET;
 }
 
+void enable_amiga_irq(struct A314Device *dev)
+{
+	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
+	*sint = REG_IRQ_SET | REG_IRQ_INTENA;
+}
+
 static void spiBegin(struct TFConfig* tfConfig)             { tfConfig->TF_SpiCtrl = 0x00; }
 static void spiEnd(struct TFConfig* tfConfig)               { tfConfig->TF_SpiCtrl = 0xFF; }
 
@@ -145,25 +151,25 @@ extern void IntServer();
 
 static void add_interrupt_handlers(struct A314Device *dev)
 {
-	memset(&dev->vertb_interrupt, 0, sizeof(struct Interrupt));
-	dev->vertb_interrupt.is_Node.ln_Type = NT_INTERRUPT;
-	dev->vertb_interrupt.is_Node.ln_Pri = -60;
-	dev->vertb_interrupt.is_Node.ln_Name = device_name;
-	dev->vertb_interrupt.is_Data = (APTR)&dev->task;
-	dev->vertb_interrupt.is_Code = IntServer;
+	// memset(&dev->vertb_interrupt, 0, sizeof(struct Interrupt));
+	// dev->vertb_interrupt.is_Node.ln_Type = NT_INTERRUPT;
+	// dev->vertb_interrupt.is_Node.ln_Pri = -60;
+	// dev->vertb_interrupt.is_Node.ln_Name = device_name;
+	// dev->vertb_interrupt.is_Data = (APTR)&dev->task;
+	// dev->vertb_interrupt.is_Code = IntServer;
 
-	AddIntServer(INTB_VERTB, &dev->vertb_interrupt);
+	// AddIntServer(INTB_VERTB, &dev->vertb_interrupt);
 
-	// memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
-	// dev->int_x_interrupt.is_Node.ln_Type = NT_INTERRUPT;
-	// dev->int_x_interrupt.is_Node.ln_Pri = 0;
-	// dev->int_x_interrupt.is_Node.ln_Name = device_name;
-	// dev->int_x_interrupt.is_Data = (APTR)&dev->task;
-	// dev->int_x_interrupt.is_Code = IntServer;
+	memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
+	dev->int_x_interrupt.is_Node.ln_Type = NT_INTERRUPT;
+	dev->int_x_interrupt.is_Node.ln_Pri = 0;
+	dev->int_x_interrupt.is_Node.ln_Name = device_name;
+	dev->int_x_interrupt.is_Data = (APTR)&dev->task;
+	dev->int_x_interrupt.is_Code = IntServer;
 
-	// dev->interrupt_number = 2;
-	// LONG int_num = dev->interrupt_number == 6 ? INTB_EXTER : INTB_PORTS;
-	// AddIntServer(int_num, &dev->int_x_interrupt);
+	dev->interrupt_number = 2;
+	LONG int_num = dev->interrupt_number == 6 ? INTB_EXTER : INTB_PORTS;
+	AddIntServer(int_num, &dev->int_x_interrupt);
 }
 
 void setup_pi_interface(struct A314Device *dev)
@@ -171,6 +177,7 @@ void setup_pi_interface(struct A314Device *dev)
 	clear_amiga_irq(dev);
 
 	add_interrupt_handlers(dev);
+	enable_amiga_irq(dev);
 
 	clear_reset(dev);
 }
