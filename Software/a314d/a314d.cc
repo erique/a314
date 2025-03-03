@@ -2433,7 +2433,7 @@ static void main_loop()
             // logger_trace("############################################ timeout...\n");
             logger_debug("Timer timeout\n");
             handle_a314_irq();
-            usleep(2);
+            // usleep(2);
         }
         else
         {
