@@ -571,8 +571,19 @@ again:
     return 0;
 }
 #else
+
+#define S_CE0 8     // SROM
+
 static int init_spi()
 {
+    if (gpioInitialise() < 0)
+    {
+        logger_error("Unable to initialize GPIO\n");
+        return 1;
+    }
+
+    gpioSetMode(S_CE0, PI_INPUT);
+
     spi_fd = open("/dev/spidev0.1", O_RDWR | O_CLOEXEC);
     if (spi_fd < 0)
         return -1;
@@ -619,6 +630,21 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
+    bool add_lf = false;
+    __useconds_t timeout = 10;
+    while (!gpioRead(S_CE0))
+    {
+        add_lf = true;
+        logger_warning("CE0 is asserted; backing off\r"); fflush(stdout);
+        usleep(timeout);
+        if (timeout < 100*1000)
+            timeout *= 2;
+    }
+    if (add_lf)
+    {
+        logger_warning("\nCE0 is deasserted; continuing..\n");  fflush(stdout);
+    }
+
     struct spi_ioc_transfer tr =
     {
         .tx_buf = (uintptr_t)tx_buf,
