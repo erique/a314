@@ -698,24 +698,12 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int length)
 {
     spi_read_shm_rxbuf(address, length);
-    if (length == 98)
-    {
-        logger_info("{PING}\n");
-        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
-    }
     memcpy(data, &rx_buf[READ_SRAM_HDR_LEN], length);
 }
 
 static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int length)
 {
     logger_trace("SPI write mem address = %d length = %d\n", address, length);
-    logger_debug("[w] 0x%08lx %ld bytes\n", address, length);
-
-    if (length == 98)
-    {
-        logger_info("{PONG}\n");
-        DumpBuffer(buf, length);
-    }
 
     unsigned int header;
     if (spi_proto_ver >= 1)
@@ -729,57 +717,20 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
 
     memcpy(&tx_buf[3], buf, length);
     spi_transfer(length + 3);
-
-#if 0 //defined(TF4060)
-    spi_read_shm_rxbuf(address, length);
-    if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
-    {
-        logger_error("#\n");
-        logger_error("  WRITE FAILED!\n");
-        logger_error("#\n");
-
-        logger_error("{OUT}\n");
-        DumpBuffer(buf, length);
-        logger_error("{READ}\n");
-        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
-
-        spi_read_shm_rxbuf(address, length);
-        if (memcmp(buf, &rx_buf[READ_SRAM_HDR_LEN], length) != 0)
-        {
-            logger_error("#\n");
-            logger_error("  WRITE FAILED 2nd time!\n");
-            logger_error("#\n");
-
-            logger_error("{OUT}\n");
-            DumpBuffer(buf, length);
-            logger_error("{READ}\n");
-            DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
-        }
-        else
-        {
-            logger_error("#\n");
-            logger_error("  WRITE FAILED single fail only?!?!\n");
-            logger_error("#\n");
-        }        
-
-    }
-#endif
 }
 
 #if defined(TF4060)
+
 static uint8_t spi_read_sint()
 {
-//    logger_trace("SPI read sint");
     tx_buf[0] = (uint8_t) (READ_SINT_CMD << 5);
     spi_transfer(1 /* 1 byte cmd */ + READ_SINT_HDR_LEN);
-//    logger_trace("SPI read sint returned = %d\n", rx_buf[READ_SINT_HDR_LEN]);
     return rx_buf[READ_SINT_HDR_LEN];
 }
 
 static void spi_write_sint(unsigned int data)
 {
     data &= 0xf0;       // only upper bits used
-//    logger_trace("SPI write sint, data = %d\n", data);
     data >>= 4;         // only upper bits sent
     tx_buf[0] = (uint8_t) (WRITE_SINT_CMD << 5) | (data & 0xf);
     spi_transfer(1);
@@ -838,15 +789,6 @@ static void spi_read_base_address()
             base_address = ba1 & ~1;
         }
     }
-
-#if defined(TF4060)
-    if (base_address > 15 * 1024)
-    {
-        logger_warning("Illegal base address (%x); discarding...\n", base_address);
-        base_address = 0;
-        have_base_address = false;
-    }
-#endif
 }
 #endif
 
@@ -1489,11 +1431,6 @@ static void handle_msg_read_mem_req(ClientConnection *cc)
 #if defined(MODEL_TD)
     // This is an optimization to save a memcpy.
     spi_read_shm_rxbuf(address, length);
-    if (length == 98)
-    {
-        logger_info("{PING}\n");
-        DumpBuffer(&rx_buf[READ_SRAM_HDR_LEN], length);
-    }
     create_and_send_msg(cc, MSG_READ_MEM_RES, 0, &rx_buf[READ_SRAM_HDR_LEN], length);
 #else
     read_shm(rx_buf, address, length);
