@@ -757,7 +757,6 @@ void task_main()
 					if (r_events != 0)
 					{
 						write_cp_nibble(R_EVENTS_ADDRESS, r_events);
-						signal_tf(dev);
 					}
 				}
 			}
@@ -775,8 +774,6 @@ void task_main()
 
 			write_cp_nibble(13, prev_regd);
 			Enable();
-
-			flush_tf(dev);
 		}
 	}
 

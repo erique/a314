@@ -576,6 +576,7 @@ again:
 
 static int init_spi()
 {
+#if defined(TF4060) // use IRQ_GPIO instead
     if (gpioInitialise() < 0)
     {
         logger_error("Unable to initialize GPIO\n");
@@ -583,6 +584,7 @@ static int init_spi()
     }
 
     gpioSetMode(S_CE0, PI_INPUT);
+#endif
 
     spi_fd = open("/dev/spidev0.1", O_RDWR | O_CLOEXEC);
     if (spi_fd < 0)
@@ -630,6 +632,7 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
+#if defined(TF4060) // use IRQ_GPIO instead
     bool add_lf = false;
     __useconds_t timeout = 10;
     while (!gpioRead(S_CE0))
@@ -644,6 +647,7 @@ static int spi_transfer(int len)
     {
         logger_warning("\nCE0 is deasserted; continuing..\n");  fflush(stdout);
     }
+#endif
 
     struct spi_ioc_transfer tr =
     {
