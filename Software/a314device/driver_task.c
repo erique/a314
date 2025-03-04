@@ -232,23 +232,6 @@ static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_i
 
 	struct Socket *s = find_socket_by_stream_id(dev, stream_id);
 
-	if (!(PKT_DRIVER_STARTED <= type && type <= PKT_RESET && s != NULL))
-	{
-		dbg_error("\nThis is BAD\n");
-
-		kprintf("ComAreaPtrs (a2r_tail, r2a_head, r2a_tail, a2r_head):\n");
-		DumpBuffer((uint8_t*)&dev->ca->cap, sizeof(dev->ca->cap));
-		// kprintf("A2R:\n");
-		// DumpBuffer(dev->ca->a2r_buffer, sizeof(dev->ca->a2r_buffer));
-		kprintf("R2A:\n");
-		DumpBuffer(dev->ca->r2a_buffer, sizeof(dev->ca->r2a_buffer));
-		CacheClearU();
-		kprintf("R2A again:\n");
-		DumpBuffer(dev->ca->r2a_buffer, sizeof(dev->ca->r2a_buffer));
-		while(1)
-			;
-	}
-
 	if (s != NULL && type == PKT_RESET)
 	{
 		close_socket(dev, s, FALSE);
