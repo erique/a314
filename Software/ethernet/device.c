@@ -23,11 +23,6 @@
 
 #include "../a314device/a314.h"
 #include "../a314device/proto_a314.h"
-#include "../a314device/kprintf.h"
-
-//#define kprintf(...) do {} while(0)
-
-#define TRACE(func) do{ kprintf("A314eth: [%s:%ld]\n", func, __LINE__); }while(0)
 
 // Defines.
 
@@ -152,7 +147,6 @@ extern void device_process_seglist();
 
 static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg("a0") BPTR seg_list, __reg("d0") struct Library *dev)
 {
-
 	saved_seg_list = seg_list;
 
 	dev->lib_Node.ln_Type = NT_DEVICE;
@@ -170,7 +164,6 @@ static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg(
 
 static BPTR expunge(__reg("a6") struct Library *dev)
 {
-
 	if (dev->lib_OpenCnt)
 	{
 		dev->lib_Flags |= LIBF_DELEXP;
@@ -189,7 +182,6 @@ static BPTR expunge(__reg("a6") struct Library *dev)
 
 static void send_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int length)
 {
-
 	ior->a314_Request.io_Command = cmd;
 	ior->a314_Request.io_Error = 0;
 	ior->a314_Socket = a314_socket;
@@ -200,7 +192,6 @@ static void send_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, i
 
 static void do_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int length)
 {
-
 	ior->a314_Request.io_Command = cmd;
 	ior->a314_Request.io_Error = 0;
 	ior->a314_Socket = a314_socket;
@@ -211,12 +202,10 @@ static void do_a314_cmd(struct A314_IORequest *ior, UWORD cmd, char *buffer, int
 
 static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 {
-
 	// TODO: Use S2_DMACopyToBuff32 instead of S2_CopyToBuff (if possible).
 	// This will avoid copying from A314 shared memory to shadow buffer
 	// before copying to stack's buffer.
 
-    // kprintf("[r] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	if (!bd->buffer_is_mapped)
 		ReadMemA314(bd->bd_Buffer, bd->bd_BufferAddress, bd->bd_Length);
 
@@ -261,8 +250,6 @@ static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 
 static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 {
-
-		// kprintf("A314eth: ios2 = %08lx\n", ios2);
 	// TODO: Use S2_DMACopyFromBuff32 instead of S2_CopyFromBuff (if possible).
 	// This will avoid copying to shadow buffer before writing to
 	// A314 shared memory.
@@ -271,18 +258,11 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 
 	if (ios2->ios2_Req.io_Flags & SANA2IOF_RAW)
 	{
-		kprintf("A314eth: RAW\n");
-
 		copyfrom(bd->bd_Buffer, ios2->ios2_Data, ios2->ios2_DataLength);
 		bd->bd_Length = ios2->ios2_DataLength;
 	}
 	else
 	{
-		// kprintf("A314eth: COOKED\n");
-
-		// kprintf("A314eth: eh = %08lx\n", eh);
-		kprintf(/*A314eth: ios2->ios2_Data = */"%08lx\n", ios2->ios2_Data);
-
 		eh->eh_Type = ios2->ios2_PacketType;
 		memcpy(eh->eh_Src, macaddr, sizeof(macaddr));
 		memcpy(eh->eh_Dst, ios2->ios2_DstAddr, MACADDR_SIZE);
@@ -290,13 +270,8 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 		bd->bd_Length = ios2->ios2_DataLength + sizeof(struct EthHdr);
 	}
 
-	// kprintf("About to copy\n");
-
-    // kprintf("[w] 0x%08lx %ld bytes\n", bd->bd_BufferAddress, bd->bd_Length);
 	if (!bd->buffer_is_mapped)
 		WriteMemA314(bd->bd_BufferAddress, bd->bd_Buffer, bd->bd_Length);
-
-	// kprintf("About to reply\n");
 
 	ios2->ios2_Req.io_Error = 0;
 	ReplyMsg(&ios2->ios2_Req.io_Message);
@@ -306,7 +281,6 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 
 static void handle_a314_reply(struct A314_IORequest *ior)
 {
-
 	if (ior == &write_ior)
 	{
 		pending_a314_write = FALSE;
@@ -354,7 +328,6 @@ static void handle_a314_reply(struct A314_IORequest *ior)
 
 static struct IOSana2Req *remove_matching_rbuf(ULONG type)
 {
-
 	struct Node *node = ut_rbuf_list.lh_Head;
 	while (node->ln_Succ)
 	{
@@ -371,7 +344,6 @@ static struct IOSana2Req *remove_matching_rbuf(ULONG type)
 
 static void complete_read_reqs()
 {
-
 	struct Node *node = et_rbuf_has_data_list.lh_Head;
 	if (!node->ln_Succ)
 		return;
@@ -383,7 +355,6 @@ static void complete_read_reqs()
 
 		UWORD eh_type;
 		// Hardcoded offset (12) and size (2) of eh_Type in EthHdr.
-	    // kprintf("[r] 0x%08lx %ld bytes (complete)\n", bd->bd_BufferAddress, bd->bd_Length);
 		ReadMemA314(&eh_type, bd->bd_BufferAddress + 12, 2);
 
 		node = node->ln_Succ;
@@ -402,7 +373,6 @@ static void complete_read_reqs()
 
 static void maybe_write_req()
 {
-
 	if (pending_a314_write)
 		return;
 
@@ -462,7 +432,6 @@ static void maybe_write_req()
 
 void device_process_run()
 {
-
 	ULONG sana2_signal = AllocSignal(-1);
 	sana2_sigmask = 1UL << sana2_signal;
 
@@ -517,7 +486,6 @@ void device_process_run()
 
 static struct TagItem *FindTagItem(Tag tagVal, struct TagItem *tagList)
 {
-
 	struct TagItem *ti = tagList;
 	while (ti && ti->ti_Tag != tagVal)
 	{
@@ -546,9 +514,8 @@ static ULONG GetTagData(Tag tagVal, ULONG defaultData, struct TagItem *tagList)
 	return ti ? ti->ti_Data : defaultData;
 }
 
-void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2, __reg("d0") ULONG unitnum, __reg("d1") ULONG flags)
+static void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2, __reg("d0") ULONG unitnum, __reg("d1") ULONG flags)
 {
-
 	ios2->ios2_Req.io_Error = IOERR_OPENFAIL;
 	ios2->ios2_Req.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
 
@@ -560,9 +527,6 @@ void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2, 
 	copyfrom = (buf_copy_func_t)GetTagData(S2_CopyFromBuff, 0, (struct TagItem *)ios2->ios2_BufferManagement);
 	copyto = (buf_copy_func_t)GetTagData(S2_CopyToBuff, 0, (struct TagItem *)ios2->ios2_BufferManagement);
 	ios2->ios2_BufferManagement = (void *)0xdeadbeefUL;
-
-	kprintf("A314eth: copyfrom = %08lx\n", copyfrom);
-	kprintf("A314eth: copyto   = %08lx\n", copyto);
 
 	memset(&a314_mp, 0, sizeof(a314_mp));
 	a314_mp.mp_Node.ln_Pri = 0;
@@ -616,19 +580,16 @@ void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2, 
 		if (bd->bd_Buffer)
 			bd->bd_BufferAddress = TranslateAddressA314(bd->bd_Buffer);
 
-		kprintf("A314eth: bd_Buffer = %08lx\n", bd->bd_Buffer);
 		bd->buffer_is_mapped = bd->bd_Buffer != NULL && bd->bd_BufferAddress != INVALID_A314_ADDRESS;
 
 		// memory-mapped alloc failed; use a separate copy-buffer
 		if (!bd->buffer_is_mapped)
 		{
 			bd->bd_Buffer = AllocMem(RAW_MTU, 0);
-			kprintf("A314eth: bd_Buffer = %08lx\n", bd->bd_Buffer);
 			if (!bd->bd_Buffer)
 				goto error;
 
 			bd->bd_BufferAddress = AllocMemA314(RAW_MTU);
-			kprintf("A314eth: bd_BufferAddress = %08lx\n", bd->bd_BufferAddress);
 			if (bd->bd_BufferAddress == INVALID_A314_ADDRESS)
 				goto error;
 		}
@@ -676,7 +637,6 @@ error:
 
 static BPTR close(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-
 	init_task = FindTask(NULL);
 	Signal(&device_process->pr_Task, shutdown_sigmask);
 	Wait(SIGF_SINGLE);
@@ -703,7 +663,6 @@ static BPTR close(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req
 
 static void device_query(struct IOSana2Req *req)
 {
-
 	struct Sana2DeviceQuery *query;
 
 	query = req->ios2_StatData;
@@ -727,7 +686,6 @@ static void device_query(struct IOSana2Req *req)
 
 static void set_last_start()
 {
-
 	struct IORequest req;
 	memset(&req, 0, sizeof(req));
 	req.io_Message.mn_Length = sizeof(req);
@@ -742,7 +700,6 @@ static void set_last_start()
 
 static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-
 	ios2->ios2_Req.io_Error = S2ERR_NO_ERROR;
 	ios2->ios2_WireError = S2WERR_GENERIC_ERROR;
 
@@ -838,20 +795,14 @@ static void begin_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2
 	if (ios2)
 	{
 		if (ios2->ios2_Req.io_Flags & SANA2IOF_QUICK)
-		{
 			ios2->ios2_Req.io_Message.mn_Node.ln_Type = NT_MESSAGE;
-		}
 		else
-		{
 			ReplyMsg(&ios2->ios2_Req.io_Message);
-		}
-
 	}
 }
 
 static void remove_from_list(struct List *list, struct Node *node)
 {
-
 	for (struct Node *n = list->lh_Head; n->ln_Succ; n = n->ln_Succ)
 	{
 		if (n == node)
@@ -864,7 +815,6 @@ static void remove_from_list(struct List *list, struct Node *node)
 
 static ULONG abort_io(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req *ios2)
 {
-
 	Forbid();
 	remove_from_list((struct List *)&ut_rbuf_list, &ios2->ios2_Req.io_Message.mn_Node);
 	remove_from_list((struct List *)&ut_wbuf_list, &ios2->ios2_Req.io_Message.mn_Node);
