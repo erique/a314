@@ -262,6 +262,7 @@ ULONG a314base_alloc_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG l
 	void *p = AllocMem(length, MEMF_A314 | MEMF_CLEAR);
 	if (!p)
 		return INVALID_A314_ADDRESS;
+	return cpu_to_a314_address(dev, p);
 	memset(p, 0xcd, length);
 	uint32_t* g = (uint32_t*)p;
 	*g++ = (uint32_t)p;
@@ -272,6 +273,7 @@ ULONG a314base_alloc_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG l
 
 void a314base_free_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address, __reg("d1") ULONG length)
 {
+	return;
 	kprintf("a314base_free_mem: %08lx / %ld bytes\n", address, length);
 	length = ( length + 63 ) & (~63);
 	length += 256;
