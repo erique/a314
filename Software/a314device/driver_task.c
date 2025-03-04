@@ -585,18 +585,6 @@ static void handle_app_request(struct A314Device *dev, struct A314_IORequest *io
 	}
 }
 
-static void set_timeout(struct A314Device *dev)
-{
-	struct timerequest* tr = &dev->timer_req;
-	tr->tr_node.io_Message.mn_ReplyPort = &dev->timer_mp;
-	tr->tr_node.io_Command = TR_ADDREQUEST;
-	tr->tr_time.tv_secs = 2;
-	tr->tr_time.tv_micro = 0;
-
-	dbg_trace("set timeout $l:$l", tr->tr_time.tv_secs, tr->tr_time.tv_micro);
-	SendIO(&tr->tr_node);
-}
-
 #if defined(MODEL_TD)
 
 #if defined(TF4060)
@@ -679,13 +667,11 @@ void task_main()
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
 	struct ComAreaPtrs *cap = CAP_PTR(dev);
 
-//	set_timeout(dev);
-
 	while (TRUE)
 	{
 		dbg_trace("Invoking Wait()");
 
-		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT | SIGF_TIMER);
+		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT);
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
 
@@ -710,17 +696,6 @@ void task_main()
 			struct Message *msg;
 			while (msg = GetMsg(&dev->task_mp))
 				handle_app_request(dev, (struct A314_IORequest *)msg);
-		}
-		else if (signal & SIGF_TIMER)
-		{
-			dbg_trace("timed out");
-			if (!GetMsg(&dev->timer_mp))
-			{
-				dbg_trace(" -- bad signal?");
-				continue;
-			}
-
-			set_timeout(dev);
 		}
 
 		UBYTE a_enable = 0;
