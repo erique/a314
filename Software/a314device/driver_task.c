@@ -675,17 +675,6 @@ void task_main()
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
 
-		{
-			uint8_t a2r_head = cap->a2r_head;
-			uint8_t a2r_tail = cap->a2r_tail;
-			uint8_t r2a_head = cap->r2a_head;
-			uint8_t r2a_tail = cap->r2a_tail;
-			int a2r_len = (a2r_tail - a2r_head) & 255;
-			int r2a_len = (r2a_tail - r2a_head) & 255;
-
-			dbg_trace("RD: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-		}
-
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
 
@@ -710,10 +699,6 @@ void task_main()
 			if (cap->r2a_head != prev_r2a_head)
 				r_events |= R_EVENT_R2A_HEAD;
 
-			{
-				dbg_trace("CH: $s / $s", r_events & R_EVENT_A2R_TAIL ? "A2R_TAIL_UPDATED" : "", r_events & R_EVENT_R2A_HEAD ? "R2A_HEAD_UPDATED" : "");
-			}
-
 			Disable();
 			UBYTE prev_regd = read_cp_nibble(13);
 			write_cp_nibble(13, prev_regd | 8);
@@ -730,21 +715,8 @@ void task_main()
 				{
 					write_cp_nibble(A_ENABLE_ADDRESS, a_enable);
 					if (r_events != 0)
-					{
 						write_cp_nibble(R_EVENTS_ADDRESS, r_events);
-					}
 				}
-			}
-
-			{
-				uint8_t a2r_head = cap->a2r_head;
-				uint8_t a2r_tail = cap->a2r_tail;
-				uint8_t r2a_head = cap->r2a_head;
-				uint8_t r2a_tail = cap->r2a_tail;
-				int a2r_len = (a2r_tail - a2r_head) & 255;
-				int r2a_len = (r2a_tail - r2a_head) & 255;
-
-				dbg_trace("WR: a2r [$b/$b] = $w ; r2a [$b/$b] = $w", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
 			}
 
 			write_cp_nibble(13, prev_regd);
