@@ -7,7 +7,6 @@
 #include <exec/ports.h>
 #include <exec/interrupts.h>
 #include <libraries/dos.h>
-#include <devices/timer.h>
 
 #include "protocol.h"
 
@@ -51,9 +50,6 @@ struct A314Device
 #endif
 
 	struct MsgPort task_mp;
-
-	struct MsgPort timer_mp;
-	struct timerequest timer_req;
 
 	struct List active_sockets;
 
