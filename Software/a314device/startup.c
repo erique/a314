@@ -60,22 +60,6 @@ static void init_message_port(struct A314Device *dev)
 	NewList(&(mp->mp_MsgList));
 }
 
-static void init_timer_port(struct A314Device *dev)
-{
-	struct MsgPort *mp = &dev->timer_mp;
-	mp->mp_Node.ln_Type = NT_MSGPORT;
-	mp->mp_Node.ln_Pri = 0;
-	mp->mp_Node.ln_Name = NULL;
-	mp->mp_Flags = PA_SIGNAL;
-	mp->mp_SigBit = SIGB_TIMER;
-	mp->mp_SigTask = &dev->task;
-	NewList(&mp->mp_MsgList);
-
-	struct timerequest* tr = &dev->timer_req;
-	if (OpenDevice(TIMERNAME, UNIT_VBLANK, &tr->tr_node, 0))
-		return;
-}
-
 BOOL task_start(struct A314Device *dev)
 {
 	if (!setup_task(dev))
@@ -90,7 +74,6 @@ BOOL task_start(struct A314Device *dev)
 		return FALSE;
 	}
 
-	init_timer_port(dev);
 	init_message_port(dev);
 	init_sockets(dev);
 
