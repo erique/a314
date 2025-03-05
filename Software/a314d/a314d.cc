@@ -34,13 +34,20 @@
 #include <string>
 #include <vector>
 
-#if !defined(MODEL_TD) && !defined(MODEL_FE) && !defined(MODEL_CP)
-#error Need to define MODEL_TD, MODEL_FE or MODEL_CP
-#elif defined(MODEL_TD) && defined(MODEL_FE) || defined(MODEL_TD) && defined(MODEL_CP) || defined(MODEL_FE) && defined(MODEL_CP)
+#define COUNT_DEFINED ( \
+    (defined MODEL_TD ? 1 : 0) + \
+    (defined MODEL_FE ? 1 : 0) + \
+    (defined MODEL_CP ? 1 : 0) + \
+    (defined MODEL_TF ? 1 : 0) \
+)
+
+#if COUNT_DEFINED == 0
+#error Need to define MODEL_TD, MODEL_FE, MODEL_CP or MODEL_TF
+#elif COUNT_DEFINED > 1
 #error The MODEL_XX flags cannot be combined
 #endif
 
-#if defined(TF4060)
+#if defined(MODEL_TF)
 #include "fomu-flash/rpi.h"
 #include "fomu-flash/spi.h"
 #endif
@@ -93,7 +100,7 @@ static int loglevel = LOGLEVEL_INFO;
 
 // TODO: These constants should be the same for both TD/FE and CP.
 // Need to update a314.device in order to change these.
-#if defined(MODEL_TD)
+#if defined(MODEL_TD) || defined(MODEL_TF)
 // Offset relative to communication area for queue pointers.
 #define A2R_TAIL_OFFSET         0
 #define R2A_HEAD_OFFSET         1
@@ -130,53 +137,20 @@ static int loglevel = LOGLEVEL_INFO;
 #endif
 
 #if defined(MODEL_TD)
-#if defined(TF4060)
-#define IRQ_GPIO                8
-#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
-#else
 #define IRQ_GPIO                25
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EDGE_FALLING
-#endif
 #elif defined(MODEL_FE)
 #define IRQ_GPIO                23
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
 #elif defined(MODEL_CP)
 #define IRQ_GPIO                2
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
+#elif defined(MODEL_TF)
+#define IRQ_GPIO                8
+#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
 #endif
 
 #if defined(MODEL_TD)
-#if defined(TF4060)
-
-// SPI commands.
-#define READ_SRAM_CMD           0
-#define WRITE_SRAM_CMD          1
-#define READ_SINT_CMD           2
-#define WRITE_SINT_CMD          3
-#define SPI_PROTO_VER_CMD       255
-
-#define SPI_PROTO_HDR_LEN       3           // 1 cmd byte + 2 delay
-#define READ_SRAM_HDR_LEN       5           // 3 cmd bytes + 2 delay
-#define READ_CMEM_HDR_LEN       3           // 1 cmd byte + 2 delay
-#define READ_SINT_HDR_LEN       3           // 1 cmd byte + 2 delay
-
-// Bit 7 Set/Clear on write 
-// Bit 6 Amiga Interrupts Enabled (INT2). 1 = Enabled, 0 = Disabled
-// Bit 5 RPi (Remote Interrupt). 1 = Pending, 0 = Not Pending (Amiga Can set but not Clear, RPi Can clear but not set)
-// Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending (Amiga can clear but not set, RPi Can set but not clear)
-// Bit 3 Unused
-// Bit 2 Unused
-// Bit 1 Unused
-// Bit 0 Reset Event 
-
-#define REG_IRQ_SET             0x80
-#define REG_IRQ_CLR             0x00
-#define REG_IRQ_INTENA          0x40
-#define REG_IRQ_RPI             0x20
-#define REG_IRQ_AMIGA           0x10
-#define REG_IRQ_RESET           0x01
-
-#else // ! TF4060
 
 // SPI commands.
 #define READ_SRAM_CMD           0
@@ -205,8 +179,6 @@ static int loglevel = LOGLEVEL_INFO;
 // Events that are communicated from Raspberry to Amiga.
 #define A_EVENT_R2A_TAIL        1
 #define A_EVENT_A2R_HEAD        2
-
-#endif // TF4060
 
 #elif defined(MODEL_FE)
 #define PIN_D(x)                (4 + x)
@@ -277,6 +249,36 @@ static int loglevel = LOGLEVEL_INFO;
 #define REG_IRQ_CLR             0x00
 #define REG_IRQ_PI              0x02
 #define REG_IRQ_CP              0x01
+
+#elif defined(MODEL_TF)
+
+// SPI commands.
+#define READ_SRAM_CMD           0
+#define WRITE_SRAM_CMD          1
+#define READ_SINT_CMD           2
+#define WRITE_SINT_CMD          3
+#define SPI_PROTO_VER_CMD       255
+
+#define SPI_PROTO_HDR_LEN       3           // 1 cmd byte + 2 delay
+#define READ_SRAM_HDR_LEN       5           // 3 cmd bytes + 2 delay
+#define READ_CMEM_HDR_LEN       3           // 1 cmd byte + 2 delay
+#define READ_SINT_HDR_LEN       3           // 1 cmd byte + 2 delay
+
+// Bit 7 Set/Clear on write 
+// Bit 6 Amiga Interrupts Enabled (INT2). 1 = Enabled, 0 = Disabled
+// Bit 5 RPi (Remote Interrupt). 1 = Pending, 0 = Not Pending (Amiga Can set but not Clear, RPi Can clear but not set)
+// Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending (Amiga can clear but not set, RPi Can set but not clear)
+// Bit 3 Unused
+// Bit 2 Unused
+// Bit 1 Unused
+// Bit 0 Reset Event 
+
+#define REG_IRQ_SET             0x80
+#define REG_IRQ_CLR             0x00
+#define REG_IRQ_INTENA          0x40
+#define REG_IRQ_RPI             0x20
+#define REG_IRQ_AMIGA           0x10
+#define REG_IRQ_RESET           0x01
 #endif
 
 // Global variables.
@@ -287,7 +289,7 @@ static uint8_t rx_buf[65536];
 
 static volatile unsigned int *gpio;
 
-#if defined(MODEL_TD)
+#if defined(MODEL_TD) || defined(MODEL_TF)
 static uint8_t mode = SPI_CS_HIGH;
 static uint8_t bits = 8;
 static uint32_t speed = 67000000;
@@ -318,12 +320,8 @@ static bool have_base_address = false;
 static unsigned int base_address = 0;
 
 #if defined(MODEL_TD) || defined(MODEL_FE)
-    #if defined(TF4060)
-        #define BASE_ADDRESS 0
-    #else
-        #define BASE_ADDRESS base_address
-    #endif
-#elif defined(MODEL_CP)
+#define BASE_ADDRESS base_address
+#elif defined(MODEL_CP) || defined(MODEL_TF)
 #define BASE_ADDRESS 0
 #endif
 
@@ -472,7 +470,7 @@ static void load_config_file(const char *filename)
         logger_warning("No registered services\n");
 }
 
-#if defined(MODEL_TD)
+#if defined(MODEL_TD) || defined(MODEL_TF)
 
 void DumpBuffer(const uint8_t* buffer, uint32_t size);
 
@@ -480,7 +478,7 @@ void DumpBuffer(const uint8_t* buffer, uint32_t size);
 
 static int init_spi()
 {
-#if defined(TF4060) // use IRQ_GPIO instead
+#if defined(MODEL_TF) // use IRQ_GPIO instead
     if (gpioInitialise() < 0)
     {
         logger_error("Unable to initialize GPIO\n");
@@ -536,7 +534,7 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
-#if defined(TF4060) // use IRQ_GPIO instead
+#if defined(MODEL_TF) // use IRQ_GPIO instead
     bool add_lf = false;
     __useconds_t timeout = 10;
     while (!gpioRead(S_CE0))
@@ -620,7 +618,7 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
     spi_transfer(length + 3);
 }
 
-#if defined(TF4060)
+#if defined(MODEL_TF)
 
 static uint8_t spi_read_sint()
 {
@@ -1170,7 +1168,7 @@ static int init_driver()
     if (init_server_socket() != 0)
         return -1;
 
-#if defined(MODEL_TD)
+#if defined(MODEL_TD) || defined(MODEL_TF)
     if (init_spi() != 0)
         return -1;
 
@@ -1178,7 +1176,7 @@ static int init_driver()
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
     spi_proto_ver = spi_protocol_version();
-#if defined(TF4060)
+#if defined(MODEL_TF)
     while (spi_proto_ver != 2)
     {
         logger_warning("Bad SPI protocol version (%02x); retrying...\r", spi_proto_ver);
@@ -1847,7 +1845,7 @@ static void write_channel_status()
     if (channel_status_updated != 0)
     {
         write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
-#if defined(TF4060)
+#if defined(MODEL_TF)
         {
             uint8_t verify[2];
             read_shm(&verify[0], BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, 2);
@@ -1859,16 +1857,12 @@ static void write_channel_status()
 #endif
 
 #if defined(MODEL_TD)
-#if defined(TF4060)
-        spi_write_sint(REG_IRQ_SET | REG_IRQ_AMIGA);
-#else // !defined(TF4060)
         unsigned int events = 0;
         if (channel_status_updated & R2A_TAIL_UPDATED)
             events |= A_EVENT_R2A_TAIL;
         if (channel_status_updated & A2R_HEAD_UPDATED)
             events |= A_EVENT_A2R_HEAD;
         spi_write_cmem(A_EVENTS_ADDRESS, events);
-#endif // !defined(TF4060)
 #elif defined(MODEL_FE)
         uint32_t irq = 0;
         if (channel_status_updated & R2A_TAIL_UPDATED)
@@ -1884,6 +1878,8 @@ static void write_channel_status()
 
         auto_clear_irq = true;
         auto_clear_irq_after = time(NULL) + 3;
+#elif defined(MODEL_TF)
+        spi_write_sint(REG_IRQ_SET | REG_IRQ_AMIGA);
 #endif
         channel_status_updated = 0;
     }
@@ -1909,62 +1905,6 @@ static void close_all_logical_channels()
 }
 
 #if defined(MODEL_TD)
-#if defined(TF4060)
-static void handle_a314_irq()
-{
-    uint8_t irq = spi_read_sint();
-
-    if (irq & REG_IRQ_RESET)
-    {
-        if (channels.empty())
-            return;
-
-        logger_info("Base address was updated while logical channels are open -- closing channels\n");
-        close_all_logical_channels();
-        return;
-    }
-
-    logger_trace("irq = %02x\n", irq);
-
-    if (!(irq & REG_IRQ_RPI))
-        return;
-
-    spi_write_sint(REG_IRQ_RPI);    
-
-    read_channel_status();
-
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
-
-    receive_from_a2r();
-    flush_send_queue();
-
-    {
-        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
-    }
-
-    write_channel_status();
-
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
-}
-#else // !defined(TF4060)
 static void handle_a314_irq()
 {
     uint8_t events = spi_ack_irq();
@@ -1990,7 +1930,6 @@ static void handle_a314_irq()
 
     write_channel_status();
 }
-#endif // !defined(TF4060)
 #elif defined(MODEL_FE)
 static void handle_a314_irq()
 {
@@ -2070,6 +2009,61 @@ static void handle_a314_irq()
     flush_send_queue();
 
     write_channel_status();
+}
+#elif defined(MODEL_TF)
+static void handle_a314_irq()
+{
+    uint8_t irq = spi_read_sint();
+
+    if (irq & REG_IRQ_RESET)
+    {
+        if (channels.empty())
+            return;
+
+        logger_info("Base address was updated while logical channels are open -- closing channels\n");
+        close_all_logical_channels();
+        return;
+    }
+
+    logger_trace("irq = %02x\n", irq);
+
+    if (!(irq & REG_IRQ_RPI))
+        return;
+
+    spi_write_sint(REG_IRQ_RPI);    
+
+    read_channel_status();
+
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
+
+    receive_from_a2r();
+    flush_send_queue();
+
+    {
+        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
+    }
+
+    write_channel_status();
+
+    {
+        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
+        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
+        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
+        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
+        int a2r_len = (a2r_tail - a2r_head) & 255;
+        int r2a_len = (r2a_tail - r2a_head) & 255;
+
+        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
+    }
 }
 #endif
 
@@ -2272,7 +2266,7 @@ static void main_loop()
         else if (n == 0)
         {
             // Timeout. Handle below.
-#if defined(TF4060)
+#if defined(MODEL_TF)
             handle_a314_irq();
 #endif
         }
@@ -2367,7 +2361,7 @@ int main(int argc, char **argv)
     return 0;
 }
 
-#if defined(MODEL_TD) || defined(TF4060)
+#if defined(MODEL_TF)
 void DumpBuffer(const uint8_t* buffer, uint32_t size)
 {
     uint32_t i, j, len;

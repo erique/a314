@@ -17,7 +17,7 @@ struct A314Device
 	BPTR saved_seg_list;
 	BOOL running;
 
-#if defined(MODEL_TD) || defined(MODEL_FE)
+#if defined(MODEL_TD) || defined(MODEL_FE) || defined(MODEL_TF)
 	struct ComArea *ca; // offsetof(ca) == 40
 #elif defined(MODEL_CP)
 	ULONG clockport_address; // offsetof(clockport_address) == 40
@@ -31,9 +31,10 @@ struct A314Device
 
 	ULONG fw_flags;
 
-	APTR tf_config; // TF4060
 #elif defined(MODEL_FE)
 	ULONG a314_mem_address;
+#elif defined(MODEL_TF)
+	APTR tf_config; // TF4060
 #endif
 
 #if defined(MODEL_TD) || defined(MODEL_FE)
@@ -59,7 +60,7 @@ struct A314Device
 	UBYTE next_stream_id;
 };
 
-#if defined(MODEL_TD) || defined(MODEL_FE)
+#if defined(MODEL_TD) || defined(MODEL_FE) || defined(MODEL_TF)
 #define CAP_PTR(dev) (&(dev->ca->cap))
 #elif defined(MODEL_CP)
 #define CAP_PTR(dev) (&(dev->cap))
