@@ -1,11 +1,11 @@
 {
     "configurations": [
         {
-            "name": "TD-TF4060",
+            "name": "MODEL_TF",
             "includePath": [
                 "${workspaceFolder}/**"
             ],
-            "defines": [ "MODEL_TD=1", "TF4060" ],
+            "defines": [ "MODEL_TF=1" ],
             "macFrameworkPath": [
                 "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
             ],

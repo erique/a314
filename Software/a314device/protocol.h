@@ -24,7 +24,7 @@ struct PktHdr
 
 // TODO: These constants should be the same for TD/FE and CP.
 // Must change on both sides at the same time.
-#if defined(MODEL_TD)
+#if defined(MODEL_TD) || defined(MODEL_TF)
 #define CAP_BASE 0
 #define A2R_BASE 4
 #define R2A_BASE 260
