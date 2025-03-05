@@ -2272,10 +2272,9 @@ static void main_loop()
         else if (n == 0)
         {
             // Timeout. Handle below.
-            // logger_trace("############################################ timeout...\n");
-            logger_debug("Timer timeout\n");
+#if defined(TF4060)
             handle_a314_irq();
-            // usleep(2);
+#endif
         }
         else
         {
