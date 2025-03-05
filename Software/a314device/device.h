@@ -17,10 +17,12 @@ struct A314Device
 	BPTR saved_seg_list;
 	BOOL running;
 
-#if defined(MODEL_TD) || defined(MODEL_FE) || defined(MODEL_TF)
+#if defined(MODEL_TD) || defined(MODEL_FE)
 	struct ComArea *ca; // offsetof(ca) == 40
 #elif defined(MODEL_CP)
 	ULONG clockport_address; // offsetof(clockport_address) == 40
+#elif defined(MODEL_TF)
+	APTR tf_config;  // offsetof(tf_config) == 40
 #endif
 
 	struct Task task; // offsetof(task) == 44
@@ -33,8 +35,6 @@ struct A314Device
 
 #elif defined(MODEL_FE)
 	ULONG a314_mem_address;
-#elif defined(MODEL_TF)
-	APTR tf_config; // TF4060
 #endif
 
 #if defined(MODEL_TD) || defined(MODEL_FE)
@@ -48,6 +48,8 @@ struct A314Device
 	struct ComAreaPtrs cap;
 
 	void *first_chunk;
+#elif defined(MODEL_TF)
+	struct ComArea *ca;
 #endif
 
 	struct MsgPort task_mp;

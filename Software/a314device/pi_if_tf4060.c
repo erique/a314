@@ -207,20 +207,11 @@ extern void IntServer();
 
 static void add_interrupt_handlers(struct A314Device *dev)
 {
-	// memset(&dev->vertb_interrupt, 0, sizeof(struct Interrupt));
-	// dev->vertb_interrupt.is_Node.ln_Type = NT_INTERRUPT;
-	// dev->vertb_interrupt.is_Node.ln_Pri = -60;
-	// dev->vertb_interrupt.is_Node.ln_Name = device_name;
-	// dev->vertb_interrupt.is_Data = (APTR)&dev->task;
-	// dev->vertb_interrupt.is_Code = IntServer;
-
-	// AddIntServer(INTB_VERTB, &dev->vertb_interrupt);
-
 	memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
 	dev->int_x_interrupt.is_Node.ln_Type = NT_INTERRUPT;
 	dev->int_x_interrupt.is_Node.ln_Pri = 0;
 	dev->int_x_interrupt.is_Node.ln_Name = (char *)device_name;
-	dev->int_x_interrupt.is_Data = (APTR)&dev->task;
+	dev->int_x_interrupt.is_Data = (APTR)dev;
 	dev->int_x_interrupt.is_Code = IntServer;
 
 	dev->interrupt_number = 2;
