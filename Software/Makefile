@@ -30,7 +30,7 @@ ${BIN}/a314d-fe: a314d/a314d.cc
 	${CPP} -DMODEL_FE=1 a314d/a314d.cc -O3 -o ${BIN}/a314d-fe
 
 ${BIN}/a314d-tf4060: a314d/a314d.cc
-	${CPP} -DMODEL_TD=1 -DTF4060 a314d/a314d.cc a314d/fomu-flash/spi.c a314d/fomu-flash/rpi.c -O3 -o ${BIN}/a314d-tf4060
+	${CPP} -DMODEL_TF=1 a314d/a314d.cc a314d/fomu-flash/spi.c a314d/fomu-flash/rpi.c -O3 -o ${BIN}/a314d-tf4060
 
 ${BIN}/spi-a314.dtbo: a314d/spi-a314-overlay.dts
 	${DTC} -I dts -O dtb -o ${BIN}/spi-a314.dtbo a314d/spi-a314-overlay.dts
