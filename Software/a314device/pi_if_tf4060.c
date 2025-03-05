@@ -4,6 +4,9 @@
 #include <hardware/intbits.h>
 
 #include <proto/exec.h>
+#include <devices/timer.h>
+
+#include <proto/alib.h>
 
 #include <string.h>
 
@@ -55,6 +58,13 @@ void set_pi_irq(struct A314Device *dev)
 	*sint = REG_IRQ_SET | REG_IRQ_RPI;
 }
 
+static int check_pi_irq(struct A314Device *dev)
+{
+	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
+	return (*sint & REG_IRQ_RPI) != 0 ? TRUE : FALSE;
+}
+
+
 void clear_amiga_irq(struct A314Device *dev)
 {
 	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
@@ -82,6 +92,35 @@ static void spiEnd(struct TFConfig* tfConfig)               { tfConfig->TF_SpiCt
 uint32_t SetMMU(__reg("a0") void* addr, __reg("d0") uint32_t size, __reg("d1") uint32_t flags, __reg("a6") struct ExecBase*);
 
 static void *a314_to_cpu_address(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address);
+
+static int delay_1s()
+{
+	int success = FALSE;
+
+	struct timerequest tr;
+	memset(&tr, 0x00, sizeof(struct timerequest));
+
+	struct MsgPort mp;
+	memset(&mp, 0x00, sizeof(struct MsgPort));
+
+	mp.mp_Node.ln_Type = NT_MSGPORT;
+	mp.mp_Flags = PA_SIGNAL;
+	mp.mp_SigTask = FindTask(NULL);
+	mp.mp_SigBit = SIGB_SINGLE;
+	NewList(&mp.mp_MsgList);
+
+	if (OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)&tr, 0))
+		return FALSE;
+
+	tr.tr_node.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
+	tr.tr_node.io_Message.mn_ReplyPort = &mp;
+	tr.tr_node.io_Message.mn_Length = sizeof(sizeof(struct timerequest));
+	tr.tr_node.io_Command = TR_ADDREQUEST;
+	tr.tr_time.tv_secs = 1;
+	DoIO((struct IORequest *)&tr);
+
+	return TRUE;
+}
 
 int probe_pi_interface(struct A314Device *dev)
 {
@@ -118,6 +157,23 @@ int probe_pi_interface(struct A314Device *dev)
     	dbg_error("Unable to find AutoConf board");
     	return FALSE;
     }
+
+	kprintf("probing PI IRQ...\n");
+	set_pi_irq(dev);
+	for(short timeout = 3; timeout >= 0; timeout--)
+	{
+		if (!check_pi_irq(dev))
+			break;
+		kprintf("PI IRQ not cleared; delaying...\n");
+		delay_1s();
+	}
+	if (check_pi_irq(dev))
+	{
+		kprintf("No a314d running on the PI ?!\n");
+		return FALSE;
+	}
+
+	kprintf("a314d is running!\n");
 
     const void* sram = (void*)(((intptr_t)dev->tf_config) + SRAM_START);
     const ULONG sram_size = SRAM_END - SRAM_START;
