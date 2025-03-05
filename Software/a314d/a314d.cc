@@ -292,11 +292,7 @@ static uint8_t mode = SPI_CS_HIGH;
 static uint8_t bits = 8;
 static uint32_t speed = 67000000;
 
-#if 0 //defined(TF4060)
-struct ff_spi* spi = NULL;
-#else
 static int spi_fd = -1;
-#endif
 static int spi_proto_ver = 0;
 #elif defined(MODEL_FE)
 static unsigned int current_address;
@@ -480,98 +476,6 @@ static void load_config_file(const char *filename)
 
 void DumpBuffer(const uint8_t* buffer, uint32_t size);
 
-#if 0 //defined(TF4060)
-
-#define S_MOSI 10
-#define S_MISO 9
-#define S_CLK 11
-#define S_CE0 8
-#define S_CE1 7
-#define S_HOLD 25
-#define S_WP 24
-#define S_D0 S_MOSI
-#define S_D1 S_MISO
-#define S_D2 S_WP
-#define S_D3 S_HOLD
-
-static int init_spi()
-{
-    if (gpioInitialise() < 0)
-    {
-        logger_error("Unable to initialize GPIO\n");
-        return 1;
-    }
-    if ((spi = spiAlloc()) == NULL)
-    {
-        logger_error("Unable to allocate SPI\n");
-        return 1;
-    }
-
-    spiSetPin(spi, SP_CLK, S_CLK);
-    spiSetPin(spi, SP_D0, S_D0);
-    spiSetPin(spi, SP_D1, S_D1);
-    spiSetPin(spi, SP_D2, S_D2);
-    spiSetPin(spi, SP_D3, S_D3);
-    spiSetPin(spi, SP_MISO, S_MISO);
-    spiSetPin(spi, SP_MOSI, S_MOSI);
-    spiSetPin(spi, SP_HOLD, S_HOLD);
-    spiSetPin(spi, SP_WP, S_WP);
-    spiSetPin(spi, SP_CS, S_CE1);
-
-    return spiInit(spi);
-}
-static void shutdown_spi()
-{
-    spiFree(&spi);
-}
-static int check_spidev_bufsiz()
-{
-    return 0;
-}
-
-static int spi_transfer(int len)
-{
-    // logger_trace("spi_transfer(%ld bytes)\n", len);
-    // logger_trace("{\n");
-    bool add_lf = false;
-again:
-    __useconds_t timeout = 10;
-    while (!gpioRead(S_CE0))
-    {
-        add_lf = true;
-        logger_warning("CE0 is asserted; backing off\r"); fflush(stdout);
-        usleep(timeout);
-        if (timeout < 100*1000)
-            timeout *= 2;
-    }
-    spiBegin(spi);
-
-    if(!gpioRead(S_CE0))
-    {
-        spiEnd(spi);
-        logger_warning("CE0 became asserted; lost the bus\n");
-        goto again;
-    }
-    if (add_lf)
-        logger_warning("\n");
-
-    // logger_trace("  TX:\n");
-    // DumpBuffer(tx_buf, len);
-
-    for (int i=0; i<len; i++)
-    {
-        rx_buf[i] = spiXfer(spi, tx_buf[i]);
-    }
-
-    // logger_trace("  RX:\n");
-    // DumpBuffer(rx_buf, len);
-    usleep(10);
-    spiEnd(spi);
-    // logger_trace("}\n");
-    return 0;
-}
-#else
-
 #define S_CE0 8     // SROM
 
 static int init_spi()
@@ -662,7 +566,6 @@ static int spi_transfer(int len)
 
     return ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
 }
-#endif
 
 static int spi_protocol_version()
 {
@@ -677,8 +580,6 @@ static int spi_protocol_version()
 static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 {
     logger_trace("SPI read mem address = %d length = %d\n", address, length);
-    if (!(address == 0xa0 && length == 4))
-        logger_debug("[r] 0x%08lx %ld bytes\n", address, length);
 
     unsigned int header;
     if (spi_proto_ver >= 1)
