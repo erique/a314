@@ -5,7 +5,9 @@
 
 #include <inline/exec_protos.h>
 
-#if DEBUG
+#include "debug.h"
+
+#if defined(ENABLE_KPRINTF)
 
 static void set_uart_speed(__reg("d0") uint32_t c) = "\tmove.w\td0,$dff032\n";
 static void RawPutChar(__reg("d0") uint32_t c, __reg("a6") struct ExecBase* SysBase) = "\tjsr\t-516(a6)\n";
