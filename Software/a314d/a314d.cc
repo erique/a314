@@ -49,7 +49,6 @@
 
 #if defined(MODEL_TF)
 #include "fomu-flash/rpi.h"
-#include "fomu-flash/spi.h"
 #endif
 
 #define LOGLEVEL_TRACE      10

@@ -83,9 +83,6 @@ void enable_amiga_irq(struct A314Device *dev)
 	*sint = REG_IRQ_SET | REG_IRQ_INTENA;
 }
 
-static void spiBegin(struct TFConfig* tfConfig)             { tfConfig->TF_SpiCtrl = 0x00; }
-static void spiEnd(struct TFConfig* tfConfig)               { tfConfig->TF_SpiCtrl = 0xFF; }
-
 #define MAPP_CACHEINHIBIT     (1<<6)
 #define MAPP_IO               (1<<30)
 
