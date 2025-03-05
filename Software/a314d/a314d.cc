@@ -2015,14 +2015,11 @@ static void handle_a314_irq()
 {
     uint8_t irq = spi_read_sint();
 
-    if (irq & REG_IRQ_RESET)
+    if ((irq & REG_IRQ_RESET) && !channels.empty())
     {
-        if (channels.empty())
-            return;
-
-        logger_info("Base address was updated while logical channels are open -- closing channels\n");
+        logger_info("Amiga was reset while logical channels are open -- closing channels\n");
         close_all_logical_channels();
-        return;
+        // fall through to check the irq
     }
 
     logger_trace("irq = %02x\n", irq);
@@ -2030,7 +2027,10 @@ static void handle_a314_irq()
     if (!(irq & REG_IRQ_RPI))
         return;
 
-    spi_write_sint(REG_IRQ_RPI);    
+    spi_write_sint(REG_IRQ_RPI);
+
+    if (irq & REG_IRQ_RESET)
+        return;
 
     read_channel_status();
 
