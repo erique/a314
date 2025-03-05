@@ -43,7 +43,7 @@ kprintf	MACRO
 _kprintf:	movem.l	d0-d1/a0-a3/a6,-(sp)	
 		move.l	$4.w,a6
 ;		jsr	-504(a6)		; _LVORawIOInit (execPrivate7)
-;		move.w	#(3546895/115200),$dff032
+		move.w	#(3546895/115200),$dff032
 		move.l	28(sp),a0
 		lea	32(sp),a1
 		lea	.putch(pc),a2
