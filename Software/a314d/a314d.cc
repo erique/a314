@@ -477,16 +477,6 @@ void DumpBuffer(const uint8_t* buffer, uint32_t size);
 
 static int init_spi()
 {
-#if defined(MODEL_TF) // use IRQ_GPIO instead
-    if (gpioInitialise() < 0)
-    {
-        logger_error("Unable to initialize GPIO\n");
-        return 1;
-    }
-
-    gpioSetMode(S_CE0, PI_INPUT);
-#endif
-
     spi_fd = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
     if (spi_fd < 0)
         return -1;
@@ -496,14 +486,6 @@ static int init_spi()
     ret |= ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
     if (ret != 0)
         return ret;
-
-    logger_info("spi speed = %d\n", speed);
-    const uint32_t limit = 25*1000*1000;
-    if (speed > limit)
-    {
-        speed = limit;
-        logger_info("spi speed limited to %d\n", speed);
-    }
 
     return 0;
 }
@@ -1174,15 +1156,32 @@ static int init_driver()
     if (check_spidev_bufsiz())
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
-    spi_proto_ver = spi_protocol_version();
 #if defined(MODEL_TF)
-    while (spi_proto_ver != 2)
+    if (gpioInitialise() < 0) // // use IRQ_GPIO instead
     {
-        logger_warning("Bad SPI protocol version (%02x); retrying...\r", spi_proto_ver);
+        logger_error("Unable to initialize GPIO\n");
+        return 1;
+    }
+
+    gpioSetMode(S_CE0, PI_INPUT);
+
+    logger_info("spi speed = %d\n", speed);
+    const uint32_t limit = 25*1000*1000;
+    if (speed > limit)
+    {
+        speed = limit;
+        logger_info("spi speed limited to %d\n", speed);
+    }
+
+    while (spi_protocol_version() != 2)
+    {
+        logger_warning("Bad SPI protocol version; retrying...\r");
         usleep(1000);
-        spi_proto_ver = spi_protocol_version();
     }
 #endif
+
+    spi_proto_ver = spi_protocol_version();
+
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     if (init_gpio() != 0)
         return -1;
