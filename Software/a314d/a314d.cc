@@ -471,8 +471,6 @@ static void load_config_file(const char *filename)
 
 #if defined(MODEL_TD) || defined(MODEL_TF)
 
-void DumpBuffer(const uint8_t* buffer, uint32_t size);
-
 #define S_CE0 8     // SROM
 
 static int init_spi()
@@ -2358,56 +2356,3 @@ int main(int argc, char **argv)
     shutdown_driver();
     return 0;
 }
-
-#if defined(MODEL_TF)
-void DumpBuffer(const uint8_t* buffer, uint32_t size)
-{
-    uint32_t i, j, len;
-    char format[150];
-    char alphas[27];
-    strcpy(format, "    [%03lx]: %04lx %04lx %04lx %04lx %04lx %04lx %04lx %04lx ");
-
-    for (i = 0; i < size; i += 16) {
-        len = size - i;
-
-        // last line is less than 16 bytes? rewrite the format string
-        if (len < 16) {
-            strcpy(format, "    [%03lx]: ");
-
-            for (j = 0; j < 16; j+=2) {
-                if (j < len) {
-                    strcat(format, "%04lx");
-
-                } else {
-                    strcat(format, "____");
-                }
-
-                strcat(format, " ");
-            }
-
-        } else {
-            len = 16;
-        }
-
-        // create the ascii representation
-        for (j = 0; j < len; ++j) {
-            alphas[j] = (isalnum(buffer[i + j]) ? buffer[i + j] : '.');
-        }
-
-        for (; j < 16; ++j) {
-            alphas[j] = '_';
-        }
-
-        alphas[j] = 0;
-
-        j = strlen(format);
-        sprintf(format + j, "'%s'\n", alphas);
-
-        uint16_t* p = (uint16_t*)&buffer[i];
-        logger_info(format, i,
-           htons(p[0]), htons(p[1]), htons(p[2]), htons(p[3]), htons(p[4]), htons(p[5]), htons(p[6]), htons(p[7]));
-
-        format[j] = '\0';
-    }
-}
-#endif
