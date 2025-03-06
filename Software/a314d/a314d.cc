@@ -1823,16 +1823,6 @@ static void write_channel_status()
     if (channel_status_updated != 0)
     {
         write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
-#if defined(MODEL_TF)
-        {
-            uint8_t verify[2];
-            read_shm(&verify[0], BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, 2);
-            if (channel_status[R2A_TAIL_OFFSET] != verify[0])
-                logger_error("WRITE FAILED (%02x != %02x)\n", channel_status[R2A_TAIL_OFFSET], verify[0]);
-            if (channel_status[R2A_TAIL_OFFSET+1] != verify[1])
-                logger_error("WRITE FAILED (%02x != %02x)\n", channel_status[R2A_TAIL_OFFSET+1], verify[1]);
-        }
-#endif
 
 #if defined(MODEL_TD)
         unsigned int events = 0;
@@ -2012,36 +2002,10 @@ static void handle_a314_irq()
 
     read_channel_status();
 
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("RD: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
-
     receive_from_a2r();
     flush_send_queue();
 
-    {
-        logger_trace("CH: %s / %s\n", channel_status_updated & R2A_TAIL_UPDATED ? "R2A_TAIL_UPDATED" : "", channel_status_updated & A2R_HEAD_UPDATED ? "A2R_HEAD_UPDATED" : "");
-    }
-
     write_channel_status();
-
-    {
-        uint8_t a2r_head = channel_status[A2R_HEAD_OFFSET];
-        uint8_t a2r_tail = channel_status[A2R_TAIL_OFFSET];
-        uint8_t r2a_head = channel_status[R2A_HEAD_OFFSET];
-        uint8_t r2a_tail = channel_status[R2A_TAIL_OFFSET];
-        int a2r_len = (a2r_tail - a2r_head) & 255;
-        int r2a_len = (r2a_tail - r2a_head) & 255;
-
-        logger_trace("WR: a2r [%02x/%02x] = %d ; r2a [%02x/%02x] = %d\n", a2r_head, a2r_tail, a2r_len, r2a_head, r2a_tail, r2a_len);
-    }
 }
 #endif
 
@@ -2246,6 +2210,7 @@ static void main_loop()
             // Timeout. Handle below.
 #if defined(MODEL_TF)
             handle_a314_irq();
+            usleep(1);
 #endif
         }
         else
