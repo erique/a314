@@ -150,7 +150,6 @@ static int loglevel = LOGLEVEL_INFO;
 #endif
 
 #if defined(MODEL_TD)
-
 // SPI commands.
 #define READ_SRAM_CMD           0
 #define WRITE_SRAM_CMD          1
@@ -1053,10 +1052,7 @@ static int init_gpio_irq()
 {
     int chip_fd = open("/dev/gpiochip0", O_RDWR);
     if (chip_fd < 0)
-    {
-        logger_error("/dev/gpiochip0 failed\n");
         return -1;
-    }
 
     struct gpio_v2_line_request line_req = {
         .offsets = {IRQ_GPIO},
@@ -1069,17 +1065,11 @@ static int init_gpio_irq()
 
     int err = ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &line_req);
     if (err == -1)
-    {
-        logger_error("ioctl() failed\n");
         return -2;
-    }
 
     gpio_irq_fd = line_req.fd;
     if (gpio_irq_fd < 0)
-    {
-        logger_error("gpio_irq_fd failed\n");
         return -3;
-    }
 
     return 0;
 }
@@ -1179,17 +1169,13 @@ static int init_driver()
 #endif
 
     spi_proto_ver = spi_protocol_version();
-
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     if (init_gpio() != 0)
         return -1;
 #endif
 
     if (init_gpio_irq() != 0)
-    {
-        logger_warning("init_gpio_irq() failed\n");
         return -1;
-    }
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd == -1)
@@ -1542,8 +1528,6 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
 
     std::string service_name((char *)data, plen);
 
-    logger_debug("service_name = %s\n", service_name.c_str());
-
     for (auto &srv : services)
     {
         if (srv.name == service_name)
@@ -1591,8 +1575,6 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
                 for (auto &arg : args)
                     args_arr.push_back(arg.c_str());
                 args_arr.push_back(nullptr);
-
-                logger_debug("execvp('%s')\n", on_demand.program.c_str());
 
                 execvp(on_demand.program.c_str(), (char* const*) &args_arr[0]);
             }
@@ -1652,7 +1634,7 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
         }
     }
 
-    logger_warning("service_name unknown\n");
+    logger_warning("service_name unknown; '%s'\n", service_name.c_str());
 
     uint8_t response = CONNECT_UNKNOWN_SERVICE;
     create_and_enqueue_packet(&ch, PKT_CONNECT_RESPONSE, &response, 1);
@@ -2228,7 +2210,7 @@ static void main_loop()
     auto_clear_irq_after = time(NULL) + 3;
 #endif
 
-    logger_debug("Entering main loop\n");
+    logger_trace("Entering main loop\n");
 
     while (!done)
     {
@@ -2279,17 +2261,17 @@ static void main_loop()
                     exit(-1);
                 }
 
-                logger_debug("GPIO interupted\n");
+                logger_trace("GPIO interupted\n");
                 handle_a314_irq();
             }
             else if (ev.data.fd == server_socket)
             {
-                logger_debug("Epoll event: server socket is ready, events = %d\n", ev.events);
+                logger_trace("Epoll event: server socket is ready, events = %d\n", ev.events);
                 handle_server_socket_ready();
             }
             else
             {
-                logger_debug("Epoll event: client socket is ready, events = %d\n", ev.events);
+                logger_trace("Epoll event: client socket is ready, events = %d\n", ev.events);
 
                 auto it = connections.begin();
                 for (; it != connections.end(); it++)
