@@ -487,7 +487,7 @@ static int init_spi()
     gpioSetMode(S_CE0, PI_INPUT);
 #endif
 
-    spi_fd = open("/dev/spidev0.1", O_RDWR | O_CLOEXEC);
+    spi_fd = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
     if (spi_fd < 0)
         return -1;
 
