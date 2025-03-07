@@ -155,8 +155,6 @@ static int loglevel = LOGLEVEL_INFO;
 
 #define SPI_PROTO_HDR_LEN       1
 #define READ_SRAM_HDR_LEN       4
-#define READ_CMEM_HDR_LEN       1
-#define READ_SINT_HDR_LEN       1
 
 // Addresses to variables in CMEM.
 #define BASE_ADDRESS_LEN        6
@@ -255,7 +253,6 @@ static int loglevel = LOGLEVEL_INFO;
 
 #define SPI_PROTO_HDR_LEN       3           // 1 cmd byte + 2 delay
 #define READ_SRAM_HDR_LEN       5           // 3 cmd bytes + 2 delay
-#define READ_CMEM_HDR_LEN       3           // 1 cmd byte + 2 delay
 #define READ_SINT_HDR_LEN       3           // 1 cmd byte + 2 delay
 
 // Bit 7 Set/Clear on write 
@@ -594,22 +591,21 @@ static void spi_write_sint(unsigned int data)
 
 static uint8_t spi_read_cmem(unsigned int address)
 {
-    if (spi_proto_ver >= 1)
+    if (spi_proto_ver == 1)
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 5) | (address & 0xf));
     else
         tx_buf[0] = (uint8_t)((READ_CMEM_CMD << 4) | (address & 0xf));
     tx_buf[1] = 0;
-    tx_buf[2] = 0;
-    spi_transfer(1 /* 1 byte cmd */ + READ_CMEM_HDR_LEN);
-    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[READ_CMEM_HDR_LEN]);
-    return rx_buf[READ_CMEM_HDR_LEN];
+    spi_transfer(2);
+    logger_trace("SPI read cmem, address = %d, returned = %d\n", address, rx_buf[1]);
+    return rx_buf[1];
 }
 
 static void spi_write_cmem(unsigned int address, unsigned int data)
 {
     logger_trace("SPI write cmem, address = %d, data = %d\n", address, data);
 
-    if (spi_proto_ver >= 1)
+    if (spi_proto_ver == 1)
         tx_buf[0] = (uint8_t)((WRITE_CMEM_CMD << 5) | (address & 0xf));
     else
         tx_buf[0] = (uint8_t)((WRITE_CMEM_CMD << 4) | (address & 0xf));
