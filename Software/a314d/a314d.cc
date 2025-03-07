@@ -2220,8 +2220,15 @@ static void main_loop()
 
     while (!done)
     {
+        int timeout = 1000;
+#if defined(MODEL_TF)        
+        sigset_t sigset;
+        sigpending(&sigset);
+        if (!sigismember(&sigset, SIGTERM))
+            timeout = 0;
+#endif
         struct epoll_event ev;
-        int n = epoll_pwait(epfd, &ev, 1, 0, &original_sigset);
+        int n = epoll_pwait(epfd, &ev, 1, timeout, &original_sigset);
         if (n == -1)
         {
             if (errno == EINTR)
