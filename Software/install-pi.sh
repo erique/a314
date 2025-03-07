@@ -16,7 +16,6 @@ modinstall() {
 }
 
 install_common() {
-	apt install -y ifupdown
 
 	echo "services..."
 	install a314d/a314d.py /opt/a314
@@ -57,7 +56,7 @@ install_common() {
 	[ -f /lib/systemd/system/a314net.service ] || install -m644 ethernet/pi-config/a314net.service /lib/systemd/system
 
 	systemctl daemon-reload
-#	systemctl enable a314d
+	systemctl enable a314d
 	systemctl enable a314net
 
 	echo
@@ -65,20 +64,29 @@ install_common() {
 	echo "Restart the Raspberry Pi (sudo reboot now) to automatically start a314 software"
 }
 
-install_tf4060() {
+install_terriblefire() {
 	echo "tf4060:"
 
 	sudo -u $A314_USER mkdir -p ${BIN}
-	sudo -u $A314_USER make ${BIN}/a314d-tf4060
+	sudo -u $A314_USER make -j ${BIN}/a314d-tf ${BIN}/spi-a314-tf.dtbo
+
+	if [ -d /boot/firmware ]; then
+		BOOT_FW_DIR=/boot/firmware
+	else
+		BOOT_FW_DIR=/boot
+	fi
 
 	echo "install..."
 	install -d /opt/a314
 	install -d /etc/opt/a314
-	install ${BIN}/a314d-tf4060 /opt/a314/a314d
+	install ${BIN}/a314d-tf /opt/a314/a314d
+	install ${BIN}/spi-a314-tf.dtbo $BOOT_FW_DIR/overlays/spi-a314.dtbo
 
 	modinstall a314d/a314d-td.service /lib/systemd/system
 	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
 
+	echo "install_spi..."
+	install_spi
 	echo "common..."
 	install_common
 }
@@ -102,6 +110,11 @@ install_trapdoor() {
 	modinstall a314d/a314d-td.service /lib/systemd/system
 	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
 
+	install_spi
+	install_common
+}
+
+install_spi() {
 	# Set dtparam=spi=on
 	CONFIG_FILE=$BOOT_FW_DIR/config.txt
 
@@ -147,8 +160,6 @@ install_trapdoor() {
 	then
 		echo `cat $CMDLINE_FILE` spidev.bufsiz=65536 > $CMDLINE_FILE
 	fi
-
-	install_common
 }
 
 install_clockport() {
@@ -182,7 +193,7 @@ install_frontexpansion() {
 }
 
 case "$1" in
-	tf | TF) install_tf4060
+	tf | TF) install_terriblefire
 		;;
 	td | TD) install_trapdoor
 		;;
@@ -192,7 +203,7 @@ case "$1" in
 		;;
 	*)	echo "Usage: sudo ./install-pi.sh <model>"
 		echo "       <model> is one of:"
-		echo "         tf   (terriblefire)      A314-4060"
+		echo "         tf   (terriblefire)      A314-TF4060"
 		echo "         td   (trapdoor)          A314-500, A314-600"
 		echo "         cp   (clockport)         A314-cp"
 		echo "         fe   (front expansion)   A314-1000"
