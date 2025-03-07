@@ -47,10 +47,6 @@
 #error The MODEL_XX flags cannot be combined
 #endif
 
-#if defined(MODEL_TF)
-#include "fomu-flash/rpi.h"
-#endif
-
 #define LOGLEVEL_TRACE      10
 #define LOGLEVEL_DEBUG      20
 #define LOGLEVEL_INFO       30
@@ -146,7 +142,7 @@ static int loglevel = LOGLEVEL_INFO;
 #define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
 #elif defined(MODEL_TF)
 #define IRQ_GPIO                8
-#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING
+#define IRQ_GPIO_EDGE           GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EDGE_FALLING
 #endif
 
 #if defined(MODEL_TD)
@@ -470,8 +466,6 @@ static void load_config_file(const char *filename)
 
 #if defined(MODEL_TD) || defined(MODEL_TF)
 
-#define S_CE0 8     // SROM
-
 static int init_spi()
 {
     spi_fd = open("/dev/spidev0.0", O_RDWR | O_CLOEXEC);
@@ -512,23 +506,6 @@ static int check_spidev_bufsiz()
 
 static int spi_transfer(int len)
 {
-#if defined(MODEL_TF) // use IRQ_GPIO instead
-    bool add_lf = false;
-    __useconds_t timeout = 10;
-    while (!gpioRead(S_CE0))
-    {
-        add_lf = true;
-        logger_warning("CE0 is asserted; backing off\r"); fflush(stdout);
-        usleep(timeout);
-        if (timeout < 100*1000)
-            timeout *= 2;
-    }
-    if (add_lf)
-    {
-        logger_warning("\nCE0 is deasserted; continuing..\n");  fflush(stdout);
-    }
-#endif
-
     struct spi_ioc_transfer tr =
     {
         .tx_buf = (uintptr_t)tx_buf,
@@ -1145,26 +1122,11 @@ static int init_driver()
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
 #if defined(MODEL_TF)
-    if (gpioInitialise() < 0) // // use IRQ_GPIO instead
-    {
-        logger_error("Unable to initialize GPIO\n");
-        return 1;
-    }
-
-    gpioSetMode(S_CE0, PI_INPUT);
-
-    logger_info("spi speed = %d\n", speed);
     const uint32_t limit = 25*1000*1000;
     if (speed > limit)
     {
         speed = limit;
-        logger_info("spi speed limited to %d\n", speed);
-    }
-
-    while (spi_protocol_version() != 2)
-    {
-        logger_warning("Bad SPI protocol version; retrying...\r");
-        usleep(1000);
+        logger_info("SPI speed limited to %d\n", speed);
     }
 #endif
 
@@ -1981,24 +1943,104 @@ static void handle_a314_irq()
 #elif defined(MODEL_TF)
 static void handle_a314_irq()
 {
-    uint8_t irq = spi_read_sint();
-
-    if ((irq & REG_IRQ_RESET) && !channels.empty())
+    // check ICE40 bus activity, and back-off if CE0 is asserted
     {
-        logger_info("Amiga was reset while logical channels are open -- closing channels\n");
-        close_all_logical_channels();
-        // fall through to check the irq
+        static bool old_ce0_state = 1;
+        gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
+        if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state))
+        {
+            logger_warning("Unable to get GPIO state; %d / %s\n", errno, strerror(errno));
+            return;
+        }
+
+        bool ce0_asserted = (gpio_state.bits == 0);
+
+        if (old_ce0_state != ce0_asserted)
+        {
+            if (ce0_asserted)
+                logger_warning("CE0 is asserted; backing off!\n");
+            else
+                logger_warning("CE0 is deasserted; continuing..\n");
+
+            old_ce0_state = ce0_asserted;
+        }
+
+        static __useconds_t timeout = 10;
+        if (ce0_asserted)
+        {
+            usleep(timeout);
+            if (timeout < 100*1000)
+                timeout *= 2;
+            return;
+        }
+        else
+        {
+            timeout = 10;
+        }
     }
 
-    logger_trace("irq = %02x\n", irq);
+    // if spi_proto_ver doesn't match most likely the ICE40 isn't running (amiga powered off?)
+    if (spi_proto_ver != 2)
+    {
+        spi_proto_ver = spi_protocol_version();
+        if (spi_proto_ver != 2)
+        {
+            usleep(500*1000);    // takes about 400-500ms to stabilize
+            return;
+        }
+    }
 
-    if (!(irq & REG_IRQ_RPI))
+    uint8_t irq = spi_read_sint();
+
+    // RESET is cleared by the Amiga-side driver, and set again on Amiga reset
+    if ((irq & REG_IRQ_RESET))
+    {
+        if ((irq & REG_IRQ_RPI))
+        {
+            logger_info("Amiga is probing the a314d side\n");
+            spi_write_sint(REG_IRQ_RPI);
+        }
+
+        if (channels.empty())
+        {
+            usleep(10*1000);    // the amiga driver isn't active; sleep a bit..
+            return;
+        }
+
+        logger_info("Amiga was reset while logical channels are open -- closing channels\n");
+        close_all_logical_channels();
+        spi_write_sint(REG_IRQ_RPI);    // reset any lingering irqs
         return;
+    }
+
+    {
+        const uint64_t cooldown = 100*1000;
+        static uint64_t sleep_counter = 0;
+
+        if (!(irq & REG_IRQ_RPI))
+        {
+            // after N checks w/o activity, sleep some extra
+            if (sleep_counter == cooldown)
+                logger_info("PI became inactive!\n");
+
+            if (sleep_counter > cooldown)
+                usleep(1000);
+
+            sleep_counter++;
+
+            if (sleep_counter > 1000)
+                usleep(1);                  // basic yield to not slam the poor PI
+
+            return;
+        }
+
+        if (sleep_counter > cooldown)
+            logger_info("PI became active!\n");
+
+        sleep_counter = 0;
+    }
 
     spi_write_sint(REG_IRQ_RPI);
-
-    if (irq & REG_IRQ_RESET)
-        return;
 
     read_channel_status();
 
@@ -2210,7 +2252,6 @@ static void main_loop()
             // Timeout. Handle below.
 #if defined(MODEL_TF)
             handle_a314_irq();
-            usleep(1);
 #endif
         }
         else
