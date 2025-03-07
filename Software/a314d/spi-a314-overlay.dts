@@ -4,29 +4,10 @@
 / {
         compatible = "brcm,bcm2835";
 
-        /*
-          GPIO8 (normal SPI0-CE0) is used when the ICE is bus master, accessing the ROM.
-          To not have conflicting pulls, we change the CE0 to use GPIO7 (normally SPI0-CE1) and CE1 to use GPIO25 instead (which isn't connected to anything).
-          This way '/dev/spidev0,0' can still be used by a314d and we also disable `/dev/spidev0,1` as an extra precaution.
-        */
         fragment@0 {
-                target = <&spi0_cs_pins>;
-                frag0: __overlay__ {
-                        brcm,pins = <7 25>;
-                };
-        };
-
-        fragment@1 {
-                target = <&spidev1>;
-                frag1: __overlay__ {
-                        status = "disabled";
-                };
-        };
-
-        fragment@2 {
-                target = <&spi0>;
-                frag2: __overlay__ {
-                        cs-gpios = <&gpio 7 1>, <&gpio 25 1>;
+                target = <&spidev0>;
+                __overlay__ {
+                        spi-cs-high;
                 };
         };
 };
