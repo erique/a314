@@ -16,8 +16,6 @@ modinstall() {
 }
 
 install_common() {
-
-	echo "services..."
 	install a314d/a314d.py /opt/a314
 	install picmd/picmd.py /opt/a314
 	install a314fs/a314fs.py /opt/a314
@@ -29,21 +27,17 @@ install_common() {
 	install remote-mouse/remote-mouse.py /opt/a314
 	install videoplayer/videoplayer.py /opt/a314
 
-	echo "config..."
 	# Write configuration files, but don't overwrite
 	[ -f /etc/opt/a314/a314d.conf ] || modinstall a314d/a314d.conf /etc/opt/a314
 	[ -f /etc/opt/a314/picmd.conf ] || modinstall picmd/picmd.conf /etc/opt/a314
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314
 
-	echo "fs shared..."
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
 
-	echo "python..."
 	# Install Python packages in virtual environment
 	python3 -m virtualenv /opt/a314/venv
-	echo "python2..."
 	/opt/a314/venv/bin/pip install pyudev websockets python-pytun bpls2gif/
 
 	# Add tap0 interface
@@ -65,8 +59,6 @@ install_common() {
 }
 
 install_terriblefire() {
-	echo "tf4060:"
-
 	sudo -u $A314_USER mkdir -p ${BIN}
 	sudo -u $A314_USER make -j ${BIN}/a314d-tf ${BIN}/spi-a314-tf.dtbo
 
@@ -76,7 +68,6 @@ install_terriblefire() {
 		BOOT_FW_DIR=/boot
 	fi
 
-	echo "install..."
 	install -d /opt/a314
 	install -d /etc/opt/a314
 	install ${BIN}/a314d-tf /opt/a314/a314d
@@ -85,9 +76,7 @@ install_terriblefire() {
 	modinstall a314d/a314d-td.service /lib/systemd/system
 	mv /lib/systemd/system/a314d-td.service /lib/systemd/system/a314d.service
 
-	echo "install_spi..."
 	install_spi
-	echo "common..."
 	install_common
 }
 

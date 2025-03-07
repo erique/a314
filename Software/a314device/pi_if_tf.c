@@ -21,9 +21,11 @@
 #include <libraries/expansion.h>
 #include <libraries/expansionbase.h>
 #include <proto/expansion.h>
-#include "tfconfig.h"
 
 #define SysBase (*(struct ExecBase **)4)
+
+#define TF_MANU_ID 0x13D8
+#define PRODUCTID 0x83
 
 /*
 0xE903F4            SINT
@@ -124,25 +126,24 @@ int probe_pi_interface(struct A314Device *dev)
     dev->tf_config = NULL;
 
     struct ExpansionBase* ExpansionBase = (struct ExpansionBase*)OpenLibrary(EXPANSIONNAME, 39);
-    kprintf("ExpansionBase = %08lx\n", ExpansionBase);
     if (!ExpansionBase)
     {
-        kprintf("OpenLibrary() failed\n");
+		dbg_error("Unable to OpenLibrary('expansion')");
         return FALSE;
     }
     struct ConfigDev* configDev = FindConfigDev(NULL, TF_MANU_ID, 0x94);
-    kprintf("configDev = %08lx\n", configDev);
+    dbg_trace("configDev = $l", configDev);
     if (!configDev)
     {
-        kprintf("FindConfigDev() failed\n");
+		dbg_error("FindConfigDev() failed");
     }
     else
     {
 	    struct TFConfig* tfConfig = configDev->cd_BoardAddr;
-	    kprintf("tfConfig = %08lx\n", tfConfig);
+	    dbg_info("tfConfig = $l", tfConfig);
 	    if (!tfConfig)
 	    {
-	        kprintf("cd_BoardAddr is null\n");
+	        dbg_warning("cd_BoardAddr is null");
 	    }
 	    dev->tf_config = tfConfig;
     }
@@ -155,22 +156,22 @@ int probe_pi_interface(struct A314Device *dev)
     	return FALSE;
     }
 
-	kprintf("probing PI IRQ...\n");
+	dbg_info("Probing PI IRQ...");
 	set_pi_irq(dev);
 	for(short timeout = 3; timeout >= 0; timeout--)
 	{
 		if (!check_pi_irq(dev))
 			break;
-		kprintf("PI IRQ not cleared; delaying...\n");
+		dbg_info("PI IRQ not cleared; delaying...");
 		delay_1s();
 	}
 	if (check_pi_irq(dev))
 	{
-		kprintf("No a314d running on the PI ?!\n");
+		dbg_error("No a314d running on the PI ?!");
 		return FALSE;
 	}
 
-	kprintf("a314d is running!\n");
+	dbg_info("a314d is running!");
 
     const void* sram = (void*)(((intptr_t)dev->tf_config) + SRAM_START);
     const ULONG sram_size = SRAM_END - SRAM_START;
@@ -179,7 +180,7 @@ int probe_pi_interface(struct A314Device *dev)
 	dev->ca = sram;
 	if (dev->ca == NULL)
 	{
-		dbg_error("Unable to allocate A314 memory for com area\n");
+		dbg_error("Unable to allocate A314 memory for com area");
 		return FALSE;
 	}
 	memset(dev->ca, 0, sizeof(struct ComArea));
@@ -187,7 +188,7 @@ int probe_pi_interface(struct A314Device *dev)
 	const uint32_t ca_cutout = 1024;
 	if (ca_cutout < sizeof(struct ComArea))
 	{
-		dbg_error("A314 memory for com area to big!\n");
+		dbg_error("A314 memory for com area too big!");
 		return FALSE;
 	}
 
@@ -229,18 +230,13 @@ void setup_pi_interface(struct A314Device *dev)
 
 void read_from_r2a(struct A314Device *dev, UBYTE *dst, UBYTE offset, int length)
 {
-	// kprintf("read_from_r2a: length = %ld ; dst = %lx\n", length, dst);
 	UBYTE *r2a_buffer = dev->ca->r2a_buffer;
-	// DumpBuffer(&r2a_buffer[offset], length);
 	for (int i = 0; i < length; i++)
 		*dst++ = r2a_buffer[offset++];
 }
 
 void write_to_a2r(struct A314Device *dev, UBYTE type, UBYTE stream_id, UBYTE length, UBYTE *data)
 {
-	// kprintf("write_to_a2r: type=%lx ; stream=%lx ; length = %ld ; data = %lx\n", type, stream_id, length, data);
-	// DumpBuffer(data, length);
-
 	struct ComArea *ca = dev->ca;
 	UBYTE index = ca->cap.a2r_tail;
 	UBYTE *a2r_buffer = ca->a2r_buffer;
@@ -261,11 +257,11 @@ static ULONG cpu_to_a314_address(__reg("a6") struct A314Device *dev, __reg("a0")
 	if (sram_lo <= address && address < sram_hi)
 	{
 		ULONG ret = (intptr_t)address - (intptr_t)sram_lo;
-		kprintf("cpu_to_a314: %08lx => %08lx\n", address, ret);
+		dbg_trace("cpu_to_a314: $l => $l", address, ret);
 		return (intptr_t)address - (intptr_t)sram_lo;
 	}
 
-	kprintf("cpu_to_a314: %08lx is not valid!\n", address);
+	dbg_error("cpu_to_a314: $l is not valid!", address);
 
 	return INVALID_A314_ADDRESS;
 }
@@ -277,18 +273,18 @@ static void *a314_to_cpu_address(__reg("a6") struct A314Device *dev, __reg("d0")
 
 	if (address == INVALID_A314_ADDRESS)
 	{
-		kprintf("a314_to_cpu: using %08lx is not valid!\n", address);
+		dbg_error("a314_to_cpu: using $l is not valid!", address);
 		return 0;
 	}
 
 	if (sram_lo <= address && address < sram_hi)
 	{
 		void* ret = (void*)((intptr_t)dev->tf_config + SRAM_START + address);
-		kprintf("a314_to_cpu: %08lx <= %08lx\n", ret, address);
+		dbg_trace("a314_to_cpu: $l <= $l", ret, address);
 		return (void*)((intptr_t)dev->tf_config + SRAM_START + address);
 	}
 
-	kprintf("a314_to_cpu: %08lx is not valid!\n", address);
+	dbg_error("a314_to_cpu: $l is not valid!", address);
 
 	return 0/*INVALID_A314_ADDRESS*/;
 }
@@ -300,52 +296,30 @@ ULONG a314base_translate_address(__reg("a6") struct A314Device *dev, __reg("a0")
 
 ULONG a314base_alloc_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG length)
 {
-	kprintf("a314base_alloc_mem: %ld bytes\n", length);
+	dbg_trace("a314base_alloc_mem: $l bytes", length);
 	length = ( length + 63 ) & (~63);
-	length += 256;
 	void *p = AllocMem(length, MEMF_A314 | MEMF_CLEAR);
 	if (!p)
 		return INVALID_A314_ADDRESS;
-	memset(p, 0xcd, length);
-	uint32_t* g = (uint32_t*)p;
-	*g++ = (uint32_t)p;
-	*g++ = length;
-	g += (128 / sizeof(uint32_t)) - 2;
-	return cpu_to_a314_address(dev, g);
+	return cpu_to_a314_address(dev,  p);
 }
 
 void a314base_free_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address, __reg("d1") ULONG length)
 {
-	kprintf("a314base_free_mem: %08lx / %ld bytes\n", address, length);
+	dbg_trace("a314base_free_mem: $l bytes", address, length);
 	length = ( length + 63 ) & (~63);
-	length += 256;
 	void *p = a314_to_cpu_address(dev, address);
-	uint32_t* g = (uint32_t*)p;
-	g -= (128 / sizeof(uint32_t));
-	if (g[0] != (uint32_t)p)
-	{
-		kprintf("***************** %08lx != %08lx\n", p, g[0]);
-	}
-	if (g[1] != length)
-	{
-		kprintf("***************** %ld != %ld\n", length, g[1]);
-	}
-	p = (void*)*g;
 	FreeMem(p, length);
 }
 
 void a314base_write_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG address, __reg("a0") UBYTE *src, __reg("d1") ULONG length)
 {
-	// kprintf("a314base_write_mem: %08lx / %ld bytes\n", address, length);
 	UBYTE *dst = a314_to_cpu_address(dev, address);
 	memcpy(dst, src, length);
-	// DumpBuffer(dst, length);
 }
 
 void a314base_read_mem(__reg("a6") struct A314Device *dev, __reg("a0") UBYTE *dst, __reg("d0") ULONG address, __reg("d1") ULONG length)
 {
-	// kprintf("a314base_read_mem: %08lx / %ld bytes\n", address, length);
 	UBYTE *src = a314_to_cpu_address(dev, address);
 	memcpy(dst, src, length);
-	// DumpBuffer(dst, length);
 }
