@@ -20,7 +20,7 @@ void dbg(const char* fmt, ...)
 }
 #else
 
-#define LOG_SIZE 128
+#define LOG_SIZE 16
 
 extern void debug_process_seglist();
 static const char debug_process_name[] = "logger-process";
@@ -165,9 +165,6 @@ void dbg(const char* fmt, ...)
         }
     }
     *q++ = '\n';
-    *q = '\0';
-
-    kprintf("%s", msg_bufs[my_slot]);
 
     Disable();
     msg_lengths[my_slot] = q - msg_bufs[my_slot];
@@ -180,5 +177,3 @@ void dbg(const char* fmt, ...)
         Signal(&debug_process->pr_Task, SIGBREAKF_CTRL_D);
 }
 #endif
-
-#include "kprintf.c"
