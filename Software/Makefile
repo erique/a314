@@ -10,7 +10,7 @@ BIN=bin_pi
 
 $(shell mkdir -p $(BIN) > /dev/null)
 
-all: ${BIN}/a314d-td ${BIN}/a314d-cp ${BIN}/a314d-fe ${BIN}/a314d-tf4060 ${BIN}/spi-a314-tf.dtbo ${BIN}/spi-a314.dtbo ${BIN}/start_gpclk
+all: ${BIN}/a314d-td ${BIN}/a314d-cp ${BIN}/a314d-fe ${BIN}/a314d-tf ${BIN}/spi-a314-tf.dtbo ${BIN}/spi-a314.dtbo ${BIN}/start_gpclk
 
 clean:
 	rm -f ${BIN}/a314d-td
@@ -29,8 +29,8 @@ ${BIN}/a314d-cp: a314d/a314d.cc
 ${BIN}/a314d-fe: a314d/a314d.cc
 	${CPP} -DMODEL_FE=1 a314d/a314d.cc -O3 -o ${BIN}/a314d-fe
 
-${BIN}/a314d-tf4060: a314d/a314d.cc
-	${CPP} -DMODEL_TF=1 a314d/a314d.cc a314d/fomu-flash/rpi.c -O3 -o ${BIN}/a314d-tf4060
+${BIN}/a314d-tf: a314d/a314d.cc
+	${CPP} -DMODEL_TF=1 a314d/a314d.cc a314d/fomu-flash/rpi.c -O3 -o ${BIN}/a314d-tf
 
 ${BIN}/spi-a314-tf.dtbo: a314d/spi-a314-tf-overlay.dts
 	${DTC} -I dts -O dtb -o ${BIN}/spi-a314-tf.dtbo a314d/spi-a314-tf-overlay.dts
