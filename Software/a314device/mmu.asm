@@ -15,8 +15,8 @@
 	XDEF	_SetMMU
 	CODE
 
-ENABLE_KPRINTF
-	include "kprintf.i"
+kprintf	MACRO
+	ENDM
 	
 _SetMMU	; ( addr:a0 size:d0 flags:d1 exec:a6 )
 	; returns old flags in d0/d1

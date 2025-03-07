@@ -1,10 +1,6 @@
 	XDEF	_IntServer
 	CODE
 
-ENABLE_KPRINTF
-
-	include "kprintf.i"
-
 SINT		equ	$3f4
 
 BOARD_OFFSET	equ	40		; == offsetof(struct A314Device, tf_config)
