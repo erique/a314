@@ -76,12 +76,13 @@ struct BufDesc
 	void *bd_Buffer;
 	ULONG bd_BufferAddress;
 	int bd_Length;
+	BOOL buffer_is_mapped;
 };
 
 // Constants.
 
 const char device_name[] = DEVICE_NAME;
-const char id_string[] = DEVICE_NAME " 1.1 (3.3.2024)";
+const char id_string[] = DEVICE_NAME " 1.2 (11.3.2025)";
 
 static const char service_name[] = SERVICE_NAME;
 static const char a314_device_name[] = A314_NAME;
@@ -205,7 +206,8 @@ static void copy_from_bd_and_reply(struct IOSana2Req *ios2, struct BufDesc *bd)
 	// This will avoid copying from A314 shared memory to shadow buffer
 	// before copying to stack's buffer.
 
-	ReadMemA314(bd->bd_Buffer, bd->bd_BufferAddress, bd->bd_Length);
+	if (!bd->buffer_is_mapped)
+		ReadMemA314(bd->bd_Buffer, bd->bd_BufferAddress, bd->bd_Length);
 
 	struct EthHdr *eh = bd->bd_Buffer;
 
@@ -268,7 +270,8 @@ static void copy_to_bd_and_reply(struct BufDesc *bd, struct IOSana2Req *ios2)
 		bd->bd_Length = ios2->ios2_DataLength + sizeof(struct EthHdr);
 	}
 
-	WriteMemA314(bd->bd_BufferAddress, bd->bd_Buffer, bd->bd_Length);
+	if (!bd->buffer_is_mapped)
+		WriteMemA314(bd->bd_BufferAddress, bd->bd_Buffer, bd->bd_Length);
 
 	ios2->ios2_Req.io_Error = 0;
 	ReplyMsg(&ios2->ios2_Req.io_Message);
@@ -572,13 +575,24 @@ static void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req 
 	{
 		struct BufDesc *bd = &et_bufs[i];
 
-		bd->bd_Buffer = AllocMem(RAW_MTU, 0);
-		if (!bd->bd_Buffer)
-			goto error;
+		// try memory-mapped alloc
+		bd->bd_Buffer = AllocMem(RAW_MTU, MEMF_A314);
+		if (bd->bd_Buffer)
+			bd->bd_BufferAddress = TranslateAddressA314(bd->bd_Buffer);
 
-		bd->bd_BufferAddress = AllocMemA314(RAW_MTU);
-		if (bd->bd_BufferAddress == INVALID_A314_ADDRESS)
-			goto error;
+		bd->buffer_is_mapped = bd->bd_Buffer != NULL && bd->bd_BufferAddress != INVALID_A314_ADDRESS;
+
+		// memory-mapped alloc failed; use a separate copy-buffer
+		if (!bd->buffer_is_mapped)
+		{
+			bd->bd_Buffer = AllocMem(RAW_MTU, 0);
+			if (!bd->bd_Buffer)
+				goto error;
+
+			bd->bd_BufferAddress = AllocMemA314(RAW_MTU);
+			if (bd->bd_BufferAddress == INVALID_A314_ADDRESS)
+				goto error;
+		}
 
 		if (i < ET_RBUF_CNT)
 			AddTail(&et_rbuf_free_list, (struct Node*)&bd->bd_Node);
