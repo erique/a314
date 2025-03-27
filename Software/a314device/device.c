@@ -17,7 +17,19 @@
 #define SysBase (*(struct ExecBase **)4)
 
 const char device_name[] = A314_NAME;
-const char id_string[] = A314_NAME " 1.0 (25 Aug 2018)";
+const char id_string[] = A314_NAME " 1.0 (25 Mar 2025) "
+#if defined(MODEL_TD)
+	"Trapdoor"
+#elif defined(MODEL_FE)
+	"Trapdoor"
+#elif defined(MODEL_CP)
+	"Front expansion"
+#elif defined(MODEL_TF)
+	"Terriblefire / TF4060"
+#else
+#error Need to define MODEL_TD, MODEL_FE, MODEL_CP or MODEL_TF
+#endif
+	;
 
 static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg("a0") BPTR seg_list, __reg("d0") struct A314Device *dev)
 {
