@@ -243,7 +243,7 @@ char *DosAllocMem(int len)
 void DosFreeMem(char *p)
 {
 	long *lp = (long *)p;
-	long len = *--lp;
+	long len = *--lp + 4;
 	FreeMem((char *)lp, len);
 }
 
