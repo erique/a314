@@ -244,7 +244,7 @@ void DosFreeMem(char *p)
 {
 	long *lp = (long *)p;
 	long len = *--lp;
-	FreeMem((char *)lp, len);
+	FreeMem((char *)lp, len + 4);
 }
 
 void reply_packet(struct DosPacket *dp)
