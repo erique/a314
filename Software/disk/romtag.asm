@@ -8,7 +8,7 @@ NT_DEVICE:      equ    3
 VERSION:        equ    1
 PRIORITY:       equ    -5
 
-        section    code,code
+        section    CODE,code
 
         moveq    #-1,d0
         rts
@@ -17,7 +17,7 @@ romtag:
         dc.w    RTC_MATCHWORD
         dc.l    romtag
         dc.l    endcode
-        dc.b    RTF_AUTOINIT | RTF_COLDSTART
+        dc.b    RTF_AUTOINIT|RTF_COLDSTART
         dc.b    VERSION
         dc.b    NT_DEVICE
         dc.b    PRIORITY

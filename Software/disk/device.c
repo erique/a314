@@ -593,7 +593,7 @@ struct MountListEntry
     struct BootNode boot_node;
 };
 
-static ULONG env_vec_template[20] = {
+static const ULONG env_vec_template[20] = {
     19,             // DE_TABLESIZE
     128,            // DE_SIZEBLOCK
     0,              // DE_SECORG
@@ -774,7 +774,7 @@ static BPTR close(__reg("a6") struct DiskDevice *dev, __reg("a1") struct IOReque
     return 0;
 }
 
-static ULONG device_vectors[] =
+static const ULONG device_vectors[] =
 {
     (ULONG)open,
     (ULONG)close,
@@ -785,7 +785,7 @@ static ULONG device_vectors[] =
     -1,
 };
 
-ULONG auto_init_tables[] =
+const ULONG auto_init_tables[] =
 {
     sizeof(struct DiskDevice),
     (ULONG)device_vectors,
