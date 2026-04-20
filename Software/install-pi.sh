@@ -26,19 +26,22 @@ install_common() {
 	install hid/hid.py /opt/a314
 	install remote-mouse/remote-mouse.py /opt/a314
 	install videoplayer/videoplayer.py /opt/a314
+	install usbhardware/usbbridge.py /opt/a314
+	install usbhardware/usb_protocol.py /opt/a314
 
 	# Write configuration files, but don't overwrite
 	[ -f /etc/opt/a314/a314d.conf ] || modinstall a314d/a314d.conf /etc/opt/a314
 	[ -f /etc/opt/a314/picmd.conf ] || modinstall picmd/picmd.conf /etc/opt/a314
 	[ -f /etc/opt/a314/a314fs.conf ] || modinstall a314fs/a314fs.conf /etc/opt/a314
 	[ -f /etc/opt/a314/disk.conf ] || modinstall disk/disk.conf /etc/opt/a314
+	[ -f /etc/opt/a314/usbbridge.conf ] || modinstall usbhardware/usbbridge.conf /etc/opt/a314
 
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
 
 	# Install Python packages in virtual environment
 	python3 -m virtualenv /opt/a314/venv
-	/opt/a314/venv/bin/pip install pyudev websockets python-pytun bpls2gif/
+	/opt/a314/venv/bin/pip install pyusb pyudev websockets python-pytun bpls2gif/
 
 	# Add tap0 interface
 	modinstall ethernet/pi-config/tap0 /etc/network/interfaces.d
