@@ -19,8 +19,6 @@ import time
 import usb.core
 import usb.util
 
-# Locate a314d module (sibling directory)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'a314d'))
 from a314d import A314d
 
 from usb_protocol import *
@@ -37,7 +35,7 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)  # DEBUG for per-transfer logging
 
 SERVICE_NAME = 'usbhw'
-CONFIG_FILE = 'usbbridge.conf'
+CONFIG_FILE = '/etc/opt/a314/usbbridge.conf'
 
 # Standard USB requests
 USB_REQ_GET_STATUS = 0x00
