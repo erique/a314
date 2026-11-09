@@ -118,8 +118,26 @@ static void begin_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314
 
 static ULONG abort_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314_IORequest *ior)
 {
+#if defined(MODEL_TF)
+	// The driver task owns the sockets: queue the request for it. If it is
+	// still pending there, it is replied with IOERR_ABORTED and its socket
+	// is reset (handle_aborts() in driver_task.c).
+	Forbid();
+	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
+	{
+		if (dev->pending_aborts[i] == NULL || dev->pending_aborts[i] == ior)
+		{
+			dev->pending_aborts[i] = ior;
+			break;
+		}
+	}
+	Permit();
+	Signal(&dev->task, SIGF_INT);
+	return 0;
+#else
 	// There is currently no support for aborting an IORequest.
 	return IOERR_NOCMD;
+#endif
 }
 
 static const ULONG device_vectors[] =

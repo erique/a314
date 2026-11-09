@@ -49,6 +49,18 @@ struct A314Device
 	void *first_chunk;
 #elif defined(MODEL_TF)
 	struct ComArea *ca;
+
+	// Fallback poll: a VERTB server signals the driver task
+	// every few frames while sockets are open, so a lost INT2 costs a short
+	// delay instead of a hang. The layout is used by int_vertb_tf.asm.
+	struct Interrupt vertb_interrupt;
+	struct TFPoll
+	{
+		struct Task *task;	// 0
+		UWORD active;		// 4: poll while non-zero
+		UWORD count;		// 6: frames to the next poll
+		ULONG ticks;		// 8: frames since start, always counted
+	} poll;
 #endif
 
 	struct MsgPort task_mp;
@@ -59,6 +71,12 @@ struct A314Device
 	struct Socket *send_queue_tail;
 
 	UBYTE next_stream_id;
+
+#if defined(MODEL_TF)
+	// AbortIO() hands requests to the driver task, which owns the sockets.
+#define MAX_PENDING_ABORTS 8
+	struct A314_IORequest *pending_aborts[MAX_PENDING_ABORTS];
+#endif
 };
 
 #if defined(MODEL_TD) || defined(MODEL_FE) || defined(MODEL_TF)
