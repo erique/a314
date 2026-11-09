@@ -1118,7 +1118,7 @@ static int init_driver()
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
 #if defined(MODEL_TF)
-    const uint32_t limit = 25*1000*1000;
+    const uint32_t limit = 12*1000*1000;   // tf4060v2 run-time clock switching: FPGA fabric down to ~50 MHz (was 25 MHz)
     if (speed > limit)
     {
         speed = limit;
@@ -1461,16 +1461,20 @@ static void create_and_enqueue_packet(LogicalChannel *ch, uint8_t type, uint8_t 
         memcpy(&pb.data[0], data, length);
 }
 
+static void close_all_logical_channels();
+
 static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
 {
     for (auto &ch : channels)
     {
         if (ch.channel_id == channel_id)
         {
-            // We should handle this in some constructive way.
-            // This signals that should reset all logical channels.
-            logger_error("Received a CONNECT packet on a channel that was believed to be previously allocated\n");
-            exit(-1);
+            // The Amiga was reset without a314d seeing it (e.g. while backing
+            // off for CE0), so the old channels belong to the previous boot.
+            // Close them all, as for a detected reset, and accept the CONNECT.
+            logger_warning("Received a CONNECT packet on a channel that was believed to be previously allocated -- missed Amiga reset, closing all channels\n");
+            close_all_logical_channels();
+            break;
         }
     }
 
@@ -2013,6 +2017,7 @@ static void handle_a314_irq()
         const uint64_t cooldown = 100*1000;
         static uint64_t sleep_counter = 0;
 
+        bool idle_poll = false;
         if (!(irq & REG_IRQ_RPI))
         {
             // after N checks w/o activity, sleep some extra
@@ -2027,13 +2032,21 @@ static void handle_a314_irq()
             if (sleep_counter > 1000)
                 usleep(1);                  // basic yield to not slam the poor PI
 
-            return;
+            // Fallback poll: look at the com area every 1000
+            // checks (about once a second when idle) even without an
+            // interrupt, so a lost one can't leave both sides waiting.
+            if ((sleep_counter % 1000) != 0)
+                return;
+            idle_poll = true;
         }
 
-        if (sleep_counter > cooldown)
-            logger_info("PI became active!\n");
+        if (!idle_poll)
+        {
+            if (sleep_counter > cooldown)
+                logger_info("PI became active!\n");
 
-        sleep_counter = 0;
+            sleep_counter = 0;
+        }
     }
 
     spi_write_sint(REG_IRQ_RPI);
@@ -2322,6 +2335,10 @@ static void main_loop()
 
 int main(int argc, char **argv)
 {
+    // Line-buffer stdout (info/warning) like stderr (errors), so the journal
+    // keeps the real order and times of the log lines.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     std::string conf_filename("/etc/opt/a314/a314d.conf");
 
     int used_args = 1;
