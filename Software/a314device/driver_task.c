@@ -741,18 +741,91 @@ void task_main()
 
 #elif defined(MODEL_TF)
 
+// A Pi that has not taken anything from a2r for this many frames is gone
+// (a314d stopped or crashed): every socket is closed, so no client waits on
+// it for ever. About 5 s at 50 Hz.
+#define DEAD_PI_FRAMES 250
+
+// Requests queued by AbortIO(): reply each one that is still pending with
+// IOERR_ABORTED and reset its socket.
+static void handle_aborts(struct A314Device *dev)
+{
+	struct A314_IORequest *aborts[MAX_PENDING_ABORTS];
+
+	Forbid();
+	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
+	{
+		aborts[i] = dev->pending_aborts[i];
+		dev->pending_aborts[i] = NULL;
+	}
+	Permit();
+
+	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
+	{
+		struct A314_IORequest *ior = aborts[i];
+		if (ior == NULL)
+			continue;
+
+		struct Node *node = dev->active_sockets.lh_Head;
+		while (node->ln_Succ != NULL)
+		{
+			struct Socket *s = (struct Socket *)node;
+			node = node->ln_Succ;
+
+			if (s->flags & SOCKET_CLOSED)
+				continue;
+			if (s->pending_connect == ior)
+				s->pending_connect = NULL;
+			else if (s->pending_read == ior)
+				s->pending_read = NULL;
+			else if (s->pending_write == ior)
+				s->pending_write = NULL;
+			else
+				continue;
+
+			dbg_info("AbortIO: request aborted, resetting its socket");
+			ior->a314_Length = 0;
+			ior->a314_Request.io_Error = IOERR_ABORTED;
+			ReplyMsg((struct Message *)ior);
+			close_socket(dev, s, TRUE);
+			break;
+		}
+	}
+}
+
+static void close_all_sockets(struct A314Device *dev)
+{
+	struct Node *node = dev->active_sockets.lh_Head;
+	while (node->ln_Succ != NULL)
+	{
+		struct Socket *s = (struct Socket *)node;
+		node = node->ln_Succ;
+		if (!(s->flags & SOCKET_CLOSED))
+			close_socket(dev, s, FALSE);
+	}
+}
+
 void task_main()
 {
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
 	struct ComAreaPtrs *cap = CAP_PTR(dev);
 
+	BOOL a2r_stalled = FALSE;
+	UBYTE stall_head = 0;
+	ULONG stall_since = 0;
+
 	while (TRUE)
 	{
+		// Poll while anything could be waiting on the Pi.
+		dev->poll.active = dev->active_sockets.lh_TailPred != (struct Node *)&dev->active_sockets;
+
 		dbg_trace("Invoking Wait()");
 
 		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT);
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
+
+		handle_aborts(dev);
 
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
@@ -767,10 +840,30 @@ void task_main()
 		handle_packets_received_r2a(dev);
 		handle_room_in_a2r(dev);
 
-		if (prev_a2r_tail != cap->a2r_tail || prev_r2a_head != cap->r2a_head)
+		// Also while a2r still holds data for the Pi: a314d only looks at the
+		// com area after an interrupt, so a lost one (or an a314d that started
+		// while a2r was full) would otherwise leave both sides waiting.
+		if (prev_a2r_tail != cap->a2r_tail || prev_r2a_head != cap->r2a_head ||
+		    cap->a2r_head != cap->a2r_tail)
 		{
 			dbg_trace("Signal PI IRQ");
 			set_pi_irq(dev);
+		}
+
+		// Dead Pi: a2r has data and its head has not moved.
+		if (cap->a2r_head == cap->a2r_tail)
+			a2r_stalled = FALSE;
+		else if (!a2r_stalled || cap->a2r_head != stall_head)
+		{
+			a2r_stalled = TRUE;
+			stall_head = cap->a2r_head;
+			stall_since = dev->poll.ticks;
+		}
+		else if (dev->poll.ticks - stall_since > DEAD_PI_FRAMES)
+		{
+			dbg_warning("The Pi has not taken data for 5 s: closing all sockets");
+			close_all_sockets(dev);
+			a2r_stalled = FALSE;
 		}
 	}
 
