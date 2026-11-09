@@ -167,11 +167,15 @@ int probe_pi_interface(struct A314Device *dev)
 	}
 	if (check_pi_irq(dev))
 	{
-		dbg_error("No a314d running on the PI ?!");
-		return FALSE;
+		// Start anyway: a314d may come up later (the Pi boots
+		// from the Amiga's power, or a314d is restarting). The com area is
+		// cleared below and the reset bit in setup_pi_interface(), so a314d
+		// picks it up when it starts. Connects made meanwhile are reset by
+		// the dead-Pi check in task_main().
+		dbg_warning("No a314d running on the Pi yet; starting anyway");
 	}
-
-	dbg_info("a314d is running!");
+	else
+		dbg_info("a314d is running!");
 
     const void* sram = (void*)(((intptr_t)dev->tf_config) + SRAM_START);
     const ULONG sram_size = SRAM_END - SRAM_START;
@@ -203,6 +207,8 @@ int probe_pi_interface(struct A314Device *dev)
 
 extern void IntServer();
 
+extern void VertbServerTF();
+
 static void add_interrupt_handlers(struct A314Device *dev)
 {
 	memset(&dev->int_x_interrupt, 0, sizeof(struct Interrupt));
@@ -215,6 +221,20 @@ static void add_interrupt_handlers(struct A314Device *dev)
 	dev->interrupt_number = 2;
 	LONG int_num = dev->interrupt_number == 6 ? INTB_EXTER : INTB_PORTS;
 	AddIntServer(int_num, &dev->int_x_interrupt);
+
+	// Fallback poll (int_vertb_tf.asm), as the TD and FE models do on VERTB.
+	dev->poll.task = &dev->task;
+	dev->poll.active = 0;
+	dev->poll.count = 1;
+	dev->poll.ticks = 0;
+
+	memset(&dev->vertb_interrupt, 0, sizeof(struct Interrupt));
+	dev->vertb_interrupt.is_Node.ln_Type = NT_INTERRUPT;
+	dev->vertb_interrupt.is_Node.ln_Pri = -60;
+	dev->vertb_interrupt.is_Node.ln_Name = (char *)device_name;
+	dev->vertb_interrupt.is_Data = (APTR)&dev->poll;
+	dev->vertb_interrupt.is_Code = VertbServerTF;
+	AddIntServer(INTB_VERTB, &dev->vertb_interrupt);
 }
 
 void setup_pi_interface(struct A314Device *dev)
