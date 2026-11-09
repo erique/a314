@@ -8,6 +8,8 @@
 #include <exec/libraries.h>
 
 #include <devices/timer.h>
+#include <devices/input.h>
+#include <devices/inputevent.h>
 
 #include <libraries/dos.h>
 #include <libraries/dosextens.h>
@@ -59,6 +61,52 @@ struct timerequest *tr;
 
 struct MsgPort *a314_mp;
 struct A314_IORequest *a314_ior;
+
+// Link resilience: PI0: must never hang the Amiga. With no Pi,
+// or a Pi that stops answering, PI0: behaves like a drive with no disk, and
+// a314fs reconnects in the background.
+#define REQ_TIMEOUT_SECS	10	// one request/response round trip
+#define CONNECT_TIMEOUT_SECS	3
+#define RESET_TIMEOUT_SECS	2
+#define RETRY_SECS		2	// between connect attempts
+#define RETRY_OPEN_SECS		10	// between OpenDevice attempts (no a314.device yet)
+#define LINK_TIMEOUT		(-1)	// a314_cmd_timed(): no answer in time
+
+struct MsgPort *a314_rst_mp;		// a second request on the same socket, to reset it
+struct A314_IORequest *a314_rst_ior;
+struct MsgPort *tmo_mp;			// request timeouts
+struct timerequest *tmo_tr;
+struct MsgPort *retry_mp;		// reconnect timer
+struct timerequest *retry_tr;
+BOOL retry_pending = FALSE;		// retry_tr is running (a retry wait or a connect timeout)
+BOOL connecting = FALSE;		// a CONNECT is outstanding on a314_ior
+struct MsgPort *input_mp;		// disk inserted/removed events for Workbench
+struct IOStdReq *input_ior;
+
+BOOL a314_open = FALSE;			// a314.device is open and our requests are ours
+BOOL a314_missing = FALSE;		// gave up on a314.device (see open_a314())
+BOOL buffers_ready = FALSE;		// request/data buffers set up in A314 memory
+BOOL connected = FALSE;
+BOOL volume_in_list = FALSE;
+ULONG conn_gen = 0;			// bumped on every connect; older locks/handles are stale
+
+// Locks and file handles remember the connection they came from, so a lock or
+// handle from before a drop is never sent to the Pi.
+struct MyLock
+{
+	struct FileLock fl;
+	ULONG gen;
+};
+
+struct MyFile
+{
+	LONG arg1;			// the Pi's handle
+	ULONG gen;
+};
+
+void create_and_add_volume();
+void remove_volume_if_unused();
+void send_disk_event(UBYTE ie_class);
 
 struct Library *A314Base;
 
@@ -254,53 +302,299 @@ void reply_packet(struct DosPacket *dp)
 	PutMsg(reply_port, dp->dp_Link);
 }
 
-// Routines for talking to the A314 driver.
-LONG a314_cmd_wait(UWORD command, char *buffer, int length)
+// Routines for talking to the A314 driver. Every request has a timeout:
+// nothing here may wait for ever on the Pi.
+
+static void start_timer(struct timerequest *t, ULONG secs)
 {
+	t->tr_node.io_Command = TR_ADDREQUEST;
+	t->tr_time.tv_secs = secs;
+	t->tr_time.tv_micro = 0;
+	SendIO((struct IORequest *)t);
+}
+
+static void stop_timer(struct timerequest *t)
+{
+	if (!CheckIO((struct IORequest *)t))
+		AbortIO((struct IORequest *)t);
+	WaitIO((struct IORequest *)t);
+}
+
+// Wait for a request that has been sent, at most secs seconds.
+// TRUE: it completed. FALSE: it is still pending.
+static BOOL wait_io_timed(struct IORequest *ior, ULONG secs)
+{
+	ULONG sigs = (1UL << ior->io_Message.mn_ReplyPort->mp_SigBit) | (1UL << tmo_mp->mp_SigBit);
+
+	start_timer(tmo_tr, secs);
+	while (1)
+	{
+		if (CheckIO(ior))
+		{
+			WaitIO(ior);
+			stop_timer(tmo_tr);
+			return TRUE;
+		}
+		if (CheckIO((struct IORequest *)tmo_tr))
+		{
+			WaitIO((struct IORequest *)tmo_tr);
+			return FALSE;
+		}
+		Wait(sigs);
+	}
+}
+
+// Send a command on our socket and wait for it, at most secs seconds.
+// Returns the a314 io_Error, or LINK_TIMEOUT.
+LONG a314_cmd_timed(UWORD command, char *buffer, int length, ULONG secs)
+{
+	if (!a314_open)
+		return LINK_TIMEOUT;
+
 	a314_ior->a314_Request.io_Command = command;
 	a314_ior->a314_Request.io_Error = 0;
 	a314_ior->a314_Socket = socket;
 	a314_ior->a314_Buffer = buffer;
 	a314_ior->a314_Length = length;
-	return DoIO((struct IORequest *)a314_ior);
+	SendIO((struct IORequest *)a314_ior);
+
+	if (wait_io_timed((struct IORequest *)a314_ior, secs))
+		return a314_ior->a314_Request.io_Error;
+
+	dbg("a314 command $l timed out; resetting the socket\n", (ULONG)command);
+
+	// a314.device has no AbortIO. Resetting the socket from a second request
+	// makes it reply the pending one (close_socket() in driver_task.c).
+	a314_rst_ior->a314_Request.io_Command = A314_RESET;
+	a314_rst_ior->a314_Request.io_Error = 0;
+	a314_rst_ior->a314_Socket = socket;
+	a314_rst_ior->a314_Buffer = NULL;
+	a314_rst_ior->a314_Length = 0;
+	SendIO((struct IORequest *)a314_rst_ior);
+
+	BOOL rst_back = wait_io_timed((struct IORequest *)a314_rst_ior, RESET_TIMEOUT_SECS);
+	BOOL ior_back = wait_io_timed((struct IORequest *)a314_ior, RESET_TIMEOUT_SECS);
+	if (!rst_back || !ior_back)
+	{
+		// a314.device itself is not answering. Its requests may still be
+		// replied later, so never reuse them: open_a314() makes new ones.
+		dbg("a314.device did not reply; abandoning its requests\n");
+		a314_open = FALSE;
+	}
+
+	return LINK_TIMEOUT;
 }
 
-LONG a314_connect(char *name)
+// Open a314.device with fresh ports and requests. After a314.device has
+// stopped answering, a few reopens are allowed; then PI0: stays empty
+// (every reopen costs two signals that can't be freed while the old
+// requests may still be replied).
+#define MAX_A314_OPENS 4
+int a314_opens = 0;
+
+static void MyDeletePort(struct MsgPort *port)
 {
+	if (port == NULL)
+		return;
+	FreeSignal(port->mp_SigBit);
+	FreeMem(port, sizeof(struct MsgPort));
+}
+
+// Request and data buffers in A314 memory, on the first successful open.
+static void setup_buffers()
+{
+	if (buffers_ready)
+		return;
+
+	char *b = AllocMem(REQ_RES_BUF_SIZE, MEMF_A314);
+	if (b != NULL)
+	{
+		FreeMem(request_buffer, REQ_RES_BUF_SIZE);	// the plain one from startup
+		request_buffer = b;
+		request_buffer_in_a314_memory = TRUE;
+		request_buffer_address = TranslateAddressA314(request_buffer);
+	}
+	else
+	{
+		request_buffer_in_a314_memory = FALSE;
+		request_buffer_address = AllocMemA314(REQ_RES_BUF_SIZE);
+	}
+
+	data_buffer_address = AllocMemA314(BUFFER_SIZE);
+	buffers_ready = TRUE;
+}
+
+BOOL open_a314()
+{
+	if (a314_opens >= MAX_A314_OPENS)
+	{
+		dbg("open_a314: too many reopens, giving up\n");
+		a314_missing = TRUE;
+		return FALSE;
+	}
+
+	a314_mp = MyCreatePort(NULL, 0);
+	a314_rst_mp = MyCreatePort(NULL, 0);
+	a314_ior = (struct A314_IORequest *)MyCreateExtIO(a314_mp, sizeof(struct A314_IORequest));
+	a314_rst_ior = (struct A314_IORequest *)MyCreateExtIO(a314_rst_mp, sizeof(struct A314_IORequest));
+
+	if (a314_ior == NULL || a314_rst_ior == NULL ||
+	    OpenDevice(A314_NAME, 0, (struct IORequest *)a314_ior, 0) != 0)
+	{
+		// Not there yet (no TF board found, no a314.device file, or an
+		// older a314.device that refuses to open without a314d): try again
+		// later. Nothing was handed to the device, so free it all.
+		dbg("open_a314: OpenDevice failed, will retry\n");
+		if (a314_ior != NULL)
+			FreeMem(a314_ior, sizeof(struct A314_IORequest));
+		if (a314_rst_ior != NULL)
+			FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
+		MyDeletePort(a314_mp);
+		MyDeletePort(a314_rst_mp);
+		a314_ior = a314_rst_ior = NULL;
+		a314_mp = a314_rst_mp = NULL;
+		return FALSE;
+	}
+	a314_opens++;
+
+	// The reset request uses the same unit.
+	a314_rst_ior->a314_Request.io_Device = a314_ior->a314_Request.io_Device;
+	a314_rst_ior->a314_Request.io_Unit = a314_ior->a314_Request.io_Unit;
+
+	A314Base = &(a314_ior->a314_Request.io_Device->dd_Library);
+	a314_open = TRUE;
+	setup_buffers();
+	return TRUE;
+}
+
+void arm_retry()
+{
+	if (retry_pending || a314_missing)
+		return;
+	start_timer(retry_tr, a314_open ? RETRY_SECS : RETRY_OPEN_SECS);
+	retry_pending = TRUE;
+}
+
+void go_online()
+{
+	conn_gen++;
+	connected = TRUE;
+	create_and_add_volume();
+	send_disk_event(IECLASS_DISKINSERTED);
+	dbg("Connected (generation $l)\n", conn_gen);
+}
+
+void go_offline()
+{
+	if (!connected)
+		return;
+
+	connected = FALSE;
+	if (my_volume != NULL)
+		my_volume->dl_Task = NULL;
+	remove_volume_if_unused();
+	send_disk_event(IECLASS_DISKREMOVED);
+	arm_retry();
+	dbg("Link to the Pi lost\n");
+}
+
+// Start a CONNECT without waiting for it: the main loop sees it complete
+// (a314_mp) or time out (retry_tr). Meanwhile every packet fails at once
+// with ERROR_NO_DISK, so nothing waits on the Pi.
+void start_connect()
+{
+	if (a314_missing || connecting || connected)
+		return;
+	if (!a314_open && !open_a314())
+	{
+		arm_retry();
+		return;
+	}
+
 	struct DateStamp ds;
 	DateStamp(&ds);
-	socket = ds.ds_Tick;
-	return a314_cmd_wait(A314_CONNECT, name, strlen(name));
+	socket = ds.ds_Tick + (conn_gen << 20);	// a new socket for every attempt
+
+	a314_ior->a314_Request.io_Command = A314_CONNECT;
+	a314_ior->a314_Request.io_Error = 0;
+	a314_ior->a314_Socket = socket;
+	a314_ior->a314_Buffer = "a314fs";
+	a314_ior->a314_Length = 6;
+	SendIO((struct IORequest *)a314_ior);
+	connecting = TRUE;
+	dbg("connect: start, socket $l, opens $l\n", (ULONG)socket, (ULONG)a314_opens);
+
+	if (retry_pending)
+		stop_timer(retry_tr);
+	start_timer(retry_tr, CONNECT_TIMEOUT_SECS);
+	retry_pending = TRUE;
 }
 
-LONG a314_read(char *buf, int length)
+// Called from the main loop on every wake-up.
+void poll_connection()
 {
-	return a314_cmd_wait(A314_READ, buf, length);
-}
+	if (connecting)
+	{
+		if (CheckIO((struct IORequest *)a314_ior))
+		{
+			WaitIO((struct IORequest *)a314_ior);
+			connecting = FALSE;
+			stop_timer(retry_tr);
+			retry_pending = FALSE;
 
-LONG a314_write(char *buf, int length)
-{
-	return a314_cmd_wait(A314_WRITE, buf, length);
-}
+			dbg("connect: done, error $l\n", (ULONG)a314_ior->a314_Request.io_Error);
+			if (a314_ior->a314_Request.io_Error == A314_CONNECT_OK)
+				go_online();
+			else
+				arm_retry();
+		}
+		else if (CheckIO((struct IORequest *)retry_tr))
+		{
+			// No answer: reset the socket so a314.device replies the CONNECT.
+			WaitIO((struct IORequest *)retry_tr);
+			retry_pending = FALSE;
 
-LONG a314_eos()
-{
-	return a314_cmd_wait(A314_EOS, NULL, 0);
-}
+			a314_rst_ior->a314_Request.io_Command = A314_RESET;
+			a314_rst_ior->a314_Request.io_Error = 0;
+			a314_rst_ior->a314_Socket = socket;
+			a314_rst_ior->a314_Buffer = NULL;
+			a314_rst_ior->a314_Length = 0;
+			SendIO((struct IORequest *)a314_rst_ior);
 
-LONG a314_reset()
-{
-	return a314_cmd_wait(A314_RESET, NULL, 0);
+			BOOL rst_back = wait_io_timed((struct IORequest *)a314_rst_ior, RESET_TIMEOUT_SECS);
+			BOOL ior_back = wait_io_timed((struct IORequest *)a314_ior, RESET_TIMEOUT_SECS);
+			dbg("connect: timeout, reset back $l, connect back $l\n", (ULONG)rst_back, (ULONG)ior_back);
+			if (!rst_back || !ior_back)
+				a314_open = FALSE;	// see a314_cmd_timed()
+			connecting = FALSE;
+			arm_retry();
+		}
+		return;
+	}
+
+	if (!connected && retry_pending && CheckIO((struct IORequest *)retry_tr))
+	{
+		WaitIO((struct IORequest *)retry_tr);
+		retry_pending = FALSE;
+		start_connect();
+	}
 }
 
 void create_and_add_volume()
 {
-	my_volume = (struct DeviceList *)DosAllocMem(sizeof(struct DeviceList));
-	my_volume->dl_Name = MKBADDR(default_volume_name);
-	my_volume->dl_Type = DLT_VOLUME;
+	if (my_volume == NULL)
+	{
+		my_volume = (struct DeviceList *)DosAllocMem(sizeof(struct DeviceList));
+		my_volume->dl_Name = MKBADDR(default_volume_name);
+		my_volume->dl_Type = DLT_VOLUME;
+		my_volume->dl_DiskType = ID_314_DISK;
+		DateStamp(&my_volume->dl_VolumeDate);
+	}
+
 	my_volume->dl_Task = mp;
-	my_volume->dl_DiskType = ID_314_DISK;
-	DateStamp(&my_volume->dl_VolumeDate);
+
+	if (volume_in_list)
+		return;
 
 	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
 	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
@@ -309,6 +603,50 @@ void create_and_add_volume()
 	my_volume->dl_Next = info->di_DevInfo;
 	info->di_DevInfo = MKBADDR(my_volume);
 	Permit();
+	volume_in_list = TRUE;
+}
+
+// Take the volume out of the device list. Only when nothing holds a lock on
+// it: with locks, it stays listed with dl_Task = NULL, so DOS asks for the
+// volume (Retry/Cancel) when they are used.
+void remove_volume_if_unused()
+{
+	if (my_volume == NULL || !volume_in_list || my_volume->dl_Lock != 0 || connected)
+		return;
+
+	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
+	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
+	BPTR me = MKBADDR(my_volume);
+
+	Forbid();
+	if (info->di_DevInfo == me)
+		info->di_DevInfo = my_volume->dl_Next;
+	else
+	{
+		struct DeviceList *prev = (struct DeviceList *)BADDR(info->di_DevInfo);
+		while (prev != NULL && prev->dl_Next != me)
+			prev = (struct DeviceList *)BADDR(prev->dl_Next);
+		if (prev != NULL)
+			prev->dl_Next = my_volume->dl_Next;
+	}
+	Permit();
+	volume_in_list = FALSE;
+}
+
+void send_disk_event(UBYTE ie_class)
+{
+	if (input_ior == NULL)
+		return;
+
+	struct InputEvent ie;
+	memset(&ie, 0, sizeof(ie));
+	ie.ie_Class = ie_class;
+
+	input_ior->io_Command = IND_WRITEEVENT;
+	input_ior->io_Data = &ie;
+	input_ior->io_Length = sizeof(struct InputEvent);
+	input_ior->io_Flags = 0;
+	DoIO((struct IORequest *)input_ior);
 }
 
 void startup_fs_handler(struct DosPacket *dp)
@@ -343,47 +681,40 @@ void startup_fs_handler(struct DosPacket *dp)
 		return;
 	}
 
-	a314_mp = MyCreatePort(NULL, 0);
-	a314_ior = (struct A314_IORequest *)MyCreateExtIO(a314_mp, sizeof(struct A314_IORequest));
-	if (OpenDevice(A314_NAME, 0, (struct IORequest *)a314_ior, 0) != 0)
+	tmo_mp = MyCreatePort(NULL, 0);
+	tmo_tr = (struct timerequest *)MyCreateExtIO(tmo_mp, sizeof(struct timerequest));
+	retry_mp = MyCreatePort(NULL, 0);
+	retry_tr = (struct timerequest *)MyCreateExtIO(retry_mp, sizeof(struct timerequest));
+	OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)tmo_tr, 0);
+	OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)retry_tr, 0);
+
+	input_mp = MyCreatePort(NULL, 0);
+	input_ior = (struct IOStdReq *)MyCreateExtIO(input_mp, sizeof(struct IOStdReq));
+	if (input_ior != NULL && OpenDevice("input.device", 0, (struct IORequest *)input_ior, 0) != 0)
+		input_ior = NULL;
+
+	// A plain request buffer until a314.device is open (setup_buffers()
+	// moves it to A314 memory), so failure responses always have a buffer.
+	request_buffer = AllocMem(REQ_RES_BUF_SIZE, MEMF_PUBLIC | MEMF_CLEAR);
+	request_buffer_in_a314_memory = FALSE;
+
+	// Connect now, waiting up to a second so a Mount followed straight away
+	// by a command sees the volume. If the Pi is not there yet, PI0: is an
+	// empty drive and the main loop keeps trying in the background.
+	start_connect();
+	if (connecting)
 	{
-		// Om detta failar så är det inget mer vi kan göra.
-		// F.n. så antar vi att det inte händer.
-		dbg("Fatal error: unable to open a314.device\n");
-		return;
+		ULONG sigs = (1UL << a314_mp->mp_SigBit) | (1UL << retry_mp->mp_SigBit);
+		start_timer(tmo_tr, 1);
+		while (connecting && !CheckIO((struct IORequest *)tmo_tr))
+		{
+			Wait(sigs | (1UL << tmo_mp->mp_SigBit));
+			poll_connection();
+		}
+		stop_timer(tmo_tr);
 	}
 
-	A314Base = &(a314_ior->a314_Request.io_Device->dd_Library);
-
-	if (a314_connect("a314fs") != A314_CONNECT_OK)
-	{
-		dbg("Fatal error: unable to connect to a314fs on rasp\n");
-		// Detta skulle kunna hända.
-		// Om det händer så måste vi bara vänta och försöka igen om en stund.
-
-		// TODO: Här måste jag använda timer.device för att sätta en timer om 2 sekunder, då jag försöker ansluta igen.
-		return;
-	}
-
-	request_buffer = AllocMem(REQ_RES_BUF_SIZE, MEMF_A314);
-	request_buffer_in_a314_memory = request_buffer != NULL;
-	if (request_buffer_in_a314_memory)
-		request_buffer_address = TranslateAddressA314(request_buffer);
-	else
-	{
-		request_buffer = AllocMem(REQ_RES_BUF_SIZE, 0);
-		request_buffer_address = AllocMemA314(REQ_RES_BUF_SIZE);
-	}
-
-	data_buffer_address = AllocMemA314(BUFFER_SIZE);
-
-	// Så vi kan anta att vi kommer hit, och då har vi en ström till rasp-sidan, där vi kan skicka data.
-	create_and_add_volume();
-
-	dbg("Startup successful\n");
-
-	// Om vi senare skulle få problem med anslutningen så hantera det som att disken har skjutits ut, och försök ansluta igen inom två sekunder.
-	// Men f.n. är det nått vi inte hanterar.
+	dbg("Startup done, connected = $l\n", (ULONG)connected);
 }
 
 void wait_for_response()
@@ -404,22 +735,54 @@ void wait_for_response()
 	}
 }
 
-void write_req_and_wait_for_res(int len)
+// Every response starts with has_response, success, error_code.
+static void fail_response(short error_code)
 {
+	memset(request_buffer, 0, REQ_RES_BUF_SIZE);
+	struct FreeLockResponse *res = (struct FreeLockResponse *)request_buffer;
+	res->has_response = 1;
+	res->success = 0;
+	res->error_code = error_code;
+}
+
+// Send the request in request_buffer and wait for the response. If the Pi is
+// not connected or does not answer in time, the response is a failure with
+// ERROR_NO_DISK (DOS then offers Retry/Cancel), and a314fs reconnects in the
+// background.
+BOOL write_req_and_wait_for_res(int len)
+{
+	if (!connected)
+	{
+		fail_response(ERROR_NO_DISK);
+		return FALSE;
+	}
+
 	if (!request_buffer_in_a314_memory)
 		WriteMemA314(request_buffer_address, request_buffer, len);
 	ULONG buf[2] = {request_buffer_address, len};
-	a314_write((char *)&buf[0], 8);
-	//wait_for_response();
-	a314_read((char *)&buf[1], 4);
+
+	if (a314_cmd_timed(A314_WRITE, (char *)&buf[0], 8, REQ_TIMEOUT_SECS) != A314_WRITE_OK ||
+	    a314_cmd_timed(A314_READ, (char *)&buf[1], 4, REQ_TIMEOUT_SECS) != A314_READ_OK ||
+	    a314_ior->a314_Length != 4)
+	{
+		go_offline();
+		fail_response(ERROR_NO_DISK);
+		return FALSE;
+	}
+
 	len = buf[1];
+	if (len > REQ_RES_BUF_SIZE)
+		len = REQ_RES_BUF_SIZE;
 	if (!request_buffer_in_a314_memory)
 		ReadMemA314(request_buffer, request_buffer_address, len);
+	return TRUE;
 }
 
 struct FileLock *create_and_add_file_lock(long key, long mode)
 {
-	struct FileLock *lock = (struct FileLock *)DosAllocMem(sizeof(struct FileLock));
+	struct MyLock *ml = (struct MyLock *)DosAllocMem(sizeof(struct MyLock));
+	struct FileLock *lock = &ml->fl;
+	ml->gen = conn_gen;
 
 	lock->fl_Key = key;
 	lock->fl_Access = mode;
@@ -485,12 +848,17 @@ void action_free_lock(struct DosPacket *dp)
 
 	if (lock != NULL)
 	{
-		struct FreeLockRequest *req = (struct FreeLockRequest *)request_buffer;
-		req->has_response = 0;
-		req->type = dp->dp_Type;
-		req->key = lock->fl_Key;
+		// A lock from before a drop is only freed here: the Pi no longer
+		// knows its key.
+		if (connected && ((struct MyLock *)lock)->gen == conn_gen)
+		{
+			struct FreeLockRequest *req = (struct FreeLockRequest *)request_buffer;
+			req->has_response = 0;
+			req->type = dp->dp_Type;
+			req->key = lock->fl_Key;
 
-		write_req_and_wait_for_res(sizeof(struct FreeLockRequest));
+			write_req_and_wait_for_res(sizeof(struct FreeLockRequest));
+		}
 
 		// Ignore the response. Must succeed.
 		//struct FreeLockResponse *res = (struct FreeLockResponse *)request_buffer;
@@ -507,6 +875,7 @@ void action_free_lock(struct DosPacket *dp)
 		}
 		Permit();
 		DosFreeMem((char *)lock);
+		remove_volume_if_unused();
 	}
 
 	dp->dp_Res1 = DOSTRUE;
@@ -788,7 +1157,27 @@ void action_findxxx(struct DosPacket *dp)
 	}
 	else
 	{
-		fh->fh_Arg1 = res->arg1;
+		struct MyFile *mf = (struct MyFile *)AllocMem(sizeof(struct MyFile), MEMF_PUBLIC);
+		if (mf == NULL)
+		{
+			// Close it again on the Pi; nothing refers to it. The request
+			// overwrites the response, so take the handle first.
+			LONG pi_arg1 = res->arg1;
+			struct EndRequest *ereq = (struct EndRequest *)request_buffer;
+			ereq->has_response = 0;
+			ereq->type = ACTION_END;
+			ereq->arg1 = pi_arg1;
+			write_req_and_wait_for_res(sizeof(struct EndRequest));
+
+			dp->dp_Res1 = DOSFALSE;
+			dp->dp_Res2 = ERROR_NO_FREE_STORE;
+			reply_packet(dp);
+			return;
+		}
+		mf->arg1 = res->arg1;
+		mf->gen = conn_gen;
+
+		fh->fh_Arg1 = (LONG)mf;
 		fh->fh_Type = mp;
 		fh->fh_Port = DOSFALSE;  // Not an interactive file.
 
@@ -1201,10 +1590,16 @@ void action_same_lock(struct DosPacket *dp)
 void fill_info_data(struct InfoData *id)
 {
 	memset(id, 0, sizeof(struct InfoData));
+	id->id_BytesPerBlock = 512;
+	if (!connected)
+	{
+		id->id_DiskState = ID_VALIDATED;
+		id->id_DiskType = ID_NO_DISK_PRESENT;
+		return;
+	}
 	id->id_DiskState = ID_VALIDATED;
 	id->id_NumBlocks = 512 * 1024;
 	id->id_NumBlocksUsed = 10;
-	id->id_BytesPerBlock = 512;
 	id->id_DiskType = ID_DOS_DISK;
 	id->id_VolumeNode = MKBADDR(my_volume);
 	id->id_InUse = DOSTRUE;
@@ -1219,6 +1614,13 @@ void action_info(struct DosPacket *dp)
 	dbg("  lock = $l\n", lock);
 
 	fill_info_data(id);
+	dp->dp_Res1 = DOSTRUE;
+	dp->dp_Res2 = 0;
+	if (!connected)
+	{
+		reply_packet(dp);
+		return;
+	}
 
 	struct InfoRequest *req = (struct InfoRequest *)request_buffer;
 	req->has_response = 0;
@@ -1251,6 +1653,13 @@ void action_disk_info(struct DosPacket *dp)
 	dbg("ACTION_DISK_INFO\n");
 
 	fill_info_data(id);
+	if (!connected)
+	{
+		dp->dp_Res1 = DOSTRUE;
+		dp->dp_Res2 = 0;
+		reply_packet(dp);
+		return;
+	}
 
 	struct DiskInfoRequest *req = (struct DiskInfoRequest *)request_buffer;
 	req->has_response = 0;
@@ -1302,6 +1711,181 @@ void action_unsupported(struct DosPacket *dp)
 	reply_packet(dp);
 }
 
+static void reply_error(struct DosPacket *dp, LONG res1, LONG error)
+{
+	dp->dp_Res1 = res1;
+	dp->dp_Res2 = error;
+	reply_packet(dp);
+}
+
+// TRUE if the lock (BPTR) is NULL or comes from the current connection.
+static BOOL lock_current(ULONG bptr)
+{
+	struct MyLock *ml = (struct MyLock *)BADDR(bptr);
+	return ml == NULL || ml->gen == conn_gen;
+}
+
+// Which packet arguments are locks: bit 0 = Arg1, bit 1 = Arg2, bit 2 = Arg3.
+static ULONG lock_args(LONG type)
+{
+	switch (type)
+	{
+	case ACTION_LOCATE_OBJECT:
+	case ACTION_COPY_DIR:
+	case ACTION_PARENT:
+	case ACTION_EXAMINE_OBJECT:
+	case ACTION_EXAMINE_NEXT:
+	case ACTION_DELETE_OBJECT:
+	case ACTION_CREATE_DIR:
+	case ACTION_INFO:
+		return 1;
+	case ACTION_FINDUPDATE:
+	case ACTION_FINDINPUT:
+	case ACTION_FINDOUTPUT:
+	case ACTION_SET_PROTECT:
+	case ACTION_SET_COMMENT:
+		return 2;
+	case ACTION_RENAME_OBJECT:
+		return 1 | 4;
+	case ACTION_SAME_LOCK:
+		return 1 | 2;
+	default:
+		return 0;
+	}
+}
+
+static BOOL is_file_action(LONG type)
+{
+	return type == ACTION_READ || type == ACTION_WRITE || type == ACTION_SEEK ||
+	       type == ACTION_END || type == ACTION_EXAMINE_FH;
+}
+
+static void dispatch_action(struct DosPacket *dp)
+{
+	switch (dp->dp_Type)
+	{
+	case ACTION_LOCATE_OBJECT: action_locate_object(dp); break;
+	case ACTION_FREE_LOCK: action_free_lock(dp); break;
+	case ACTION_COPY_DIR: action_copy_dir(dp); break;
+	case ACTION_PARENT: action_parent(dp); break;
+	case ACTION_EXAMINE_OBJECT: action_examine_object(dp); break;
+	case ACTION_EXAMINE_NEXT: action_examine_next(dp); break;
+	case ACTION_EXAMINE_FH: action_examine_fh(dp); break;
+
+	case ACTION_FINDUPDATE: action_findxxx(dp); break;
+	case ACTION_FINDINPUT: action_findxxx(dp); break;
+	case ACTION_FINDOUTPUT: action_findxxx(dp); break;
+	case ACTION_READ: action_read(dp); break;
+	case ACTION_WRITE: action_write(dp); break;
+	case ACTION_SEEK: action_seek(dp); break;
+	case ACTION_END: action_end(dp); break;
+	//case ACTION_TRUNCATE: action_truncate(dp); break;
+
+	case ACTION_DELETE_OBJECT: action_delete_object(dp); break;
+	case ACTION_RENAME_OBJECT: action_rename_object(dp); break;
+	case ACTION_CREATE_DIR: action_create_dir(dp); break;
+
+	case ACTION_SET_PROTECT: action_set_protect(dp); break;
+	case ACTION_SET_COMMENT: action_set_comment(dp); break;
+	//case ACTION_SET_DATE: action_set_date(dp); break;
+
+	case ACTION_SAME_LOCK: action_same_lock(dp); break;
+	case ACTION_DISK_INFO: action_disk_info(dp); break;
+	case ACTION_INFO: action_info(dp); break;
+
+	case ACTION_IS_FILESYSTEM: action_is_filesystem(dp); break;
+
+	/*
+	case ACTION_CURRENT_VOLUME: action_current_volume(dp); break;
+	case ACTION_RENAME_DISK: action_rename_disk(dp); break;
+
+	case ACTION_DIE: //action_die(dp); break;
+	case ACTION_MORE_CACHE: //action_more_cache(dp); break;
+	case ACTION_FLUSH: //action_flush(dp); break;
+	case ACTION_INHIBIT: //action_inhibit(dp); break;
+	case ACTION_WRITE_PROTECT: //action_write_protect(dp); break;
+	*/
+
+	default: action_unsupported(dp); break;
+	}
+}
+
+// Offline (no Pi): fail with ERROR_NO_DISK, so DOS offers Retry/Cancel.
+// A lock or file handle from before a drop: free it, or fail it with
+// ERROR_INVALID_LOCK; never send its old key to the Pi.
+void handle_packet(struct DosPacket *dp)
+{
+	LONG type = dp->dp_Type;
+	LONG fail_res1 = (type == ACTION_READ || type == ACTION_WRITE || type == ACTION_SEEK) ? -1 : DOSFALSE;
+
+	switch (type)
+	{
+	case ACTION_IS_FILESYSTEM:
+	case ACTION_FREE_LOCK:		// handles stale locks and offline itself
+		dispatch_action(dp);
+		return;
+	case ACTION_INFO:
+	case ACTION_DISK_INFO:
+		if (!connected || lock_current(dp->dp_Arg1) || type == ACTION_DISK_INFO)
+		{
+			dispatch_action(dp);
+			return;
+		}
+		break;
+	}
+
+	if (is_file_action(type))
+	{
+		struct MyFile *mf = (struct MyFile *)dp->dp_Arg1;
+		if (mf == NULL)
+		{
+			reply_error(dp, fail_res1, ERROR_INVALID_LOCK);
+			return;
+		}
+
+		BOOL current = connected && mf->gen == conn_gen;
+		if (type == ACTION_END && !current)
+		{
+			FreeMem(mf, sizeof(struct MyFile));
+			reply_error(dp, DOSTRUE, 0);
+			return;
+		}
+		if (!connected)
+		{
+			reply_error(dp, fail_res1, ERROR_NO_DISK);
+			return;
+		}
+		if (!current)
+		{
+			reply_error(dp, fail_res1, ERROR_INVALID_LOCK);
+			return;
+		}
+
+		dp->dp_Arg1 = mf->arg1;
+		dispatch_action(dp);
+		if (type == ACTION_END)
+			FreeMem(mf, sizeof(struct MyFile));
+		return;
+	}
+
+	if (!connected)
+	{
+		reply_error(dp, DOSFALSE, ERROR_NO_DISK);
+		return;
+	}
+
+	ULONG m = lock_args(type);
+	if (((m & 1) && !lock_current(dp->dp_Arg1)) ||
+	    ((m & 2) && !lock_current(dp->dp_Arg2)) ||
+	    ((m & 4) && !lock_current(dp->dp_Arg3)))
+	{
+		reply_error(dp, DOSFALSE, ERROR_INVALID_LOCK);
+		return;
+	}
+
+	dispatch_action(dp);
+}
+
 void start(__reg("a0") struct DosPacket *startup_packet)
 {
 	SysBase = *(struct ExecBase **)4;
@@ -1311,58 +1895,19 @@ void start(__reg("a0") struct DosPacket *startup_packet)
 
 	startup_fs_handler(startup_packet);
 
+	ULONG mp_sig = 1UL << mp->mp_SigBit;
+	ULONG retry_sig = retry_mp != NULL ? (1UL << retry_mp->mp_SigBit) : 0;
+
 	while (1)
 	{
-		WaitPort(mp);
-		struct StandardPacket *sp = (struct StandardPacket *)GetMsg(mp);
-		struct DosPacket *dp = (struct DosPacket *)(sp->sp_Msg.mn_Node.ln_Name);
+		ULONG a314_sig = a314_open ? (1UL << a314_mp->mp_SigBit) : 0;
+		Wait(mp_sig | retry_sig | a314_sig);
 
-		switch (dp->dp_Type)
-		{
-		case ACTION_LOCATE_OBJECT: action_locate_object(dp); break;
-		case ACTION_FREE_LOCK: action_free_lock(dp); break;
-		case ACTION_COPY_DIR: action_copy_dir(dp); break;
-		case ACTION_PARENT: action_parent(dp); break;
-		case ACTION_EXAMINE_OBJECT: action_examine_object(dp); break;
-		case ACTION_EXAMINE_NEXT: action_examine_next(dp); break;
-		case ACTION_EXAMINE_FH: action_examine_fh(dp); break;
+		poll_connection();
 
-		case ACTION_FINDUPDATE: action_findxxx(dp); break;
-		case ACTION_FINDINPUT: action_findxxx(dp); break;
-		case ACTION_FINDOUTPUT: action_findxxx(dp); break;
-		case ACTION_READ: action_read(dp); break;
-		case ACTION_WRITE: action_write(dp); break;
-		case ACTION_SEEK: action_seek(dp); break;
-		case ACTION_END: action_end(dp); break;
-		//case ACTION_TRUNCATE: action_truncate(dp); break;
-
-		case ACTION_DELETE_OBJECT: action_delete_object(dp); break;
-		case ACTION_RENAME_OBJECT: action_rename_object(dp); break;
-		case ACTION_CREATE_DIR: action_create_dir(dp); break;
-
-		case ACTION_SET_PROTECT: action_set_protect(dp); break;
-		case ACTION_SET_COMMENT: action_set_comment(dp); break;
-		//case ACTION_SET_DATE: action_set_date(dp); break;
-
-		case ACTION_SAME_LOCK: action_same_lock(dp); break;
-		case ACTION_DISK_INFO: action_disk_info(dp); break;
-		case ACTION_INFO: action_info(dp); break;
-
-		case ACTION_IS_FILESYSTEM: action_is_filesystem(dp); break;
-
-		/*
-		case ACTION_CURRENT_VOLUME: action_current_volume(dp); break;
-		case ACTION_RENAME_DISK: action_rename_disk(dp); break;
-
-		case ACTION_DIE: //action_die(dp); break;
-		case ACTION_MORE_CACHE: //action_more_cache(dp); break;
-		case ACTION_FLUSH: //action_flush(dp); break;
-		case ACTION_INHIBIT: //action_inhibit(dp); break;
-		case ACTION_WRITE_PROTECT: //action_write_protect(dp); break;
-		*/
-
-		default: action_unsupported(dp); break;
-		}
+		struct StandardPacket *sp;
+		while ((sp = (struct StandardPacket *)GetMsg(mp)) != NULL)
+			handle_packet((struct DosPacket *)(sp->sp_Msg.mn_Node.ln_Name));
 	}
 
 	dbg("Shutting down\n");

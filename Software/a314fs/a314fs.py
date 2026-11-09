@@ -10,6 +10,7 @@ import time
 import os
 import struct
 import glob
+import collections
 import logging
 import json
 import shutil
@@ -67,13 +68,31 @@ def send_read_mem_req(address, length):
     m = struct.pack('=IIBII', 8, 0, MSG_READ_MEM_REQ, address, length)
     drv.sendall(m)
 
+class StreamReset(Exception):
+    """The Amiga reset the a314fs stream while a request was in progress."""
+
+# Messages that arrived while waiting for a memory response; the main loop
+# handles them first.
+pending_msgs = collections.deque()
+
+def next_msg():
+    return pending_msgs.popleft() if pending_msgs else wait_for_msg()
+
+def wait_for_mem_res(expected):
+    # An Amiga reset (MSG_RESET, then a new MSG_CONNECT) can arrive before the
+    # memory response. Keep those for the main loop instead of exiting, and
+    # give up on the request if our stream was reset.
+    while True:
+        stream_id, ptype, payload = wait_for_msg()
+        if ptype == expected:
+            return payload
+        pending_msgs.append((stream_id, ptype, payload))
+        if ptype == MSG_RESET and stream_id == current_stream_id:
+            raise StreamReset()
+
 def read_mem(address, length):
     send_read_mem_req(address, length)
-    stream_id, ptype, payload = wait_for_msg()
-    if ptype != MSG_READ_MEM_RES:
-        logger.error('Expected MSG_READ_MEM_RES but got %s. Shutting down.', ptype)
-        exit(-1)
-    return payload
+    return wait_for_mem_res(MSG_READ_MEM_RES)
 
 def send_write_mem_req(address, data):
     m = struct.pack('=IIBI', 4 + len(data), 0, MSG_WRITE_MEM_REQ, address) + data
@@ -81,10 +100,7 @@ def send_write_mem_req(address, data):
 
 def write_mem(address, data):
     send_write_mem_req(address, data)
-    stream_id, ptype, payload = wait_for_msg()
-    if ptype != MSG_WRITE_MEM_RES:
-        logger.error('Expected MSG_WRITE_MEM_RES but got %s. Shutting down.', ptype)
-        exit(-1)
+    wait_for_mem_res(MSG_WRITE_MEM_RES)
 
 def send_connect_response(stream_id, result):
     m = struct.pack('=IIBB', 1, stream_id, MSG_CONNECT_RESPONSE, result)
@@ -817,7 +833,7 @@ if not done:
     logger.info('a314fs is running, shared directory: %s', SHARED_DIRECTORY)
 
 while not done:
-    stream_id, ptype, payload = wait_for_msg()
+    stream_id, ptype, payload = next_msg()
 
     if ptype == MSG_CONNECT:
         if payload == b'a314fs':
@@ -828,11 +844,26 @@ while not done:
         else:
             send_connect_response(stream_id, 3)
     elif ptype == MSG_DATA:
+        if stream_id != current_stream_id:
+            logger.debug('Ignoring DATA for stream %d (not the current stream)', stream_id)
+            continue
         address, length = struct.unpack('>II', payload)
-        req = read_mem(address + 2, length - 2)
-        res = process_request(req)
-        write_mem(address + 2, res)
+        try:
+            req = read_mem(address + 2, length - 2)
+            try:
+                res = process_request(req)
+            except Exception:
+                # e.g. a lock or file key from before a reset: answer with an
+                # error instead of exiting (the Amiga would lose PI0:).
+                logger.exception('Request failed; answering with an error')
+                res = struct.pack('>HH', 0, ERROR_INVALID_LOCK)
+            write_mem(address + 2, res)
+        except StreamReset:
+            logger.warning('Stream reset by the Amiga during a request; request dropped')
+            continue
         send_data(stream_id, struct.pack('>I', len(res) + 2))
+    elif ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
+        logger.debug('Ignoring a late memory response (request dropped after a reset)')
     elif ptype == MSG_EOS:
         if stream_id == current_stream_id:
             logger.debug('Got EOS, stream closed')
