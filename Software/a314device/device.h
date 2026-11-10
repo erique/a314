@@ -71,13 +71,14 @@ struct A314Device
 	struct Socket *send_queue_tail;
 
 	UBYTE next_stream_id;
+};
 
 #if defined(MODEL_TF)
-	// AbortIO() hands requests to the driver task, which owns the sockets.
-#define MAX_PENDING_ABORTS 8
-	struct A314_IORequest *pending_aborts[MAX_PENDING_ABORTS];
+// Set in io_Flags (bits 4-7 are the device's) by AbortIO() on a request that is
+// not yet replied. The driver task, which owns the sockets, replies it with
+// IOERR_ABORTED. BeginIO() clears it.
+#define A314_IOF_ABORT (1 << 7)
 #endif
-};
 
 #if defined(MODEL_TD) || defined(MODEL_FE) || defined(MODEL_TF)
 #define CAP_PTR(dev) (&(dev->ca->cap))

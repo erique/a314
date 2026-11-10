@@ -58,6 +58,13 @@ static void close_socket(struct A314Device *dev, struct Socket *s, BOOL should_s
 {
 	dbg_trace("Enter: close_socket");
 
+	// A CONNECT still in the send queue was never written to a2r, so the Pi
+	// has never seen this stream: there is nothing to reset, and keeping the
+	// socket until a PKT_RESET goes out would leak it (and its stream id)
+	// for as long as the Pi is not reading a2r.
+	if (s->pending_connect != NULL && (s->flags & SOCKET_IN_SEND_QUEUE))
+		should_send_reset = FALSE;
+
 	if (s->pending_connect != NULL)
 	{
 		struct A314_IORequest *ior = s->pending_connect;
@@ -538,9 +545,29 @@ static void handle_app_reset(struct A314Device *dev, struct A314_IORequest *ior,
 	}
 }
 
+#if defined(MODEL_TF)
+// A request marked by AbortIO() (A314_IOF_ABORT) is replied with IOERR_ABORTED.
+static BOOL reply_if_aborted(struct A314_IORequest *ior)
+{
+	if (ior == NULL || !(ior->a314_Request.io_Flags & A314_IOF_ABORT))
+		return FALSE;
+
+	ior->a314_Length = 0;
+	ior->a314_Request.io_Error = IOERR_ABORTED;
+	ReplyMsg((struct Message *)ior);
+	return TRUE;
+}
+#endif
+
 static void handle_app_request(struct A314Device *dev, struct A314_IORequest *ior)
 {
 	dbg_trace("Enter: handle_app_request");
+
+#if defined(MODEL_TF)
+	// Aborted before the driver task took it: nothing was done for it yet.
+	if (reply_if_aborted(ior))
+		return;
+#endif
 
 	struct Socket *s = find_socket(dev, ior->a314_Request.io_Message.mn_ReplyPort->mp_SigTask, ior->a314_Socket);
 
@@ -742,57 +769,55 @@ void task_main()
 #elif defined(MODEL_TF)
 
 // A Pi that has not taken anything from a2r for this many frames is gone
-// (a314d stopped or crashed): every socket is closed, so no client waits on
-// it for ever. About 5 s at 50 Hz.
+// (a314d stopped or crashed): every socket is closed, so clients waiting to
+// send or connect get an error. About 5 s at 50 Hz. This only sees a Pi that
+// stops reading: a client blocked on a READ with a2r empty needs its own
+// timeout (a314fs has one).
 #define DEAD_PI_FRAMES 250
 
-// Requests queued by AbortIO(): reply each one that is still pending with
-// IOERR_ABORTED and reset its socket.
+// Requests marked by AbortIO() while pending on a socket: reply them with
+// IOERR_ABORTED and reset the socket, as the stream state is no longer known.
+// (Marked requests still in task_mp are replied by handle_app_request().)
 static void handle_aborts(struct A314Device *dev)
 {
-	struct A314_IORequest *aborts[MAX_PENDING_ABORTS];
-
-	Forbid();
-	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
+	struct Node *node = dev->active_sockets.lh_Head;
+	while (node->ln_Succ != NULL)
 	{
-		aborts[i] = dev->pending_aborts[i];
-		dev->pending_aborts[i] = NULL;
-	}
-	Permit();
+		struct Socket *s = (struct Socket *)node;
+		node = node->ln_Succ;
 
-	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
-	{
-		struct A314_IORequest *ior = aborts[i];
-		if (ior == NULL)
+		if (s->flags & SOCKET_CLOSED)
 			continue;
 
-		struct Node *node = dev->active_sockets.lh_Head;
-		while (node->ln_Succ != NULL)
+		BOOL aborted = FALSE;
+		if (reply_if_aborted(s->pending_connect))
 		{
-			struct Socket *s = (struct Socket *)node;
-			node = node->ln_Succ;
+			s->pending_connect = NULL;
+			aborted = TRUE;
+		}
+		if (reply_if_aborted(s->pending_read))
+		{
+			s->pending_read = NULL;
+			aborted = TRUE;
+		}
+		if (reply_if_aborted(s->pending_write))
+		{
+			s->pending_write = NULL;
+			aborted = TRUE;
+		}
 
-			if (s->flags & SOCKET_CLOSED)
-				continue;
-			if (s->pending_connect == ior)
-				s->pending_connect = NULL;
-			else if (s->pending_read == ior)
-				s->pending_read = NULL;
-			else if (s->pending_write == ior)
-				s->pending_write = NULL;
-			else
-				continue;
-
+		if (aborted)
+		{
 			dbg_info("AbortIO: request aborted, resetting its socket");
-			ior->a314_Length = 0;
-			ior->a314_Request.io_Error = IOERR_ABORTED;
-			ReplyMsg((struct Message *)ior);
 			close_socket(dev, s, TRUE);
-			break;
 		}
 	}
 }
 
+// The Pi has stopped reading a2r: close every socket, so the requests pending
+// on them are replied. Each one is reset, and its stream id stays in use until
+// the PKT_RESET goes out (when the Pi reads a2r again), so a314d never sees the
+// id reused for a new CONNECT while its old channel is still open.
 static void close_all_sockets(struct A314Device *dev)
 {
 	struct Node *node = dev->active_sockets.lh_Head;
@@ -800,8 +825,9 @@ static void close_all_sockets(struct A314Device *dev)
 	{
 		struct Socket *s = (struct Socket *)node;
 		node = node->ln_Succ;
+
 		if (!(s->flags & SOCKET_CLOSED))
-			close_socket(dev, s, FALSE);
+			close_socket(dev, s, TRUE);
 	}
 }
 
@@ -825,8 +851,6 @@ void task_main()
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
 
-		handle_aborts(dev);
-
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
 
@@ -839,6 +863,10 @@ void task_main()
 
 		handle_packets_received_r2a(dev);
 		handle_room_in_a2r(dev);
+
+		// After the packets, so a request that completed in the meantime is
+		// replied normally instead of aborted.
+		handle_aborts(dev);
 
 		// Also while a2r still holds data for the Pi: a314d only looks at the
 		// com area after an interrupt, so a lost one (or an a314d that started

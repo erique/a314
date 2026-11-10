@@ -98,11 +98,46 @@ struct MyLock
 	ULONG gen;
 };
 
+// fh_Arg1 of our file handles. The open ones are kept in a list, so a handle
+// that is not ours any more (a second Close(), a packet reused after
+// ACTION_END) is recognised instead of used.
 struct MyFile
 {
+	struct MyFile *next;
 	LONG arg1;			// the Pi's handle
 	ULONG gen;
 };
+
+struct MyFile *my_files = NULL;
+
+static struct MyFile *find_my_file(LONG fh_arg1)
+{
+	for (struct MyFile *mf = my_files; mf != NULL; mf = mf->next)
+		if ((LONG)mf == fh_arg1)
+			return mf;
+	return NULL;
+}
+
+static void free_my_file(struct MyFile *mf)
+{
+	for (struct MyFile **pp = &my_files; *pp != NULL; pp = &(*pp)->next)
+	{
+		if (*pp == mf)
+		{
+			*pp = mf->next;
+			FreeMem(mf, sizeof(struct MyFile));
+			return;
+		}
+	}
+}
+
+// The Pi's handle for a file packet (dp_Arg1 = fh_Arg1, checked by
+// handle_packet()). The packet itself is not changed: a program may send the
+// same packet again.
+static LONG file_arg1(struct DosPacket *dp)
+{
+	return ((struct MyFile *)dp->dp_Arg1)->arg1;
+}
 
 void create_and_add_volume();
 void remove_volume_if_unused();
@@ -111,6 +146,7 @@ void send_disk_event(UBYTE ie_class);
 struct Library *A314Base;
 
 long socket;
+ULONG next_socket = 0;		// see start_connect()
 
 char *request_buffer = NULL;
 BOOL request_buffer_in_a314_memory;
@@ -344,8 +380,32 @@ static BOOL wait_io_timed(struct IORequest *ior, ULONG secs)
 	}
 }
 
+// Reset our socket from the second request, so neither side keeps it. Older
+// a314.device versions have no AbortIO; a reset makes any version reply a
+// request still pending on the socket (close_socket() in driver_task.c), so
+// ior_pending says whether a314_ior is to be waited for too.
+static void reset_socket(BOOL ior_pending)
+{
+	a314_rst_ior->a314_Request.io_Command = A314_RESET;
+	a314_rst_ior->a314_Request.io_Error = 0;
+	a314_rst_ior->a314_Socket = socket;
+	a314_rst_ior->a314_Buffer = NULL;
+	a314_rst_ior->a314_Length = 0;
+	SendIO((struct IORequest *)a314_rst_ior);
+
+	BOOL rst_back = wait_io_timed((struct IORequest *)a314_rst_ior, RESET_TIMEOUT_SECS);
+	BOOL ior_back = !ior_pending || wait_io_timed((struct IORequest *)a314_ior, RESET_TIMEOUT_SECS);
+	if (!rst_back || !ior_back)
+	{
+		// a314.device itself is not answering. Its requests may still be
+		// replied later, so never reuse them: open_a314() makes new ones.
+		dbg("a314.device did not reply; abandoning its requests\n");
+		a314_open = FALSE;
+	}
+}
+
 // Send a command on our socket and wait for it, at most secs seconds.
-// Returns the a314 io_Error, or LINK_TIMEOUT.
+// Returns the a314 io_Error, or LINK_TIMEOUT (the socket has then been reset).
 LONG a314_cmd_timed(UWORD command, char *buffer, int length, ULONG secs)
 {
 	if (!a314_open)
@@ -362,26 +422,7 @@ LONG a314_cmd_timed(UWORD command, char *buffer, int length, ULONG secs)
 		return a314_ior->a314_Request.io_Error;
 
 	dbg("a314 command $l timed out; resetting the socket\n", (ULONG)command);
-
-	// a314.device has no AbortIO. Resetting the socket from a second request
-	// makes it reply the pending one (close_socket() in driver_task.c).
-	a314_rst_ior->a314_Request.io_Command = A314_RESET;
-	a314_rst_ior->a314_Request.io_Error = 0;
-	a314_rst_ior->a314_Socket = socket;
-	a314_rst_ior->a314_Buffer = NULL;
-	a314_rst_ior->a314_Length = 0;
-	SendIO((struct IORequest *)a314_rst_ior);
-
-	BOOL rst_back = wait_io_timed((struct IORequest *)a314_rst_ior, RESET_TIMEOUT_SECS);
-	BOOL ior_back = wait_io_timed((struct IORequest *)a314_ior, RESET_TIMEOUT_SECS);
-	if (!rst_back || !ior_back)
-	{
-		// a314.device itself is not answering. Its requests may still be
-		// replied later, so never reuse them: open_a314() makes new ones.
-		dbg("a314.device did not reply; abandoning its requests\n");
-		a314_open = FALSE;
-	}
-
+	reset_socket(TRUE);
 	return LINK_TIMEOUT;
 }
 
@@ -511,9 +552,15 @@ void start_connect()
 		return;
 	}
 
-	struct DateStamp ds;
-	DateStamp(&ds);
-	socket = ds.ds_Tick + (conn_gen << 20);	// a new socket for every attempt
+	// A new socket id for every attempt: a closed socket can stay in
+	// a314.device until its PKT_RESET goes out, and would still match.
+	if (next_socket == 0)
+	{
+		struct DateStamp ds;
+		DateStamp(&ds);
+		next_socket = ((ULONG)ds.ds_Minute << 12) + ds.ds_Tick + 1;
+	}
+	socket = next_socket++;
 
 	a314_ior->a314_Request.io_Command = A314_CONNECT;
 	a314_ior->a314_Request.io_Error = 0;
@@ -554,18 +601,8 @@ void poll_connection()
 			WaitIO((struct IORequest *)retry_tr);
 			retry_pending = FALSE;
 
-			a314_rst_ior->a314_Request.io_Command = A314_RESET;
-			a314_rst_ior->a314_Request.io_Error = 0;
-			a314_rst_ior->a314_Socket = socket;
-			a314_rst_ior->a314_Buffer = NULL;
-			a314_rst_ior->a314_Length = 0;
-			SendIO((struct IORequest *)a314_rst_ior);
-
-			BOOL rst_back = wait_io_timed((struct IORequest *)a314_rst_ior, RESET_TIMEOUT_SECS);
-			BOOL ior_back = wait_io_timed((struct IORequest *)a314_ior, RESET_TIMEOUT_SECS);
-			dbg("connect: timeout, reset back $l, connect back $l\n", (ULONG)rst_back, (ULONG)ior_back);
-			if (!rst_back || !ior_back)
-				a314_open = FALSE;	// see a314_cmd_timed()
+			dbg("connect: timeout, resetting the socket\n");
+			reset_socket(TRUE);
 			connecting = FALSE;
 			arm_retry();
 		}
@@ -685,8 +722,15 @@ void startup_fs_handler(struct DosPacket *dp)
 	tmo_tr = (struct timerequest *)MyCreateExtIO(tmo_mp, sizeof(struct timerequest));
 	retry_mp = MyCreatePort(NULL, 0);
 	retry_tr = (struct timerequest *)MyCreateExtIO(retry_mp, sizeof(struct timerequest));
-	OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)tmo_tr, 0);
-	OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)retry_tr, 0);
+	if (tmo_tr == NULL || retry_tr == NULL ||
+	    OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)tmo_tr, 0) != 0 ||
+	    OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)retry_tr, 0) != 0)
+	{
+		// Without the timeouts a request could wait on the Pi for ever, so
+		// never connect: PI0: stays an empty drive.
+		dbg("Unable to open timer.device for the timeouts; PI0: stays empty\n");
+		a314_missing = TRUE;
+	}
 
 	input_mp = MyCreatePort(NULL, 0);
 	input_ior = (struct IOStdReq *)MyCreateExtIO(input_mp, sizeof(struct IOStdReq));
@@ -761,10 +805,16 @@ BOOL write_req_and_wait_for_res(int len)
 		WriteMemA314(request_buffer_address, request_buffer, len);
 	ULONG buf[2] = {request_buffer_address, len};
 
-	if (a314_cmd_timed(A314_WRITE, (char *)&buf[0], 8, REQ_TIMEOUT_SECS) != A314_WRITE_OK ||
-	    a314_cmd_timed(A314_READ, (char *)&buf[1], 4, REQ_TIMEOUT_SECS) != A314_READ_OK ||
-	    a314_ior->a314_Length != 4)
+	LONG err = a314_cmd_timed(A314_WRITE, (char *)&buf[0], 8, REQ_TIMEOUT_SECS);
+	if (err == A314_WRITE_OK)
+		err = a314_cmd_timed(A314_READ, (char *)&buf[1], 4, REQ_TIMEOUT_SECS);
+	if (err != A314_READ_OK || a314_ior->a314_Length != 4)
 	{
+		// A timeout has reset the socket already. Anything else (a reset or
+		// EOS from the Pi, a short read) may leave it open on one side or the
+		// other: reset it, or the old stream would stay behind.
+		if (err != LINK_TIMEOUT && a314_open)
+			reset_socket(FALSE);
 		go_offline();
 		fail_response(ERROR_NO_DISK);
 		return FALSE;
@@ -1073,7 +1123,7 @@ void action_examine_next(struct DosPacket *dp)
 
 void action_examine_fh(struct DosPacket *dp)
 {
-	ULONG arg1 = dp->dp_Arg1;
+	ULONG arg1 = file_arg1(dp);
 	struct FileInfoBlock *fib = (struct FileInfoBlock *)BADDR(dp->dp_Arg2);
 
 	dbg("ACTION_EXAMINE_FH\n");
@@ -1176,6 +1226,8 @@ void action_findxxx(struct DosPacket *dp)
 		}
 		mf->arg1 = res->arg1;
 		mf->gen = conn_gen;
+		mf->next = my_files;
+		my_files = mf;
 
 		fh->fh_Arg1 = (LONG)mf;
 		fh->fh_Type = mp;
@@ -1190,7 +1242,7 @@ void action_findxxx(struct DosPacket *dp)
 
 void action_read(struct DosPacket *dp)
 {
-	ULONG arg1 = dp->dp_Arg1;
+	ULONG arg1 = file_arg1(dp);
 	UBYTE *dst = (UBYTE *)dp->dp_Arg2;
 	int length = dp->dp_Arg3;
 
@@ -1251,7 +1303,7 @@ void action_read(struct DosPacket *dp)
 
 void action_write(struct DosPacket *dp)
 {
-	ULONG arg1 = dp->dp_Arg1;
+	ULONG arg1 = file_arg1(dp);
 	UBYTE *src = (UBYTE *)dp->dp_Arg2;
 	int length = dp->dp_Arg3;
 
@@ -1305,7 +1357,7 @@ void action_write(struct DosPacket *dp)
 
 void action_seek(struct DosPacket *dp)
 {
-	ULONG arg1 = dp->dp_Arg1;
+	ULONG arg1 = file_arg1(dp);
 	LONG new_pos = dp->dp_Arg2;
 	LONG mode = dp->dp_Arg3;
 
@@ -1341,7 +1393,7 @@ void action_seek(struct DosPacket *dp)
 
 void action_end(struct DosPacket *dp)
 {
-	ULONG arg1 = dp->dp_Arg1;
+	ULONG arg1 = file_arg1(dp);
 
 	dbg("ACTION_END\n");
 	dbg("  arg1 = $l\n", arg1);
@@ -1836,17 +1888,21 @@ void handle_packet(struct DosPacket *dp)
 
 	if (is_file_action(type))
 	{
-		struct MyFile *mf = (struct MyFile *)dp->dp_Arg1;
+		struct MyFile *mf = find_my_file(dp->dp_Arg1);
 		if (mf == NULL)
 		{
-			reply_error(dp, fail_res1, ERROR_INVALID_LOCK);
+			// Not one of ours (any more): closing it again is harmless.
+			if (type == ACTION_END)
+				reply_error(dp, DOSTRUE, 0);
+			else
+				reply_error(dp, fail_res1, ERROR_INVALID_LOCK);
 			return;
 		}
 
 		BOOL current = connected && mf->gen == conn_gen;
 		if (type == ACTION_END && !current)
 		{
-			FreeMem(mf, sizeof(struct MyFile));
+			free_my_file(mf);
 			reply_error(dp, DOSTRUE, 0);
 			return;
 		}
@@ -1861,10 +1917,9 @@ void handle_packet(struct DosPacket *dp)
 			return;
 		}
 
-		dp->dp_Arg1 = mf->arg1;
 		dispatch_action(dp);
 		if (type == ACTION_END)
-			FreeMem(mf, sizeof(struct MyFile));
+			free_my_file(mf);
 		return;
 	}
 
