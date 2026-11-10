@@ -42,23 +42,33 @@ MSG_DATA                = 11
 MSG_EOS                 = 12
 MSG_RESET               = 13
 
-def wait_for_msg():
-    header = b''
-    while len(header) < 9:
-        data = drv.recv(9 - len(header))
-        if not data:
-            logger.error('Connection to a314d was closed, terminating.')
-            exit(-1)
-        header += data
-    (plen, stream_id, ptype) = struct.unpack('=IIB', header)
-    payload = b''
-    while len(payload) < plen:
-        data = drv.recv(plen - len(payload))
-        if not data:
-            logger.error('Connection to a314d was closed, terminating.')
-            exit(-1)
-        payload += data
+# Bytes received from a314d that do not make a whole message yet.
+rx_buf = bytearray()
+
+def recv_more():
+    data = drv.recv(65536)
+    if not data:
+        logger.error('Connection to a314d was closed, terminating.')
+        exit(-1)
+    rx_buf.extend(data)
+
+def take_msg():
+    # The next whole message from rx_buf, or None.
+    if len(rx_buf) < 9:
+        return None
+    (plen, stream_id, ptype) = struct.unpack('=IIB', rx_buf[:9])
+    if len(rx_buf) < 9 + plen:
+        return None
+    payload = bytes(rx_buf[9:9 + plen])
+    del rx_buf[:9 + plen]
     return (stream_id, ptype, payload)
+
+def wait_for_msg():
+    while True:
+        msg = take_msg()
+        if msg is not None:
+            return msg
+        recv_more()
 
 def send_register_req(name):
     m = struct.pack('=IIB', len(name), 0, MSG_REGISTER_REQ) + name
@@ -110,8 +120,15 @@ def check_stream():
     # its buffers, so a response written now could overwrite its next request.
     # Drop the request instead if the stream was reset or replaced.
     global stale_mem_responses
-    while select.select([drv], [], [], 0)[0]:
-        stream_id, ptype, payload = wait_for_msg()
+    while True:
+        msg = take_msg()
+        if msg is None:
+            # Only whole messages count: a part of one stays in rx_buf.
+            if not select.select([drv], [], [], 0)[0]:
+                return
+            recv_more()
+            continue
+        stream_id, ptype, payload = msg
         if ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
             if stale_mem_responses > 0:
                 stale_mem_responses -= 1
@@ -251,6 +268,8 @@ ST_PIPEFILE         = -5
 
 INFO_BLOCK_SIZE     = 512
 
+REQ_RES_BUF_SIZE    = 256   # the request/response buffer in a314fs.c
+
 current_stream_id = 0
 
 class ObjectLock(object):
@@ -263,6 +282,13 @@ class ObjectLock(object):
 locks = {}
 
 next_key = 1
+
+def bcpl_string(s, maxlen):
+    # A length byte, then at most maxlen bytes: a FileInfoBlock holds 107 for
+    # a name and 79 for a comment, and a response must fit the Amiga's
+    # 256-byte request/response buffer. The length is counted after encoding.
+    b = s.encode('latin-1', 'ignore')[:maxlen]
+    return bytes([len(b)]) + b
 
 def get_key():
     global next_key
@@ -430,8 +456,8 @@ def process_examine_object(key):
         ol.entry_it = os.scandir(path)
 
     size = min(size, 2 ** 31 - 1)
-    fn = (chr(len(fn)) + fn).encode('latin-1', 'ignore')
-    comment = (chr(len(comment)) + comment).encode('latin-1', 'ignore')
+    fn = bcpl_string(fn, 107)
+    comment = bcpl_string(comment, 79)
     return struct.pack('>HHHhIIIII', 1, 0, 666, type_, size, protection, days, mins, ticks) + fn + comment
 
 def process_examine_next(key, disk_key):
@@ -469,8 +495,8 @@ def process_examine_next(key, disk_key):
         type_ = ST_USERDIR
 
     size = min(size, 2 ** 31 - 1)
-    fn = (chr(len(fn)) + fn).encode('latin-1', 'ignore')
-    comment = (chr(len(comment)) + comment).encode('latin-1', 'ignore')
+    fn = bcpl_string(fn, 107)
+    comment = bcpl_string(comment, 79)
     return struct.pack('>HHHhIIIII', 1, 0, disk_key, type_, size, protection, days, mins, ticks) + fn + comment
 
 def process_examine_fh(arg1):
@@ -489,8 +515,8 @@ def process_examine_fh(arg1):
         type_ = ST_USERDIR
 
     size = min(size, 2 ** 31 - 1)
-    fn = (chr(len(fn)) + fn).encode('latin-1', 'ignore')
-    comment = (chr(len(comment)) + comment).encode('latin-1', 'ignore')
+    fn = bcpl_string(fn, 107)
+    comment = bcpl_string(comment, 79)
     return struct.pack('>HHHhIIIII', 1, 0, 666, type_, size, protection, days, mins, ticks) + fn + comment
 
 
@@ -904,6 +930,9 @@ while not done:
                 # error instead of exiting (the Amiga would lose PI0:).
                 logger.exception('Request failed; answering with an error')
                 res = struct.pack('>HH', 0, ERROR_INVALID_LOCK)
+            if len(res) + 2 > REQ_RES_BUF_SIZE:
+                logger.error('Response of %d bytes does not fit the Amiga buffer', len(res))
+                res = struct.pack('>HH', 0, ERROR_OBJECT_TOO_LARGE)
             write_mem(address + 2, res)
         except StreamReset:
             logger.warning('Stream reset by the Amiga during a request; request dropped')

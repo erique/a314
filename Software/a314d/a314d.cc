@@ -1679,8 +1679,38 @@ static void remove_channel_if_not_associated_and_empty_pq(int channel_id)
     }
 }
 
+// DATA or EOS on a channel a314d does not know: the Amiga holds a stream from
+// before an a314d restart. Answer with a RESET, so its client is told instead
+// of waiting for ever. The channel goes away once the RESET is sent.
+static void reset_unknown_channel(int channel_id, int ptype)
+{
+    for (auto &ch : channels)
+    {
+        if (ch.channel_id == channel_id)
+            return;
+    }
+
+    logger_warning("Received a %s packet on unknown channel %d -- resetting it\n",
+                   ptype == PKT_DATA ? "DATA" : "EOS", channel_id);
+
+    channels.emplace_back();
+
+    auto &ch = channels.back();
+
+    ch.channel_id = channel_id;
+    ch.association = nullptr;
+    ch.stream_id = 0;
+    ch.got_eos_from_ami = false;
+    ch.got_eos_from_client = false;
+
+    create_and_enqueue_packet(&ch, PKT_RESET, nullptr, 0);
+}
+
 static void handle_received_pkt(int ptype, int channel_id, uint8_t *data, int plen)
 {
+    if (ptype == PKT_DATA || ptype == PKT_EOS)
+        reset_unknown_channel(channel_id, ptype);
+
     if (ptype == PKT_CONNECT)
         handle_pkt_connect(channel_id, data, plen);
     else if (ptype == PKT_DATA)
@@ -2074,8 +2104,18 @@ static void handle_a314_irq()
 // last handle_a314_irq() may be from before an Amiga reset. Read them again,
 // and publish nothing while the Amiga driver is not set up (RESET still set);
 // if channels are open then, the Amiga was reset, so close them first.
+// Nothing is published while the FPGA is busy either; handle_a314_irq() does
+// it later.
 static bool com_area_ready()
 {
+    // Not while the FPGA is busy (CE0) or not answering: handle_a314_irq()
+    // backs off then, and publishes once it is back.
+    gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
+    if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state) || gpio_state.bits == 0)
+        return false;
+    if (spi_proto_ver != 2)
+        return false;
+
     uint8_t irq = spi_read_sint();
     if (irq & REG_IRQ_RESET)
     {
