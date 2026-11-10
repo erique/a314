@@ -252,6 +252,12 @@ static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_i
 		return;
 	}
 
+	// Until its CONNECT is answered a stream has no data: a314d sends the
+	// CONNECT_RESPONSE first. DATA or EOS now is left over from a channel
+	// with the same id before an Amiga reset, so it is not for this socket.
+	if (s->pending_connect != NULL && type != PKT_CONNECT_RESPONSE)
+		return;
+
 	if (type == PKT_CONNECT_RESPONSE)
 	{
 		handle_pkt_connect_response(dev, offset, length, s);
@@ -768,11 +774,13 @@ void task_main()
 
 #elif defined(MODEL_TF)
 
-// A Pi that has not taken anything from a2r for this many frames is gone
-// (a314d stopped or crashed): every socket is closed, so clients waiting to
-// send or connect get an error. About 5 s at 50 Hz. This only sees a Pi that
-// stops reading: a client blocked on a READ with a2r empty needs its own
-// timeout (a314fs has one).
+// Dead Pi. a314d clears the Pi interrupt (SINT RPI) whenever it looks at the
+// com area. While sockets are open the driver raises it at least every
+// KICK_PI_FRAMES. If it then stays set for DEAD_PI_FRAMES, a314d is gone
+// (stopped, crashed, or the Pi rebooted), even when a2r is empty: it may have
+// taken a CONNECT or the last DATA before it died. Every socket is then closed,
+// so no request waits on it for ever. About 1 s and 5 s at 50 Hz.
+#define KICK_PI_FRAMES 50
 #define DEAD_PI_FRAMES 250
 
 // Requests marked by AbortIO() while pending on a socket: reply them with
@@ -814,10 +822,10 @@ static void handle_aborts(struct A314Device *dev)
 	}
 }
 
-// The Pi has stopped reading a2r: close every socket, so the requests pending
-// on them are replied. Each one is reset, and its stream id stays in use until
-// the PKT_RESET goes out (when the Pi reads a2r again), so a314d never sees the
-// id reused for a new CONNECT while its old channel is still open.
+// a314d is gone: close every socket, so the requests pending on them are
+// replied. Each one is reset, and its stream id stays in use until the
+// PKT_RESET goes out (when a314d reads a2r again), so a314d never sees the id
+// reused for a new CONNECT while its old channel is still open.
 static void close_all_sockets(struct A314Device *dev)
 {
 	struct Node *node = dev->active_sockets.lh_Head;
@@ -836,9 +844,9 @@ void task_main()
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
 	struct ComAreaPtrs *cap = CAP_PTR(dev);
 
-	BOOL a2r_stalled = FALSE;
-	UBYTE stall_head = 0;
-	ULONG stall_since = 0;
+	BOOL irq_waiting = FALSE;	// the Pi interrupt is set and a314d has not cleared it
+	ULONG irq_since = 0;
+	ULONG last_kick = 0;
 
 	while (TRUE)
 	{
@@ -878,20 +886,28 @@ void task_main()
 			set_pi_irq(dev);
 		}
 
-		// Dead Pi: a2r has data and its head has not moved.
-		if (cap->a2r_head == cap->a2r_tail)
-			a2r_stalled = FALSE;
-		else if (!a2r_stalled || cap->a2r_head != stall_head)
+		// Dead Pi (see DEAD_PI_FRAMES).
+		if (dev->active_sockets.lh_TailPred == (struct Node *)&dev->active_sockets)
+			irq_waiting = FALSE;
+		else if (!check_pi_irq(dev))
 		{
-			a2r_stalled = TRUE;
-			stall_head = cap->a2r_head;
-			stall_since = dev->poll.ticks;
+			irq_waiting = FALSE;
+			if (dev->poll.ticks - last_kick >= KICK_PI_FRAMES)
+			{
+				last_kick = dev->poll.ticks;
+				set_pi_irq(dev);
+			}
 		}
-		else if (dev->poll.ticks - stall_since > DEAD_PI_FRAMES)
+		else if (!irq_waiting)
 		{
-			dbg_warning("The Pi has not taken data for 5 s: closing all sockets");
+			irq_waiting = TRUE;
+			irq_since = dev->poll.ticks;
+		}
+		else if (dev->poll.ticks - irq_since > DEAD_PI_FRAMES)
+		{
+			dbg_warning("a314d has not answered for 5 s: closing all sockets");
 			close_all_sockets(dev);
-			a2r_stalled = FALSE;
+			irq_waiting = FALSE;
 		}
 	}
 

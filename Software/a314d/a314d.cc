@@ -2069,6 +2069,27 @@ static void handle_a314_irq()
 
     write_channel_status();
 }
+
+// Before a client event publishes packets: the com area pointers kept from the
+// last handle_a314_irq() may be from before an Amiga reset. Read them again,
+// and publish nothing while the Amiga driver is not set up (RESET still set);
+// if channels are open then, the Amiga was reset, so close them first.
+static bool com_area_ready()
+{
+    uint8_t irq = spi_read_sint();
+    if (irq & REG_IRQ_RESET)
+    {
+        if (!channels.empty())
+        {
+            logger_info("Amiga was reset while logical channels are open -- closing channels\n");
+            close_all_logical_channels();
+        }
+        return false;
+    }
+
+    read_channel_status();
+    return true;
+}
 #endif
 
 static void handle_client_connection_event(ClientConnection *cc, struct epoll_event *ev)
@@ -2322,8 +2343,13 @@ static void main_loop()
                 ClientConnection *cc = &(*it);
                 handle_client_connection_event(cc, &ev);
 
-                flush_send_queue();
-                write_channel_status();
+#if defined(MODEL_TF)
+                if (com_area_ready())
+#endif
+                {
+                    flush_send_queue();
+                    write_channel_status();
+                }
             }
         }
 

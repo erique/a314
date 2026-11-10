@@ -12,6 +12,9 @@ extern void read_pi_cap(struct A314Device *dev);
 extern void write_amiga_cap(struct A314Device *dev);
 
 extern void set_pi_irq(struct A314Device *dev);
+#if defined(MODEL_TF)
+extern int check_pi_irq(struct A314Device *dev);
+#endif
 extern void clear_amiga_irq(struct A314Device *dev);
 
 extern ULONG a314base_translate_address(__reg("a6") struct A314Device *dev, __reg("a0") void *address);

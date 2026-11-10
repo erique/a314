@@ -104,6 +104,23 @@ def wait_for_mem_res(expected):
             stale_mem_responses += 1
             raise StreamReset()
 
+def check_stream():
+    # Take what a314d has sent meanwhile, without waiting. A slow request can
+    # outlast the Amiga's timeout: the Amiga then resets the stream and reuses
+    # its buffers, so a response written now could overwrite its next request.
+    # Drop the request instead if the stream was reset or replaced.
+    global stale_mem_responses
+    while select.select([drv], [], [], 0)[0]:
+        stream_id, ptype, payload = wait_for_msg()
+        if ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
+            if stale_mem_responses > 0:
+                stale_mem_responses -= 1
+            continue
+        pending_msgs.append((stream_id, ptype, payload))
+        if (ptype == MSG_RESET and stream_id == current_stream_id) or \
+           (ptype == MSG_CONNECT and payload == b'a314fs'):
+            raise StreamReset()
+
 def read_mem(address, length):
     send_read_mem_req(address, length)
     return wait_for_mem_res(MSG_READ_MEM_RES)
@@ -113,6 +130,7 @@ def send_write_mem_req(address, data):
     drv.sendall(m)
 
 def write_mem(address, data):
+    check_stream()
     send_write_mem_req(address, data)
     wait_for_mem_res(MSG_WRITE_MEM_RES)
 
