@@ -78,16 +78,30 @@ pending_msgs = collections.deque()
 def next_msg():
     return pending_msgs.popleft() if pending_msgs else wait_for_msg()
 
+# Memory requests given up on after a reset. a314d answers every memory request,
+# in order, and the responses carry no tag: the next this many responses belong
+# to those requests and must not be taken as the answer to a later one.
+stale_mem_responses = 0
+
 def wait_for_mem_res(expected):
     # An Amiga reset (MSG_RESET, then a new MSG_CONNECT) can arrive before the
     # memory response. Keep those for the main loop instead of exiting, and
-    # give up on the request if our stream was reset.
+    # give up on the request if our stream was reset or replaced.
+    global stale_mem_responses
     while True:
         stream_id, ptype, payload = wait_for_msg()
-        if ptype == expected:
-            return payload
+        if ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
+            if stale_mem_responses > 0:
+                stale_mem_responses -= 1
+            elif ptype == expected:
+                return payload
+            else:
+                logger.error('Expected memory response %s but got %s; ignored', expected, ptype)
+            continue
         pending_msgs.append((stream_id, ptype, payload))
-        if ptype == MSG_RESET and stream_id == current_stream_id:
+        if (ptype == MSG_RESET and stream_id == current_stream_id) or \
+           (ptype == MSG_CONNECT and payload == b'a314fs'):
+            stale_mem_responses += 1
             raise StreamReset()
 
 def read_mem(address, length):
@@ -480,6 +494,18 @@ class OpenFileHandle(object):
         self.f = f
         self.p = p
 
+def drop_stream_state():
+    # The Amiga handler forgets its locks and file handles when its stream ends
+    # (reset, EOS or a new CONNECT), so free them here too. Otherwise every link
+    # drop leaks the open files.
+    for ofh in open_file_handles.values():
+        try:
+            ofh.f.close()
+        except Exception:
+            pass
+    open_file_handles.clear()
+    locks.clear()
+
 def process_findxxx(mode, key, name):
     if mode == ACTION_FINDINPUT:
         logger.debug('ACTION_FINDINPUT, key: %s, name: %s', key, name)
@@ -839,6 +865,7 @@ while not done:
         if payload == b'a314fs':
             if current_stream_id is not None:
                 send_reset(current_stream_id)
+            drop_stream_state()
             current_stream_id = stream_id
             send_connect_response(stream_id, 0)
         else:
@@ -852,6 +879,8 @@ while not done:
             req = read_mem(address + 2, length - 2)
             try:
                 res = process_request(req)
+            except StreamReset:
+                raise   # from read_mem()/write_mem() in ACTION_READ/WRITE
             except Exception:
                 # e.g. a lock or file key from before a reset: answer with an
                 # error instead of exiting (the Amiga would lose PI0:).
@@ -863,13 +892,18 @@ while not done:
             continue
         send_data(stream_id, struct.pack('>I', len(res) + 2))
     elif ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
+        # The answer to a request given up on after a reset.
+        if stale_mem_responses > 0:
+            stale_mem_responses -= 1
         logger.debug('Ignoring a late memory response (request dropped after a reset)')
     elif ptype == MSG_EOS:
         if stream_id == current_stream_id:
             logger.debug('Got EOS, stream closed')
             send_eos(stream_id)
+            drop_stream_state()
             current_stream_id = None
     elif ptype == MSG_RESET:
         if stream_id == current_stream_id:
             logger.debug('Got RESET, stream closed')
+            drop_stream_state()
             current_stream_id = None
