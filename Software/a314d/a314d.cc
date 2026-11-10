@@ -1461,21 +1461,31 @@ static void create_and_enqueue_packet(LogicalChannel *ch, uint8_t type, uint8_t 
         memcpy(&pb.data[0], data, length);
 }
 
-static void close_all_logical_channels();
+static void handle_pkt_reset(int channel_id);
+static void remove_channel_if_not_associated_and_empty_pq(int channel_id);
 
 static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
 {
+    bool in_use = false;
     for (auto &ch : channels)
     {
         if (ch.channel_id == channel_id)
         {
-            // The Amiga was reset without a314d seeing it (e.g. while backing
-            // off for CE0), so the old channels belong to the previous boot.
-            // Close them all, as for a detected reset, and accept the CONNECT.
-            logger_warning("Received a CONNECT packet on a channel that was believed to be previously allocated -- missed Amiga reset, closing all channels\n");
-            close_all_logical_channels();
+            in_use = true;
             break;
         }
+    }
+
+    if (in_use)
+    {
+        // The Amiga reuses a stream id only after it has sent a RESET for it,
+        // so this channel is left over from an Amiga reset that a314d did not
+        // see (e.g. while backing off for CE0). Reset just this channel, as
+        // for a PKT_RESET, and accept the CONNECT: other channels may already
+        // be in use by the new boot.
+        logger_warning("Received a CONNECT packet on a channel that was believed to be previously allocated -- missed Amiga reset? Resetting that channel\n");
+        handle_pkt_reset(channel_id);
+        remove_channel_if_not_associated_and_empty_pq(channel_id);
     }
 
     channels.emplace_back();
@@ -2032,9 +2042,10 @@ static void handle_a314_irq()
             if (sleep_counter > 1000)
                 usleep(1);                  // basic yield to not slam the poor PI
 
-            // Fallback poll: look at the com area every 1000
-            // checks (about once a second when idle) even without an
-            // interrupt, so a lost one can't leave both sides waiting.
+            // Fallback poll: look at the com area every 1000 checks (about
+            // every 0.1 s just after activity, about once a second after the
+            // cooldown) even without an interrupt, so a lost one can't leave
+            // both sides waiting.
             if ((sleep_counter % 1000) != 0)
                 return;
             idle_poll = true;
