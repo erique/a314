@@ -239,6 +239,12 @@ static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_i
 
 	struct Socket *s = find_socket_by_stream_id(dev, stream_id);
 
+	// A socket whose CONNECT is still in the send queue has a stream id the Pi
+	// has not seen: any packet for it (RESET, CONNECT_RESPONSE, DATA) is left
+	// over from a channel with the same id before an Amiga reset.
+	if (s != NULL && s->pending_connect != NULL && (s->flags & SOCKET_IN_SEND_QUEUE))
+		return;
+
 	if (s != NULL && type == PKT_RESET)
 	{
 		close_socket(dev, s, FALSE);
@@ -312,6 +318,9 @@ static void handle_room_in_a2r(struct A314Device *dev)
 			struct A314_IORequest *ior = s->pending_connect;
 			int len = ior->a314_Length;
 			write_to_a2r(dev, PKT_CONNECT, s->stream_id, (UBYTE)len, ior->a314_Buffer);
+#if defined(MODEL_TF)
+			s->connect_sent = dev->poll.ticks;
+#endif
 		}
 		else if (s->pending_write != NULL)
 		{
@@ -371,6 +380,13 @@ static void handle_app_connect(struct A314Device *dev, struct A314_IORequest *io
 	else
 	{
 		s = create_socket(dev, ior->a314_Request.io_Message.mn_ReplyPort->mp_SigTask, ior->a314_Socket);
+		if (s == NULL)
+		{
+			// No memory, or all stream ids in use.
+			ior->a314_Request.io_Error = A314_CONNECT_RESET;
+			ReplyMsg((struct Message *)ior);
+			return;
+		}
 
 		s->pending_connect = ior;
 		s->flags = 0;
@@ -379,6 +395,9 @@ static void handle_app_connect(struct A314Device *dev, struct A314_IORequest *io
 		if (dev->send_queue_head == NULL && room_in_a2r(CAP_PTR(dev), len))
 		{
 			write_to_a2r(dev, PKT_CONNECT, s->stream_id, (UBYTE)len, ior->a314_Buffer);
+#if defined(MODEL_TF)
+			s->connect_sent = dev->poll.ticks;
+#endif
 		}
 		else
 		{
@@ -775,13 +794,39 @@ void task_main()
 #elif defined(MODEL_TF)
 
 // Dead Pi. a314d clears the Pi interrupt (SINT RPI) whenever it looks at the
-// com area. While sockets are open the driver raises it at least every
-// KICK_PI_FRAMES. If it then stays set for DEAD_PI_FRAMES, a314d is gone
+// com area, and moves a2r_head or r2a_tail when it takes or sends packets.
+// While sockets are open the driver raises RPI at least every KICK_PI_FRAMES.
+// RPI is sampled at the start of each pass, before that pass raises it again.
+// If for DEAD_PI_FRAMES it is still set and neither ring moved, a314d is gone
 // (stopped, crashed, or the Pi rebooted), even when a2r is empty: it may have
-// taken a CONNECT or the last DATA before it died. Every socket is then closed,
-// so no request waits on it for ever. About 1 s and 5 s at 50 Hz.
+// taken a CONNECT or the last DATA before it died. Every socket is then
+// closed, so no request waits on it for ever. About 1 s and 5 s at 50 Hz.
 #define KICK_PI_FRAMES 50
 #define DEAD_PI_FRAMES 250
+
+// A CONNECT that a314d took but that no service answers: a314d itself is
+// alive, so the check above can't see it. After this many frames (about 20 s
+// at 50 Hz, room for an on-demand service to start) the socket is reset and
+// the client gets A314_CONNECT_RESET.
+#define CONNECT_TIMEOUT_FRAMES 1000
+
+static void handle_connect_timeouts(struct A314Device *dev)
+{
+	struct Node *node = dev->active_sockets.lh_Head;
+	while (node->ln_Succ != NULL)
+	{
+		struct Socket *s = (struct Socket *)node;
+		node = node->ln_Succ;
+
+		if (!(s->flags & SOCKET_CLOSED) && s->pending_connect != NULL &&
+		    !(s->flags & SOCKET_IN_SEND_QUEUE) &&
+		    dev->poll.ticks - s->connect_sent > CONNECT_TIMEOUT_FRAMES)
+		{
+			dbg_warning("CONNECT not answered: resetting its socket");
+			close_socket(dev, s, TRUE);
+		}
+	}
+}
 
 // Requests marked by AbortIO() while pending on a socket: reply them with
 // IOERR_ABORTED and reset the socket, as the stream state is no longer known.
@@ -796,6 +841,9 @@ static void handle_aborts(struct A314Device *dev)
 
 		if (s->flags & SOCKET_CLOSED)
 			continue;
+
+		// Decided before pending_connect is cleared (see close_socket()).
+		BOOL connect_unsent = s->pending_connect != NULL && (s->flags & SOCKET_IN_SEND_QUEUE);
 
 		BOOL aborted = FALSE;
 		if (reply_if_aborted(s->pending_connect))
@@ -817,7 +865,7 @@ static void handle_aborts(struct A314Device *dev)
 		if (aborted)
 		{
 			dbg_info("AbortIO: request aborted, resetting its socket");
-			close_socket(dev, s, TRUE);
+			close_socket(dev, s, !connect_unsent);
 		}
 	}
 }
@@ -844,9 +892,11 @@ void task_main()
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
 	struct ComAreaPtrs *cap = CAP_PTR(dev);
 
-	BOOL irq_waiting = FALSE;	// the Pi interrupt is set and a314d has not cleared it
+	BOOL irq_waiting = FALSE;	// RPI set, no ring progress, since irq_since
 	ULONG irq_since = 0;
 	ULONG last_kick = 0;
+	UBYTE seen_a2r_head = cap->a2r_head;
+	UBYTE seen_r2a_tail = cap->r2a_tail;
 
 	while (TRUE)
 	{
@@ -858,6 +908,12 @@ void task_main()
 		ULONG signal = Wait(SIGF_MSGPORT | SIGF_INT);
 
 		dbg_trace("Returned from Wait() with signal=$l", signal);
+
+		// For the dead-Pi check: sampled before this pass raises RPI again.
+		BOOL pi_irq_set = check_pi_irq(dev);
+		BOOL pi_moved = cap->a2r_head != seen_a2r_head || cap->r2a_tail != seen_r2a_tail;
+		seen_a2r_head = cap->a2r_head;
+		seen_r2a_tail = cap->r2a_tail;
 
 		UBYTE prev_a2r_tail = cap->a2r_tail;
 		UBYTE prev_r2a_head = cap->r2a_head;
@@ -875,6 +931,7 @@ void task_main()
 		// After the packets, so a request that completed in the meantime is
 		// replied normally instead of aborted.
 		handle_aborts(dev);
+		handle_connect_timeouts(dev);
 
 		// Also while a2r still holds data for the Pi: a314d only looks at the
 		// com area after an interrupt, so a lost one (or an a314d that started
@@ -887,12 +944,11 @@ void task_main()
 		}
 
 		// Dead Pi (see DEAD_PI_FRAMES).
-		if (dev->active_sockets.lh_TailPred == (struct Node *)&dev->active_sockets)
-			irq_waiting = FALSE;
-		else if (!check_pi_irq(dev))
+		BOOL no_sockets = dev->active_sockets.lh_TailPred == (struct Node *)&dev->active_sockets;
+		if (no_sockets || pi_moved || !pi_irq_set)
 		{
 			irq_waiting = FALSE;
-			if (dev->poll.ticks - last_kick >= KICK_PI_FRAMES)
+			if (!no_sockets && !pi_irq_set && dev->poll.ticks - last_kick >= KICK_PI_FRAMES)
 			{
 				last_kick = dev->poll.ticks;
 				set_pi_irq(dev);
