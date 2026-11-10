@@ -56,10 +56,9 @@ static UBYTE allocate_stream_id(struct A314Device *dev)
 		}
 	}
 
-	// BUG: What to do here? This is quite bad.
-	// Need to propagate this error condition to the calling application.
-	dbg_error("There were no free stream ids, and there is no code to handle this case");
-	return dev->next_stream_id;
+	// All 128 ids are in use. Stream ids are odd, so 0 means none.
+	dbg_error("There were no free stream ids");
+	return 0;
 }
 
 static void free_stream_id(struct A314Device *dev, UBYTE stream_id)
@@ -73,10 +72,18 @@ struct Socket *create_socket(struct A314Device *dev, struct Task *task, ULONG id
 {
 	dbg_trace("Enter: create_socket, socket_id=$l", id);
 
+	// NULL if there is no memory or no free stream id.
 	struct Socket *s = (struct Socket *)AllocMem(sizeof(struct Socket), MEMF_CLEAR);
+	if (s == NULL)
+		return NULL;
 	s->sig_task = task;
 	s->socket = id;
 	s->stream_id = allocate_stream_id(dev);
+	if (s->stream_id == 0)
+	{
+		FreeMem(s, sizeof(struct Socket));
+		return NULL;
+	}
 	AddTail(&dev->active_sockets, (struct Node *)s);
 	return s;
 }

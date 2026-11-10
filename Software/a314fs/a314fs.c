@@ -150,8 +150,14 @@ struct Library *A314Base;
 long socket;
 ULONG next_socket = 0;		// see start_connect()
 
-char *request_buffer = NULL;
-BOOL request_buffer_in_a314_memory;
+// Requests are built and responses read through request_buffer. It points
+// at a314_request_buffer (A314 memory, read and written by the Pi) when that
+// exists, and otherwise, and for every response made up locally, at
+// local_buffer: a late write by the Pi must never land on those.
+char local_buffer[REQ_RES_BUF_SIZE];
+char *a314_request_buffer = NULL;
+char *request_buffer = local_buffer;
+BOOL request_buffer_in_a314_memory = FALSE;
 
 // These are allocated in A314 memory.
 ULONG request_buffer_address;
@@ -382,6 +388,8 @@ static BOOL wait_io_timed(struct IORequest *ior, ULONG secs)
 	}
 }
 
+static void abandon_requests(BOOL ior_out, BOOL rst_out);
+
 // Reset our socket from the second request, so neither side keeps it. Older
 // a314.device versions have no AbortIO; a reset makes any version reply a
 // request still pending on the socket (close_socket() in driver_task.c), so
@@ -402,7 +410,7 @@ static void reset_socket(BOOL ior_pending)
 		// a314.device itself is not answering. Its requests may still be
 		// replied later, so never reuse them: open_a314() makes new ones.
 		dbg("a314.device did not reply; abandoning its requests\n");
-		a314_open = FALSE;
+		abandon_requests(ior_pending && !ior_back, !rst_back);
 	}
 }
 
@@ -428,19 +436,94 @@ LONG a314_cmd_timed(UWORD command, char *buffer, int length, ULONG secs)
 	return LINK_TIMEOUT;
 }
 
-// Open a314.device with fresh ports and requests. After a314.device has
-// stopped answering, a few reopens are allowed; then PI0: stays empty
-// (every reopen costs two signals that can't be freed while the old
-// requests may still be replied).
-#define MAX_A314_OPENS 4
-int a314_opens = 0;
-
 static void MyDeletePort(struct MsgPort *port)
 {
 	if (port == NULL)
 		return;
 	FreeSignal(port->mp_SigBit);
 	FreeMem(port, sizeof(struct MsgPort));
+}
+
+// Free the current request set. Nothing of it may be outstanding.
+static void free_requests(BOOL close_device)
+{
+	if (close_device)
+		CloseDevice((struct IORequest *)a314_ior);
+	if (a314_ior != NULL)
+		FreeMem(a314_ior, sizeof(struct A314_IORequest));
+	if (a314_rst_ior != NULL)
+		FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
+	if (a314_msg != NULL)
+		FreeMem(a314_msg, 2 * sizeof(ULONG));
+	MyDeletePort(a314_mp);
+	MyDeletePort(a314_rst_mp);
+	a314_ior = a314_rst_ior = NULL;
+	a314_msg = NULL;
+	a314_mp = a314_rst_mp = NULL;
+}
+
+// Request sets given up after a314.device did not answer a RESET in time. They
+// may still be replied, so they are kept (with their buffer and device open)
+// and freed by reap_abandoned() once every outstanding request is back.
+#define MAX_ABANDONED 4
+struct AbandonedSet
+{
+	struct MsgPort *mp, *rst_mp;
+	struct A314_IORequest *ior, *rst_ior;
+	ULONG *msg;
+	BOOL ior_out, rst_out;		// still outstanding (not yet WaitIO()ed)
+};
+struct AbandonedSet abandoned[MAX_ABANDONED];
+int n_abandoned = 0;
+
+static void abandon_requests(BOOL ior_out, BOOL rst_out)
+{
+	struct AbandonedSet *a = &abandoned[n_abandoned++];	// open_a314() keeps room
+	a->mp = a314_mp;
+	a->rst_mp = a314_rst_mp;
+	a->ior = a314_ior;
+	a->rst_ior = a314_rst_ior;
+	a->msg = a314_msg;
+	a->ior_out = ior_out;
+	a->rst_out = rst_out;
+
+	a314_ior = a314_rst_ior = NULL;
+	a314_msg = NULL;
+	a314_mp = a314_rst_mp = NULL;
+	a314_open = FALSE;
+}
+
+// Called on every wake-up of the main loop.
+static void reap_abandoned()
+{
+	for (int i = 0; i < n_abandoned; )
+	{
+		struct AbandonedSet *a = &abandoned[i];
+		if (a->ior_out && CheckIO((struct IORequest *)a->ior))
+		{
+			WaitIO((struct IORequest *)a->ior);
+			a->ior_out = FALSE;
+		}
+		if (a->rst_out && CheckIO((struct IORequest *)a->rst_ior))
+		{
+			WaitIO((struct IORequest *)a->rst_ior);
+			a->rst_out = FALSE;
+		}
+		if (a->ior_out || a->rst_out)
+		{
+			i++;
+			continue;
+		}
+
+		dbg("Abandoned a314 requests are back; freeing them\n");
+		CloseDevice((struct IORequest *)a->ior);
+		FreeMem(a->ior, sizeof(struct A314_IORequest));
+		FreeMem(a->rst_ior, sizeof(struct A314_IORequest));
+		FreeMem(a->msg, 2 * sizeof(ULONG));
+		MyDeletePort(a->mp);
+		MyDeletePort(a->rst_mp);
+		*a = abandoned[--n_abandoned];
+	}
 }
 
 // Request and data buffers in A314 memory, on the first successful open.
@@ -454,12 +537,19 @@ static BOOL setup_buffers()
 		return FALSE;
 
 	char *b = AllocMem(REQ_RES_BUF_SIZE, MEMF_A314);
+	ULONG b_address = b != NULL ? TranslateAddressA314(b) : INVALID_A314_ADDRESS;
+	if (b != NULL && b_address == INVALID_A314_ADDRESS)
+	{
+		FreeMem(b, REQ_RES_BUF_SIZE);
+		b = NULL;
+	}
+
 	if (b != NULL)
 	{
-		FreeMem(request_buffer, REQ_RES_BUF_SIZE);	// the plain one from startup
+		a314_request_buffer = b;
 		request_buffer = b;
 		request_buffer_in_a314_memory = TRUE;
-		request_buffer_address = TranslateAddressA314(request_buffer);
+		request_buffer_address = b_address;
 	}
 	else
 	{
@@ -480,10 +570,10 @@ static BOOL setup_buffers()
 
 BOOL open_a314()
 {
-	if (a314_opens >= MAX_A314_OPENS)
+	reap_abandoned();
+	if (n_abandoned >= MAX_ABANDONED)
 	{
-		dbg("open_a314: too many reopens, giving up\n");
-		a314_missing = TRUE;
+		dbg("open_a314: earlier requests are not back yet, will retry\n");
 		return FALSE;
 	}
 
@@ -500,17 +590,7 @@ BOOL open_a314()
 		// older a314.device that refuses to open without a314d): try again
 		// later. Nothing was handed to the device, so free it all.
 		dbg("open_a314: OpenDevice failed, will retry\n");
-		if (a314_ior != NULL)
-			FreeMem(a314_ior, sizeof(struct A314_IORequest));
-		if (a314_rst_ior != NULL)
-			FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
-		if (a314_msg != NULL)
-			FreeMem(a314_msg, 2 * sizeof(ULONG));
-		MyDeletePort(a314_mp);
-		MyDeletePort(a314_rst_mp);
-		a314_ior = a314_rst_ior = NULL;
-		a314_msg = NULL;
-		a314_mp = a314_rst_mp = NULL;
+		free_requests(FALSE);
 		return FALSE;
 	}
 
@@ -520,18 +600,9 @@ BOOL open_a314()
 		// No A314 memory for the buffers: try again later. Nothing has been
 		// sent yet, so the requests can be freed.
 		dbg("open_a314: no A314 memory for the buffers, will retry\n");
-		CloseDevice((struct IORequest *)a314_ior);
-		FreeMem(a314_ior, sizeof(struct A314_IORequest));
-		FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
-		FreeMem(a314_msg, 2 * sizeof(ULONG));
-		MyDeletePort(a314_mp);
-		MyDeletePort(a314_rst_mp);
-		a314_ior = a314_rst_ior = NULL;
-		a314_msg = NULL;
-		a314_mp = a314_rst_mp = NULL;
+		free_requests(TRUE);
 		return FALSE;
 	}
-	a314_opens++;
 
 	// The reset request uses the same unit.
 	a314_rst_ior->a314_Request.io_Device = a314_ior->a314_Request.io_Device;
@@ -602,7 +673,7 @@ void start_connect()
 	a314_ior->a314_Length = 6;
 	SendIO((struct IORequest *)a314_ior);
 	connecting = TRUE;
-	dbg("connect: start, socket $l, opens $l\n", (ULONG)socket, (ULONG)a314_opens);
+	dbg("connect: start, socket $l\n", (ULONG)socket);
 
 	if (retry_pending)
 		stop_timer(retry_tr);
@@ -650,11 +721,13 @@ void poll_connection()
 	}
 }
 
-// The volume node goes in and out of the DOS list. On V36+ this is done with
-// the DOS list lock, but only if it is free (AttemptLockDosList()): a task that
-// holds it while it waits on PI0: must not deadlock the handler. Otherwise, and
-// on 1.3, under Forbid(). The node is never freed, so a task walking the list
-// while it is unlinked still finds a valid dl_Next.
+// The volume node goes in and out of the DOS list, and the handler must never
+// wait for a DOS lock: a task that holds one while it waits on PI0: would
+// deadlock it (so no AddDosEntry()/RemDosEntry(), which can wait on the entry
+// and delete locks). On V36+ the node is linked in or out by hand under the
+// volume list lock if AttemptLockDosList() gets it, which keeps other writers
+// out; if it is busy, and on 1.3, under Forbid(). The node is never freed, so
+// a task walking the list while it is unlinked still finds a valid dl_Next.
 static BOOL lock_volume_list()
 {
 	if (DOSBase->dl_lib.lib_Version >= 36)
@@ -695,13 +768,8 @@ void create_and_add_volume()
 	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
 
 	BOOL locked = lock_volume_list();
-	if (locked)
-		AddDosEntry((struct DosList *)my_volume);
-	else
-	{
-		my_volume->dl_Next = info->di_DevInfo;
-		info->di_DevInfo = MKBADDR(my_volume);
-	}
+	my_volume->dl_Next = info->di_DevInfo;
+	info->di_DevInfo = MKBADDR(my_volume);
 	unlock_volume_list(locked);
 	volume_in_list = TRUE;
 }
@@ -711,7 +779,7 @@ void create_and_add_volume()
 // volume (Retry/Cancel) when they are used.
 void remove_volume_if_unused()
 {
-	if (my_volume == NULL || !volume_in_list || my_volume->dl_Lock != 0 || connected)
+	if (my_volume == NULL || !volume_in_list || my_volume->dl_LockList != 0 || connected)
 		return;
 
 	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
@@ -719,9 +787,7 @@ void remove_volume_if_unused()
 	BPTR me = MKBADDR(my_volume);
 
 	BOOL locked = lock_volume_list();
-	if (locked)
-		RemDosEntry((struct DosList *)my_volume);
-	else if (info->di_DevInfo == me)
+	if (info->di_DevInfo == me)
 		info->di_DevInfo = my_volume->dl_Next;
 	else
 	{
@@ -803,17 +869,20 @@ void startup_fs_handler(struct DosPacket *dp)
 		// never connect: PI0: stays an empty drive.
 		dbg("Unable to open timer.device for the timeouts; PI0: stays empty\n");
 		a314_missing = TRUE;
+		if (tmo_tr != NULL)
+			FreeMem(tmo_tr, sizeof(struct timerequest));
+		if (retry_tr != NULL)
+			FreeMem(retry_tr, sizeof(struct timerequest));
+		MyDeletePort(tmo_mp);
+		MyDeletePort(retry_mp);
+		tmo_tr = retry_tr = NULL;
+		tmo_mp = retry_mp = NULL;
 	}
 
 	input_mp = MyCreatePort(NULL, 0);
 	input_ior = (struct IOStdReq *)MyCreateExtIO(input_mp, sizeof(struct IOStdReq));
 	if (input_ior != NULL && OpenDevice("input.device", 0, (struct IORequest *)input_ior, 0) != 0)
 		input_ior = NULL;
-
-	// A plain request buffer until a314.device is open (setup_buffers()
-	// moves it to A314 memory), so failure responses always have a buffer.
-	request_buffer = AllocMem(REQ_RES_BUF_SIZE, MEMF_PUBLIC | MEMF_CLEAR);
-	request_buffer_in_a314_memory = FALSE;
 
 	// Connect now, waiting up to a second so a Mount followed straight away
 	// by a command sees the volume. If the Pi is not there yet, PI0: is an
@@ -838,6 +907,7 @@ void startup_fs_handler(struct DosPacket *dp)
 // Every response starts with has_response, success, error_code.
 static void fail_response(short error_code)
 {
+	request_buffer = local_buffer;	// never in A314 memory (see local_buffer)
 	memset(request_buffer, 0, REQ_RES_BUF_SIZE);
 	struct FreeLockResponse *res = (struct FreeLockResponse *)request_buffer;
 	res->has_response = 1;
@@ -855,6 +925,13 @@ BOOL write_req_and_wait_for_res(int len)
 	{
 		fail_response(ERROR_NO_DISK);
 		return FALSE;
+	}
+
+	// After a local failure response the request was built in local_buffer.
+	if (request_buffer_in_a314_memory && request_buffer != a314_request_buffer)
+	{
+		memcpy(a314_request_buffer, request_buffer, len);
+		request_buffer = a314_request_buffer;
 	}
 
 	if (!request_buffer_in_a314_memory)
@@ -905,8 +982,8 @@ struct FileLock *create_and_add_file_lock(long key, long mode)
 	lock->fl_Volume = MKBADDR(my_volume);
 
 	Forbid();
-	lock->fl_Link = my_volume->dl_Lock;
-	my_volume->dl_Lock = MKBADDR(lock);
+	lock->fl_Link = my_volume->dl_LockList;
+	my_volume->dl_LockList = MKBADDR(lock);
 	Permit();
 
 	return lock;
@@ -979,11 +1056,11 @@ void action_free_lock(struct DosPacket *dp)
 		//struct FreeLockResponse *res = (struct FreeLockResponse *)request_buffer;
 
 		Forbid();
-		if (my_volume->dl_Lock == arg1)
-			my_volume->dl_Lock = lock->fl_Link;
+		if (my_volume->dl_LockList == arg1)
+			my_volume->dl_LockList = lock->fl_Link;
 		else
 		{
-			struct FileLock *prev = (struct FileLock *)BADDR(my_volume->dl_Lock);
+			struct FileLock *prev = (struct FileLock *)BADDR(my_volume->dl_LockList);
 			while (prev->fl_Link != arg1)
 				prev = (struct FileLock *)BADDR(prev->fl_Link);
 			prev->fl_Link = lock->fl_Link;
@@ -1980,8 +2057,10 @@ void handle_packet(struct DosPacket *dp)
 		BOOL current = connected && mf->gen == conn_gen;
 		if (type == ACTION_END && !current)
 		{
+			// The link dropped while it was open: what was written before is on
+			// the Pi (a314fs.py closes its files), but say the close failed.
 			free_my_file(mf);
-			reply_error(dp, DOSTRUE, 0);
+			reply_error(dp, DOSFALSE, connected ? ERROR_INVALID_LOCK : ERROR_NO_DISK);
 			return;
 		}
 		if (!connected)
@@ -2037,6 +2116,7 @@ void start(__reg("a0") struct DosPacket *startup_packet)
 		Wait(mp_sig | retry_sig | a314_sig);
 
 		poll_connection();
+		reap_abandoned();
 
 		struct StandardPacket *sp;
 		while ((sp = (struct StandardPacket *)GetMsg(mp)) != NULL)

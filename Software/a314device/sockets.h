@@ -42,6 +42,10 @@ struct Socket
 	// Data that is received on the stream, but the application didn't read yet.
 	struct QueuedData *rq_head;
 	struct QueuedData *rq_tail;
+
+#if defined(MODEL_TF)
+	ULONG connect_sent;	// dev->poll.ticks when the CONNECT went to a2r
+#endif
 };
 
 extern void init_sockets(struct A314Device *dev);
