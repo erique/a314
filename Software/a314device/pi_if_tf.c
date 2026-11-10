@@ -60,7 +60,7 @@ void set_pi_irq(struct A314Device *dev)
 	*sint = REG_IRQ_SET | REG_IRQ_RPI;
 }
 
-static int check_pi_irq(struct A314Device *dev)
+int check_pi_irq(struct A314Device *dev)
 {
 	volatile UBYTE* sint = (void*)(((intptr_t)dev->tf_config) + SINT);
 	return (*sint & REG_IRQ_RPI) != 0 ? TRUE : FALSE;

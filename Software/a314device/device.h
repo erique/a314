@@ -71,6 +71,8 @@ struct A314Device
 	struct Socket *send_queue_tail;
 
 	UBYTE next_stream_id;
+
+	UBYTE starting;		// open(): task_start() in progress
 };
 
 #if defined(MODEL_TF)
