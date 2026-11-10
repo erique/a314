@@ -112,6 +112,9 @@ static void begin_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314
 {
 	dbg_trace("Enter: begin_io");
 
+#if defined(MODEL_TF)
+	ior->a314_Request.io_Flags &= ~A314_IOF_ABORT;
+#endif
 	PutMsg(&dev->task_mp, (struct Message *)ior);
 	ior->a314_Request.io_Flags &= ~IOF_QUICK;
 }
@@ -119,20 +122,16 @@ static void begin_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314
 static ULONG abort_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314_IORequest *ior)
 {
 #if defined(MODEL_TF)
-	// The driver task owns the sockets: queue the request for it. If it is
-	// still pending there, it is replied with IOERR_ABORTED and its socket
-	// is reset (handle_aborts() in driver_task.c).
+	// The driver task owns the sockets, so it does the abort: mark the request
+	// and wake it. A request that is already replied is left alone, and a
+	// stale mark can't hit the request's next use (BeginIO() clears it).
 	Forbid();
-	for (int i = 0; i < MAX_PENDING_ABORTS; i++)
+	if (ior->a314_Request.io_Message.mn_Node.ln_Type != NT_REPLYMSG)
 	{
-		if (dev->pending_aborts[i] == NULL || dev->pending_aborts[i] == ior)
-		{
-			dev->pending_aborts[i] = ior;
-			break;
-		}
+		ior->a314_Request.io_Flags |= A314_IOF_ABORT;
+		Signal(&dev->task, SIGF_INT);
 	}
 	Permit();
-	Signal(&dev->task, SIGF_INT);
 	return 0;
 #else
 	// There is currently no support for aborting an IORequest.
