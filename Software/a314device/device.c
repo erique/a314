@@ -35,6 +35,7 @@ static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg(
 {
 	dev->saved_seg_list = seg_list;
 	dev->running = FALSE;
+	dev->starting = FALSE;
 
 	// We are being called from InitResident() in initializers.asm.
 	// MakeLibrary() was executed before we got here.
@@ -77,9 +78,20 @@ static void open(__reg("a6") struct A314Device *dev, __reg("a1") struct A314_IOR
 
 	dev->lib.lib_OpenCnt++;
 
-	if (dev->lib.lib_OpenCnt == 1 && !dev->running)
+	if (!dev->running)
 	{
-		if (!task_start(dev))
+		// task_start() can wait (the Pi probe uses timer.device), which breaks
+		// the Forbid() around Open: a second opener meanwhile must not get a
+		// device whose task is not set up yet, so it fails and can retry.
+		BOOL started = FALSE;
+		if (!dev->starting)
+		{
+			dev->starting = TRUE;
+			started = task_start(dev);
+			dev->starting = FALSE;
+		}
+
+		if (!started)
 		{
 			ior->a314_Request.io_Error = IOERR_OPENFAIL;
 			ior->a314_Request.io_Message.mn_Node.ln_Type = NT_REPLYMSG;
@@ -112,11 +124,12 @@ static void begin_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314
 {
 	dbg_trace("Enter: begin_io");
 
+	// Before PutMsg(): the driver task may reply the request at once.
+	ior->a314_Request.io_Flags &= ~IOF_QUICK;
 #if defined(MODEL_TF)
 	ior->a314_Request.io_Flags &= ~A314_IOF_ABORT;
 #endif
 	PutMsg(&dev->task_mp, (struct Message *)ior);
-	ior->a314_Request.io_Flags &= ~IOF_QUICK;
 }
 
 static ULONG abort_io(__reg("a6") struct A314Device *dev, __reg("a1") struct A314_IORequest *ior)

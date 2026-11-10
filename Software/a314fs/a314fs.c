@@ -56,11 +56,11 @@ char default_volume_name[] = "\006PiDisk";
 
 char device_name[32]; // "\004PI0:"
 
-struct MsgPort *timer_mp;
-struct timerequest *tr;
-
 struct MsgPort *a314_mp;
 struct A314_IORequest *a314_ior;
+// The WRITE/READ buffer of the current a314_ior: allocated with it, never on
+// the stack, as an abandoned request (see reset_socket()) may still use it.
+ULONG *a314_msg;
 
 // Link resilience: PI0: must never hang the Amiga. With no Pi,
 // or a Pi that stops answering, PI0: behaves like a drive with no disk, and
@@ -82,6 +82,8 @@ BOOL retry_pending = FALSE;		// retry_tr is running (a retry wait or a connect t
 BOOL connecting = FALSE;		// a CONNECT is outstanding on a314_ior
 struct MsgPort *input_mp;		// disk inserted/removed events for Workbench
 struct IOStdReq *input_ior;
+struct InputEvent disk_ie;		// the event input_ior sends (see send_disk_event())
+BOOL input_busy = FALSE;		// input_ior has been sent and not yet collected
 
 BOOL a314_open = FALSE;			// a314.device is open and our requests are ours
 BOOL a314_missing = FALSE;		// gave up on a314.device (see open_a314())
@@ -442,10 +444,14 @@ static void MyDeletePort(struct MsgPort *port)
 }
 
 // Request and data buffers in A314 memory, on the first successful open.
-static void setup_buffers()
+static BOOL setup_buffers()
 {
 	if (buffers_ready)
-		return;
+		return TRUE;
+
+	ULONG data = AllocMemA314(BUFFER_SIZE);
+	if (data == INVALID_A314_ADDRESS)
+		return FALSE;
 
 	char *b = AllocMem(REQ_RES_BUF_SIZE, MEMF_A314);
 	if (b != NULL)
@@ -457,12 +463,19 @@ static void setup_buffers()
 	}
 	else
 	{
+		ULONG req = AllocMemA314(REQ_RES_BUF_SIZE);
+		if (req == INVALID_A314_ADDRESS)
+		{
+			FreeMemA314(data, BUFFER_SIZE);
+			return FALSE;
+		}
 		request_buffer_in_a314_memory = FALSE;
-		request_buffer_address = AllocMemA314(REQ_RES_BUF_SIZE);
+		request_buffer_address = req;
 	}
 
-	data_buffer_address = AllocMemA314(BUFFER_SIZE);
+	data_buffer_address = data;
 	buffers_ready = TRUE;
+	return TRUE;
 }
 
 BOOL open_a314()
@@ -478,8 +491,9 @@ BOOL open_a314()
 	a314_rst_mp = MyCreatePort(NULL, 0);
 	a314_ior = (struct A314_IORequest *)MyCreateExtIO(a314_mp, sizeof(struct A314_IORequest));
 	a314_rst_ior = (struct A314_IORequest *)MyCreateExtIO(a314_rst_mp, sizeof(struct A314_IORequest));
+	a314_msg = (ULONG *)AllocMem(2 * sizeof(ULONG), MEMF_PUBLIC);
 
-	if (a314_ior == NULL || a314_rst_ior == NULL ||
+	if (a314_ior == NULL || a314_rst_ior == NULL || a314_msg == NULL ||
 	    OpenDevice(A314_NAME, 0, (struct IORequest *)a314_ior, 0) != 0)
 	{
 		// Not there yet (no TF board found, no a314.device file, or an
@@ -490,9 +504,30 @@ BOOL open_a314()
 			FreeMem(a314_ior, sizeof(struct A314_IORequest));
 		if (a314_rst_ior != NULL)
 			FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
+		if (a314_msg != NULL)
+			FreeMem(a314_msg, 2 * sizeof(ULONG));
 		MyDeletePort(a314_mp);
 		MyDeletePort(a314_rst_mp);
 		a314_ior = a314_rst_ior = NULL;
+		a314_msg = NULL;
+		a314_mp = a314_rst_mp = NULL;
+		return FALSE;
+	}
+
+	A314Base = &(a314_ior->a314_Request.io_Device->dd_Library);
+	if (!setup_buffers())
+	{
+		// No A314 memory for the buffers: try again later. Nothing has been
+		// sent yet, so the requests can be freed.
+		dbg("open_a314: no A314 memory for the buffers, will retry\n");
+		CloseDevice((struct IORequest *)a314_ior);
+		FreeMem(a314_ior, sizeof(struct A314_IORequest));
+		FreeMem(a314_rst_ior, sizeof(struct A314_IORequest));
+		FreeMem(a314_msg, 2 * sizeof(ULONG));
+		MyDeletePort(a314_mp);
+		MyDeletePort(a314_rst_mp);
+		a314_ior = a314_rst_ior = NULL;
+		a314_msg = NULL;
 		a314_mp = a314_rst_mp = NULL;
 		return FALSE;
 	}
@@ -502,9 +537,7 @@ BOOL open_a314()
 	a314_rst_ior->a314_Request.io_Device = a314_ior->a314_Request.io_Device;
 	a314_rst_ior->a314_Request.io_Unit = a314_ior->a314_Request.io_Unit;
 
-	A314Base = &(a314_ior->a314_Request.io_Device->dd_Library);
 	a314_open = TRUE;
-	setup_buffers();
 	return TRUE;
 }
 
@@ -617,6 +650,31 @@ void poll_connection()
 	}
 }
 
+// The volume node goes in and out of the DOS list. On V36+ this is done with
+// the DOS list lock, but only if it is free (AttemptLockDosList()): a task that
+// holds it while it waits on PI0: must not deadlock the handler. Otherwise, and
+// on 1.3, under Forbid(). The node is never freed, so a task walking the list
+// while it is unlinked still finds a valid dl_Next.
+static BOOL lock_volume_list()
+{
+	if (DOSBase->dl_lib.lib_Version >= 36)
+	{
+		struct DosList *dl = AttemptLockDosList(LDF_VOLUMES | LDF_WRITE);
+		if ((ULONG)dl > 1)	// some versions return 1, not NULL, on failure
+			return TRUE;
+	}
+	Forbid();
+	return FALSE;
+}
+
+static void unlock_volume_list(BOOL locked)
+{
+	if (locked)
+		UnLockDosList(LDF_VOLUMES | LDF_WRITE);
+	else
+		Permit();
+}
+
 void create_and_add_volume()
 {
 	if (my_volume == NULL)
@@ -636,10 +694,15 @@ void create_and_add_volume()
 	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
 	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
 
-	Forbid();
-	my_volume->dl_Next = info->di_DevInfo;
-	info->di_DevInfo = MKBADDR(my_volume);
-	Permit();
+	BOOL locked = lock_volume_list();
+	if (locked)
+		AddDosEntry((struct DosList *)my_volume);
+	else
+	{
+		my_volume->dl_Next = info->di_DevInfo;
+		info->di_DevInfo = MKBADDR(my_volume);
+	}
+	unlock_volume_list(locked);
 	volume_in_list = TRUE;
 }
 
@@ -655,8 +718,10 @@ void remove_volume_if_unused()
 	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
 	BPTR me = MKBADDR(my_volume);
 
-	Forbid();
-	if (info->di_DevInfo == me)
+	BOOL locked = lock_volume_list();
+	if (locked)
+		RemDosEntry((struct DosList *)my_volume);
+	else if (info->di_DevInfo == me)
 		info->di_DevInfo = my_volume->dl_Next;
 	else
 	{
@@ -666,24 +731,35 @@ void remove_volume_if_unused()
 		if (prev != NULL)
 			prev->dl_Next = my_volume->dl_Next;
 	}
-	Permit();
+	unlock_volume_list(locked);
 	volume_in_list = FALSE;
 }
 
+// Sent without waiting for it, so an input handler that waits on PI0: can't
+// deadlock the handler. If the previous event is still in progress, this one
+// is dropped (they are seconds apart; the next one gives the current state).
 void send_disk_event(UBYTE ie_class)
 {
 	if (input_ior == NULL)
 		return;
 
-	struct InputEvent ie;
-	memset(&ie, 0, sizeof(ie));
-	ie.ie_Class = ie_class;
+	if (input_busy)
+	{
+		if (!CheckIO((struct IORequest *)input_ior))
+			return;
+		WaitIO((struct IORequest *)input_ior);
+		input_busy = FALSE;
+	}
+
+	memset(&disk_ie, 0, sizeof(disk_ie));
+	disk_ie.ie_Class = ie_class;
 
 	input_ior->io_Command = IND_WRITEEVENT;
-	input_ior->io_Data = &ie;
+	input_ior->io_Data = &disk_ie;
 	input_ior->io_Length = sizeof(struct InputEvent);
 	input_ior->io_Flags = 0;
-	DoIO((struct IORequest *)input_ior);
+	SendIO((struct IORequest *)input_ior);
+	input_busy = TRUE;
 }
 
 void startup_fs_handler(struct DosPacket *dp)
@@ -708,23 +784,20 @@ void startup_fs_handler(struct DosPacket *dp)
 	dbg("  fssm = $l\n", (ULONG)fssm);
 	dbg("  node = $l\n", (ULONG)node);
 
-	timer_mp = MyCreatePort(NULL, 0);
-	tr = (struct timerequest *)MyCreateExtIO(timer_mp, sizeof(struct timerequest));
-	if (OpenDevice(TIMERNAME, UNIT_MICROHZ, (struct IORequest *)tr, 0) != 0)
-	{
-		// Om detta händer så är det inget mer vi kan göra.
-		// F.n. så antar vi att det inte händer.
-		dbg("Fatal error: unable to open timer.device\n");
-		return;
-	}
-
 	tmo_mp = MyCreatePort(NULL, 0);
 	tmo_tr = (struct timerequest *)MyCreateExtIO(tmo_mp, sizeof(struct timerequest));
 	retry_mp = MyCreatePort(NULL, 0);
 	retry_tr = (struct timerequest *)MyCreateExtIO(retry_mp, sizeof(struct timerequest));
-	if (tmo_tr == NULL || retry_tr == NULL ||
-	    OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)tmo_tr, 0) != 0 ||
-	    OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)retry_tr, 0) != 0)
+	BOOL timers = FALSE;
+	if (tmo_tr != NULL && retry_tr != NULL &&
+	    OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)tmo_tr, 0) == 0)
+	{
+		if (OpenDevice(TIMERNAME, UNIT_VBLANK, (struct IORequest *)retry_tr, 0) == 0)
+			timers = TRUE;
+		else
+			CloseDevice((struct IORequest *)tmo_tr);
+	}
+	if (!timers)
 	{
 		// Without the timeouts a request could wait on the Pi for ever, so
 		// never connect: PI0: stays an empty drive.
@@ -745,39 +818,22 @@ void startup_fs_handler(struct DosPacket *dp)
 	// Connect now, waiting up to a second so a Mount followed straight away
 	// by a command sees the volume. If the Pi is not there yet, PI0: is an
 	// empty drive and the main loop keeps trying in the background.
+	// Only the CONNECT and tmo_tr are waited for here: poll_connection() may
+	// reset the socket, which uses tmo_tr itself, so it runs after stop_timer().
 	start_connect();
 	if (connecting)
 	{
-		ULONG sigs = (1UL << a314_mp->mp_SigBit) | (1UL << retry_mp->mp_SigBit);
+		ULONG sigs = (1UL << a314_mp->mp_SigBit) | (1UL << tmo_mp->mp_SigBit);
 		start_timer(tmo_tr, 1);
-		while (connecting && !CheckIO((struct IORequest *)tmo_tr))
-		{
-			Wait(sigs | (1UL << tmo_mp->mp_SigBit));
-			poll_connection();
-		}
+		while (!CheckIO((struct IORequest *)a314_ior) && !CheckIO((struct IORequest *)tmo_tr))
+			Wait(sigs);
 		stop_timer(tmo_tr);
+		poll_connection();
 	}
 
 	dbg("Startup done, connected = $l\n", (ULONG)connected);
 }
 
-void wait_for_response()
-{
-	for (unsigned long i = 0; 1; i++)
-	{
-		if (*request_buffer)
-		{
-			dbg("--Got response after $l sleeps\n", i);
-			return;
-		}
-
-		tr->tr_node.io_Command = TR_ADDREQUEST;
-		tr->tr_node.io_Message.mn_ReplyPort = timer_mp;
-		tr->tr_time.tv_secs = 0;
-		tr->tr_time.tv_micro = 1000;
-		DoIO((struct IORequest *)tr);
-	}
-}
 
 // Every response starts with has_response, success, error_code.
 static void fail_response(short error_code)
@@ -803,11 +859,23 @@ BOOL write_req_and_wait_for_res(int len)
 
 	if (!request_buffer_in_a314_memory)
 		WriteMemA314(request_buffer_address, request_buffer, len);
-	ULONG buf[2] = {request_buffer_address, len};
+	a314_msg[0] = request_buffer_address;
+	a314_msg[1] = len;
 
-	LONG err = a314_cmd_timed(A314_WRITE, (char *)&buf[0], 8, REQ_TIMEOUT_SECS);
+	LONG err = a314_cmd_timed(A314_WRITE, (char *)&a314_msg[0], 8, REQ_TIMEOUT_SECS);
 	if (err == A314_WRITE_OK)
-		err = a314_cmd_timed(A314_READ, (char *)&buf[1], 4, REQ_TIMEOUT_SECS);
+		err = a314_cmd_timed(A314_READ, (char *)&a314_msg[1], 4, REQ_TIMEOUT_SECS);
+
+	// The response length: at least has_response, success and error_code, and
+	// no more than the buffer (unsigned, so a bad value can't pass as negative).
+	ULONG res_len = a314_msg[1];
+	if (err == A314_READ_OK && a314_ior->a314_Length == 4 &&
+	    (res_len < sizeof(struct FreeLockResponse) || res_len > REQ_RES_BUF_SIZE))
+	{
+		dbg("Bad response length $l\n", res_len);
+		err = A314_READ_RESET;
+	}
+
 	if (err != A314_READ_OK || a314_ior->a314_Length != 4)
 	{
 		// A timeout has reset the socket already. Anything else (a reset or
@@ -820,11 +888,8 @@ BOOL write_req_and_wait_for_res(int len)
 		return FALSE;
 	}
 
-	len = buf[1];
-	if (len > REQ_RES_BUF_SIZE)
-		len = REQ_RES_BUF_SIZE;
 	if (!request_buffer_in_a314_memory)
-		ReadMemA314(request_buffer, request_buffer_address, len);
+		ReadMemA314(request_buffer, request_buffer_address, res_len);
 	return TRUE;
 }
 
@@ -1333,7 +1398,7 @@ void action_write(struct DosPacket *dp)
 		if (!res->success)
 		{
 			dbg("  Failed, error code $l\n", (LONG)res->error_code);
-			dp->dp_Res1 = total_written;
+			dp->dp_Res1 = total_written != 0 ? total_written : -1;	// Write() is -1 on error
 			dp->dp_Res2 = res->error_code;
 			reply_packet(dp);
 			return;
@@ -1405,10 +1470,11 @@ void action_end(struct DosPacket *dp)
 
 	write_req_and_wait_for_res(sizeof(struct EndRequest));
 
-	//struct EndResponse *res = (struct EndResponse *)request_buffer;
-
-	dp->dp_Res1 = DOSTRUE;
-	dp->dp_Res2 = 0;
+	// The handle is freed either way (handle_packet()); a close that did not
+	// reach the Pi may have lost buffered data, so report it.
+	struct EndResponse *res = (struct EndResponse *)request_buffer;
+	dp->dp_Res1 = res->success ? DOSTRUE : DOSFALSE;
+	dp->dp_Res2 = res->success ? 0 : res->error_code;
 	reply_packet(dp);
 }
 
@@ -1679,7 +1745,12 @@ void action_info(struct DosPacket *dp)
 	req->type = dp->dp_Type;
 	req->key = lock == NULL ? 0 : lock->fl_Key;
 
-	write_req_and_wait_for_res(sizeof(struct InfoRequest));
+	if (!write_req_and_wait_for_res(sizeof(struct InfoRequest)))
+	{
+		fill_info_data(id);	// the link dropped: no disk now
+		reply_packet(dp);
+		return;
+	}
 
 	struct InfoResponse *res = (struct InfoResponse *)request_buffer;
 	if (!res->success)
@@ -1717,7 +1788,14 @@ void action_disk_info(struct DosPacket *dp)
 	req->has_response = 0;
 	req->type = dp->dp_Type;
 
-	write_req_and_wait_for_res(sizeof(struct DiskInfoRequest));
+	if (!write_req_and_wait_for_res(sizeof(struct DiskInfoRequest)))
+	{
+		fill_info_data(id);	// the link dropped: no disk now
+		dp->dp_Res1 = DOSTRUE;
+		dp->dp_Res2 = 0;
+		reply_packet(dp);
+		return;
+	}
 
 	struct DiskInfoResponse *res = (struct DiskInfoResponse *)request_buffer;
 	if (!res->success)
