@@ -402,8 +402,9 @@ def find_path(key, name):
                     cp = cp + (e,)
                     found = True
                     break
-            if not found:
+            if not found and '~' in comp:
                 # A stand-in for a name the Amiga can't show (dir_names()).
+                # Every stand-in has a '~' (stand_in()).
                 for e, shown in dir_names(p).items():
                     if shown != e and comp.lower() == shown.lower():
                         cp = cp + (e,)
