@@ -17,7 +17,7 @@
 #define SysBase (*(struct ExecBase **)4)
 
 const char device_name[] = A314_NAME;
-const char id_string[] = A314_NAME " 1.0 (25 Mar 2025) "
+const char id_string[] = A314_NAME " 1.1 (11 Nov 2026) "
 #if defined(MODEL_TD)
 	"Trapdoor"
 #elif defined(MODEL_FE)
@@ -44,7 +44,7 @@ static struct Library *init_device(__reg("a6") struct ExecBase *sys_base, __reg(
 	dev->lib.lib_Node.ln_Name = (char *)device_name;
 	dev->lib.lib_Flags = LIBF_SUMUSED | LIBF_CHANGED;
 	dev->lib.lib_Version = 1;
-	dev->lib.lib_Revision = 0;
+	dev->lib.lib_Revision = 1;
 	dev->lib.lib_IdString = (APTR)id_string;
 
 	dbg_init();

@@ -53,6 +53,9 @@ struct DosLibrary *DOSBase;
 struct MsgPort *mp;
 
 struct DeviceList *my_volume;
+
+const char version_string[] = "$VER: a314fs 1.1 (11.11.2026)";
+
 char default_volume_name[] = "\006PiDisk";
 
 char device_name[32]; // "\004PI0:"
