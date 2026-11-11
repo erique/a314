@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -381,10 +382,30 @@ struct LogicalChannel
 };
 
 static void remove_association(LogicalChannel *ch);
+static void close_all_logical_channels();
 static void clear_packet_queue(LogicalChannel *ch);
 static void create_and_enqueue_packet(LogicalChannel *ch, uint8_t type, uint8_t *data, uint8_t length);
 
 static std::list<ClientConnection> connections;
+
+// Set when an SPI transfer fails (spi_transfer()); cleared by the code that
+// checks it.
+static bool spi_error = false;
+
+// The longest message a client may send (a memory write is the longest).
+#define MAX_CLIENT_MSG_LEN (1024 * 1024)
+
+// A memory request that is malformed, or whose SPI transfer failed, is not
+// answered: the client's connection is closed instead
+// (handle_client_connection_event()). That resets
+// its streams on the Amiga, and no client ever gets a reply for a transfer
+// that did not happen. A standalone a314fs.py registers again.
+static ClientConnection *failed_cc = nullptr;
+
+// An a2r head that was taken (its packets handled) but could not be written to
+// SRAM, or -1. read_channel_status() keeps it instead of the head in SRAM, so
+// those packets are not handled twice.
+static int a2r_head_unwritten = -1;
 static std::list<RegisteredService> services;
 static std::list<LogicalChannel> channels;
 static std::list<LogicalChannel*> send_queue;
@@ -514,7 +535,10 @@ static int spi_transfer(int len)
         .cs_change = 0,
     };
 
-    return ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+    int r = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+    if (r < 0)
+        spi_error = true;
+    return r;
 }
 
 static int spi_protocol_version()
@@ -1264,25 +1288,75 @@ static void handle_msg_deregister_req(ClientConnection *cc)
 
 static void handle_msg_read_mem_req(ClientConnection *cc)
 {
+    if (cc->payload.size() != 8 || *(uint32_t *)&(cc->payload[4]) > sizeof(rx_buf) - 16)
+    {
+        logger_error("Malformed memory read request -- closing the client connection\n");
+        failed_cc = cc;
+        return;
+    }
+
     uint32_t address = *(uint32_t *)&(cc->payload[0]);
     uint32_t length = *(uint32_t *)&(cc->payload[4]);
 
-#if defined(MODEL_TD)
-    // This is an optimization to save a memcpy.
+    if (length == 0)
+    {
+        // Nothing to transfer (the FE backend can't do a zero-length one).
+        create_and_send_msg(cc, MSG_READ_MEM_RES, 0, nullptr, 0);
+        return;
+    }
+
+    spi_error = false;
+#if defined(MODEL_TD) || defined(MODEL_TF)
+    // The data stays in rx_buf, after the header (no memcpy, which on TF
+    // would also overlap).
     spi_read_shm_rxbuf(address, length);
-    create_and_send_msg(cc, MSG_READ_MEM_RES, 0, &rx_buf[READ_SRAM_HDR_LEN], length);
+    uint8_t *data = &rx_buf[READ_SRAM_HDR_LEN];
 #else
     read_shm(rx_buf, address, length);
-    create_and_send_msg(cc, MSG_READ_MEM_RES, 0, rx_buf, length);
+    uint8_t *data = rx_buf;
 #endif
+    if (spi_error)
+    {
+        logger_error("SPI transfer failed for a memory read -- closing the client connection\n");
+        failed_cc = cc;
+        return;
+    }
+
+    create_and_send_msg(cc, MSG_READ_MEM_RES, 0, data, length);
 }
 
 static void handle_msg_write_mem_req(ClientConnection *cc)
 {
+#if defined(MODEL_TD) || defined(MODEL_TF)
+    // SPI writes go through tx_buf; FE and CP write straight from the payload.
+    bool too_long = cc->payload.size() - 4 > sizeof(tx_buf) - 16;
+#else
+    bool too_long = false;
+#endif
+    if (cc->payload.size() < 4 || too_long)
+    {
+        logger_error("Malformed memory write request -- closing the client connection\n");
+        failed_cc = cc;
+        return;
+    }
+
     uint32_t address = *(uint32_t *)&(cc->payload[0]);
     uint32_t length = cc->payload.size() - 4;
 
+    if (length == 0)
+    {
+        create_and_send_msg(cc, MSG_WRITE_MEM_RES, 0, nullptr, 0);
+        return;
+    }
+
+    spi_error = false;
     write_shm(address, &(cc->payload[4]), length);
+    if (spi_error)
+    {
+        logger_error("SPI transfer failed for a memory write -- closing the client connection\n");
+        failed_cc = cc;
+        return;
+    }
 
     create_and_send_msg(cc, MSG_WRITE_MEM_RES, 0, nullptr, 0);
 }
@@ -1706,6 +1780,27 @@ static void reset_unknown_channel(int channel_id, int ptype)
     create_and_enqueue_packet(&ch, PKT_RESET, nullptr, 0);
 }
 
+// After a corrupt a2r: what was dropped may have been for any channel, so every
+// channel is reset on both sides. Unlike close_all_logical_channels() (for an
+// Amiga reset, when the Amiga's sockets are gone anyway), each one also gets a
+// PKT_RESET, so an Amiga socket that only waits to receive is told too. A
+// channel goes away once its RESET is sent.
+static void reset_all_channels()
+{
+    for (auto &ch : channels)
+    {
+        clear_packet_queue(&ch);
+
+        if (ch.association != nullptr)
+        {
+            create_and_send_msg(ch.association, MSG_RESET, ch.stream_id, nullptr, 0);
+            remove_association(&ch);
+        }
+
+        create_and_enqueue_packet(&ch, PKT_RESET, nullptr, 0);
+    }
+}
+
 static void handle_received_pkt(int ptype, int channel_id, uint8_t *data, int plen)
 {
     if (ptype == PKT_DATA || ptype == PKT_EOS)
@@ -1731,6 +1826,7 @@ static void receive_from_a2r()
     if (len == 0)
         return;
 
+    spi_error = false;
     if (head < tail)
         read_shm(recv_buf, BASE_ADDRESS + A2R_BASE + head, len);
     else
@@ -1740,10 +1836,26 @@ static void receive_from_a2r()
         if (tail != 0)
             read_shm(&recv_buf[len - tail], BASE_ADDRESS + A2R_BASE, tail);
     }
+    if (spi_error)
+    {
+        // Not taken: the head stays, so the packets are read again next time.
+        logger_error("SPI read of the a2r ring failed -- retrying later\n");
+        return;
+    }
 
     uint8_t *p = recv_buf;
-    while (p < recv_buf + len)
+    uint8_t *end = recv_buf + len;
+    while (p < end)
     {
+        // A header and payload that do not fit the bytes read are not a packet.
+        if (end - p < 3 || end - p - 3 < p[0])
+        {
+            // What was dropped may have been for any stream, so none of them can
+            // be trusted: reset them all, on both sides.
+            logger_error("Malformed packet in a2r -- dropping it and resetting all channels\n");
+            reset_all_channels();
+            break;
+        }
         uint8_t plen = *p++;
         uint8_t ptype = *p++;
         uint8_t channel_id = *p++;
@@ -1762,12 +1874,21 @@ static void flush_send_queue()
     int len = (tail - head) & 255;
     int left = 255 - len;
 
+    // The batch is built from a copy of the send order, without touching the
+    // queues. The packets are taken off them only once the ring bytes and the
+    // new r2a tail are in SRAM: after a failed SPI write they stay queued and
+    // are sent again, instead of being lost or of a tail that shows stale bytes.
+    std::list<LogicalChannel*> order(send_queue);
+    std::map<LogicalChannel*, std::list<PacketBuffer>::iterator> next;
+    int npackets = 0;
     int pos = 0;
 
-    while (!send_queue.empty())
+    while (!order.empty())
     {
-        LogicalChannel *ch = send_queue.front();
-        PacketBuffer &pb = ch->packet_queue.front();
+        LogicalChannel *ch = order.front();
+        auto found = next.find(ch);
+        auto pit = found == next.end() ? ch->packet_queue.begin() : found->second;
+        PacketBuffer &pb = *pit;
 
         int ptype = pb.type;
         int plen = 3 + pb.data.size();
@@ -1780,15 +1901,12 @@ static void flush_send_queue()
         send_buf[pos++] = ch->channel_id;
         memcpy(&send_buf[pos], &pb.data[0], pb.data.size());
         pos += pb.data.size();
+        npackets++;
 
-        ch->packet_queue.pop_front();
-
-        send_queue.pop_front();
-
-        if (!ch->packet_queue.empty())
-            send_queue.push_back(ch);
-        else
-            remove_channel_if_not_associated_and_empty_pq(ch->channel_id);
+        order.pop_front();
+        next[ch] = ++pit;
+        if (pit != ch->packet_queue.end())
+            order.push_back(ch);
 
         left -= plen;
     }
@@ -1796,6 +1914,8 @@ static void flush_send_queue()
     int to_write = pos;
     if (!to_write)
         return;
+
+    spi_error = false;
 
     uint8_t *p = send_buf;
     int at_end = 256 - tail;
@@ -1810,21 +1930,68 @@ static void flush_send_queue()
     write_shm(BASE_ADDRESS + R2A_BASE + tail, p, to_write);
     tail = (tail + to_write) & 255;
 
+    uint8_t new_tail = tail;
+    if (!spi_error)
+        write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &new_tail, 1);
+
+    if (spi_error)
+    {
+        logger_error("SPI write of the r2a ring failed -- packets kept, sent again later\n");
+        return;
+    }
+
     channel_status[R2A_TAIL_OFFSET] = tail;
     channel_status_updated |= R2A_TAIL_UPDATED;
+
+    // Committed: take the packets off their queues, in the order they went.
+    for (int i = 0; i < npackets; i++)
+    {
+        LogicalChannel *ch = send_queue.front();
+
+        ch->packet_queue.pop_front();
+
+        send_queue.pop_front();
+
+        if (!ch->packet_queue.empty())
+            send_queue.push_back(ch);
+        else
+            remove_channel_if_not_associated_and_empty_pq(ch->channel_id);
+    }
 }
 
+// Sets spi_error if the read failed (the TF callers then stop).
 static void read_channel_status()
 {
+    spi_error = false;
     read_shm(channel_status, BASE_ADDRESS + CAP_BASE, 4);
     channel_status_updated = 0;
+
+    if (a2r_head_unwritten >= 0)
+    {
+        channel_status[A2R_HEAD_OFFSET] = a2r_head_unwritten;
+        channel_status_updated |= A2R_HEAD_UPDATED;
+    }
 }
 
 static void write_channel_status()
 {
     if (channel_status_updated != 0)
     {
+        spi_error = false;
         write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
+        if (spi_error)
+        {
+            spi_error = false;
+            write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
+        }
+        if (spi_error)
+        {
+            logger_error("SPI write of the channel status failed -- retrying later\n");
+            if (channel_status_updated & A2R_HEAD_UPDATED)
+                a2r_head_unwritten = channel_status[A2R_HEAD_OFFSET];
+        }
+        else
+            a2r_head_unwritten = -1;
 
 #if defined(MODEL_TD)
         unsigned int events = 0;
@@ -1858,6 +2025,7 @@ static void write_channel_status()
 static void close_all_logical_channels()
 {
     send_queue.clear();
+    a2r_head_unwritten = -1;    // the ring it belonged to is gone
 
     auto it = channels.begin();
     while (it != channels.end())
@@ -2030,11 +2198,15 @@ static void handle_a314_irq()
         }
     }
 
+    spi_error = false;
     uint8_t irq = spi_read_sint();
+    if (spi_error)
+        return;     // not a real value: try again on the next pass
 
     // RESET is cleared by the Amiga-side driver, and set again on Amiga reset
     if ((irq & REG_IRQ_RESET))
     {
+        a2r_head_unwritten = -1;    // the Amiga sets up a new ring
         if ((irq & REG_IRQ_RPI))
         {
             logger_info("Amiga is probing the a314d side\n");
@@ -2093,6 +2265,11 @@ static void handle_a314_irq()
     spi_write_sint(REG_IRQ_RPI);
 
     read_channel_status();
+    if (spi_error)
+    {
+        logger_error("SPI read of the channel status failed -- retrying later\n");
+        return;
+    }
 
     receive_from_a2r();
     flush_send_queue();
@@ -2116,9 +2293,13 @@ static bool com_area_ready()
     if (spi_proto_ver != 2)
         return false;
 
+    spi_error = false;
     uint8_t irq = spi_read_sint();
+    if (spi_error)
+        return false;
     if (irq & REG_IRQ_RESET)
     {
+        a2r_head_unwritten = -1;
         if (!channels.empty())
         {
             logger_info("Amiga was reset while logical channels are open -- closing channels\n");
@@ -2128,7 +2309,7 @@ static bool com_area_ready()
     }
 
     read_channel_status();
-    return true;
+    return !spi_error;
 }
 #endif
 
@@ -2187,9 +2368,23 @@ static void handle_client_connection_event(ClientConnection *cc, struct epoll_ev
                         {
                             logger_trace("header: length=%d, stream_id=%d, type=%d\n", cc->header.length, cc->header.stream_id, cc->header.type);
                             handle_received_message(cc);
+                            if (failed_cc == cc)
+                            {
+                                failed_cc = nullptr;
+                                close_and_remove_connection(cc);
+                                return;
+                            }
                         }
                         else
                         {
+                            // Bounded before allocating: the largest real message is
+                            // a memory write of a few hundred KB.
+                            if (cc->header.length > MAX_CLIENT_MSG_LEN)
+                            {
+                                logger_error("Client message of %u bytes is too long -- closing the client connection\n", cc->header.length);
+                                close_and_remove_connection(cc);
+                                return;
+                            }
                             cc->payload.resize(cc->header.length);
                         }
                     }
@@ -2197,6 +2392,12 @@ static void handle_client_connection_event(ClientConnection *cc, struct epoll_ev
                     {
                         logger_trace("header: length=%d, stream_id=%d, type=%d\n", cc->header.length, cc->header.stream_id, cc->header.type);
                         handle_received_message(cc);
+                        if (failed_cc == cc)
+                        {
+                            failed_cc = nullptr;
+                            close_and_remove_connection(cc);
+                            return;
+                        }
                         cc->payload.clear();
                     }
                     cc->bytes_read = 0;

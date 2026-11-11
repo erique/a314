@@ -278,16 +278,50 @@ static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_i
 	}
 }
 
+// Close every socket, so the requests pending on them are replied: a314d is
+// gone (TF), or r2a was corrupt. Each one is reset, and its stream id stays in
+// use until the PKT_RESET goes out (when a314d reads a2r again), so a314d never
+// sees the id reused for a new CONNECT while its old channel is still open.
+static void close_all_sockets(struct A314Device *dev)
+{
+	struct Node *node = dev->active_sockets.lh_Head;
+	while (node->ln_Succ != NULL)
+	{
+		struct Socket *s = (struct Socket *)node;
+		node = node->ln_Succ;
+
+		if (!(s->flags & SOCKET_CLOSED))
+			close_socket(dev, s, TRUE);
+	}
+}
+
 static void handle_packets_received_r2a(struct A314Device *dev)
 {
 	dbg_trace("Enter: handle_packets_received_r2a");
 
-	while (used_in_r2a(CAP_PTR(dev)) != 0)
+	int used;
+	while ((used = used_in_r2a(CAP_PTR(dev))) != 0)
 	{
 		UBYTE index = CAP_PTR(dev)->r2a_head;
 
 		struct PktHdr hdr;
-		read_from_r2a(dev, (UBYTE *)&hdr, index, sizeof(hdr));
+		if (used < sizeof(hdr))
+			hdr.length = 255;	// can't be a whole packet
+		else
+			read_from_r2a(dev, (UBYTE *)&hdr, index, sizeof(hdr));
+
+		// A packet longer than what is in the ring is corrupt: a byte-sized head
+		// moved by it would end up anywhere (or nowhere, at 256), and this loop
+		// would never end. Drop the rest of the ring instead.
+		if (sizeof(hdr) + hdr.length > used)
+		{
+			// What was dropped may have been for any socket, so reset them all:
+			// none of them may wait for a packet that is gone.
+			dbg_error("Malformed packet in r2a: dropping the rest of it, closing all sockets");
+			CAP_PTR(dev)->r2a_head = CAP_PTR(dev)->r2a_tail;
+			close_all_sockets(dev);
+			break;
+		}
 
 		index += sizeof(hdr);
 
@@ -867,23 +901,6 @@ static void handle_aborts(struct A314Device *dev)
 			dbg_info("AbortIO: request aborted, resetting its socket");
 			close_socket(dev, s, !connect_unsent);
 		}
-	}
-}
-
-// a314d is gone: close every socket, so the requests pending on them are
-// replied. Each one is reset, and its stream id stays in use until the
-// PKT_RESET goes out (when a314d reads a2r again), so a314d never sees the id
-// reused for a new CONNECT while its old channel is still open.
-static void close_all_sockets(struct A314Device *dev)
-{
-	struct Node *node = dev->active_sockets.lh_Head;
-	while (node->ln_Succ != NULL)
-	{
-		struct Socket *s = (struct Socket *)node;
-		node = node->ln_Succ;
-
-		if (!(s->flags & SOCKET_CLOSED))
-			close_socket(dev, s, TRUE);
 	}
 }
 
