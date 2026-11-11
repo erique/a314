@@ -279,9 +279,10 @@ static void handle_r2a_packet(struct A314Device *dev, UBYTE type, UBYTE stream_i
 }
 
 // Close every socket, so the requests pending on them are replied: a314d is
-// gone (TF), or r2a was corrupt. Each one is reset, and its stream id stays in
-// use until the PKT_RESET goes out (when a314d reads a2r again), so a314d never
-// sees the id reused for a new CONNECT while its old channel is still open.
+// gone (TF), or r2a was corrupt. Each one is reset: its PKT_RESET goes into a2r
+// at once if there is room, otherwise the socket and its stream id are kept
+// until it can be sent. Either way a2r has the PKT_RESET ahead of any CONNECT
+// that reuses the id, so a314d closes the old channel first.
 static void close_all_sockets(struct A314Device *dev)
 {
 	struct Node *node = dev->active_sockets.lh_Head;
