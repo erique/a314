@@ -56,6 +56,8 @@
 
 static int loglevel = LOGLEVEL_INFO;
 
+#define A314D_VERSION "1.1 (11 Nov 2026)"
+
 #define logger_trace(...) do { if (loglevel <= LOGLEVEL_TRACE) fprintf(stdout, __VA_ARGS__); } while (0)
 #define logger_debug(...) do { if (loglevel <= LOGLEVEL_DEBUG) fprintf(stdout, __VA_ARGS__); } while (0)
 #define logger_info(...) do { if (loglevel <= LOGLEVEL_INFO) fprintf(stdout, __VA_ARGS__); } while (0)
@@ -2639,6 +2641,8 @@ int main(int argc, char **argv)
 
     if (argc > used_args)
         conf_filename = argv[used_args];
+
+    logger_info("a314d " A314D_VERSION "\n");
 
     load_config_file(conf_filename.c_str());
 
