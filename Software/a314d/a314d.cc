@@ -2585,7 +2585,9 @@ static void main_loop()
                 handle_client_connection_event(cc, &ev);
 
 #if defined(MODEL_TF)
-                if (com_area_ready())
+                // Most client events (e.g. memory requests) queue no packets:
+                // then there is nothing to publish, so no SPI traffic.
+                if ((!send_queue.empty() || a2r_head_unwritten >= 0) && com_area_ready())
 #endif
                 {
                     flush_send_queue();
