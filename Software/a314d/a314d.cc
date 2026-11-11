@@ -1977,21 +1977,24 @@ static void write_channel_status()
 {
     if (channel_status_updated != 0)
     {
-        spi_error = false;
-        write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
-        if (spi_error)
+        // The r2a tail is already in SRAM (flush_send_queue() writes it).
+        if ((channel_status_updated & A2R_HEAD_UPDATED) || a2r_head_unwritten >= 0)
         {
             spi_error = false;
-            write_shm(BASE_ADDRESS + CAP_BASE + R2A_TAIL_OFFSET, &channel_status[R2A_TAIL_OFFSET], 2);
-        }
-        if (spi_error)
-        {
-            logger_error("SPI write of the channel status failed -- retrying later\n");
-            if (channel_status_updated & A2R_HEAD_UPDATED)
+            write_shm(BASE_ADDRESS + CAP_BASE + A2R_HEAD_OFFSET, &channel_status[A2R_HEAD_OFFSET], 1);
+            if (spi_error)
+            {
+                spi_error = false;
+                write_shm(BASE_ADDRESS + CAP_BASE + A2R_HEAD_OFFSET, &channel_status[A2R_HEAD_OFFSET], 1);
+            }
+            if (spi_error)
+            {
+                logger_error("SPI write of the a2r head failed -- retrying later\n");
                 a2r_head_unwritten = channel_status[A2R_HEAD_OFFSET];
+            }
+            else
+                a2r_head_unwritten = -1;
         }
-        else
-            a2r_head_unwritten = -1;
 
 #if defined(MODEL_TD)
         unsigned int events = 0;
