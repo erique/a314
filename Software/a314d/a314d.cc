@@ -524,8 +524,58 @@ static int check_spidev_bufsiz()
     return 0;
 }
 
+#if defined(MODEL_TF)
+// CE0 is the SPI flash's chip select, on the same SPI bus as the A314. It is
+// asserted while the Amiga reads the flash. An SPI transfer made then reads or
+// writes garbage without any ioctl() error. This only keeps the Pi from
+// starting during a flash access: the Amiga side does not wait for the Pi.
+#define CE0_WAIT_FIRST_US   10
+#define CE0_WAIT_MAX_US     (100*1000)
+#define CE0_WAIT_WARN_US    (1000*1000)
+
+// True if CE0 is asserted, or its state can't be read.
+static bool ce0_asserted()
+{
+    gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
+    if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state))
+        return true;
+    return gpio_state.bits == 0;
+}
+
+// Waits for CE0 to be released. The callers can't handle a failed transfer, so
+// there is no time limit. The GPIO line is requested after the first SPI
+// transfers (init_driver()); those are not checked.
+static void wait_for_ce0_released()
+{
+    if (gpio_irq_fd < 0)
+        return;
+
+    unsigned long waited = 0;
+    __useconds_t timeout = CE0_WAIT_FIRST_US;
+    bool warned = false;
+    while (ce0_asserted())
+    {
+        if (!warned && waited >= CE0_WAIT_WARN_US)
+        {
+            logger_warning("CE0 still asserted -- waiting to make an SPI transfer\n");
+            warned = true;
+        }
+        usleep(timeout);
+        waited += timeout;
+        if (timeout < CE0_WAIT_MAX_US)
+            timeout *= 2;
+    }
+    if (warned)
+        logger_warning("CE0 is deasserted; continuing..\n");
+}
+#endif
+
 static int spi_transfer(int len)
 {
+#if defined(MODEL_TF)
+    wait_for_ce0_released();
+#endif
+
     struct spi_ioc_transfer tr =
     {
         .tx_buf = (uintptr_t)tx_buf,
