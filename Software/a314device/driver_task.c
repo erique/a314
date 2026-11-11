@@ -904,6 +904,18 @@ static void handle_aborts(struct A314Device *dev)
 	}
 }
 
+// TRUE if a socket is open. A closed one that still waits to send its PKT_RESET
+// has no requests pending, so nothing waits on the Pi for it.
+static BOOL any_open_socket(struct A314Device *dev)
+{
+	for (struct Node *node = dev->active_sockets.lh_Head; node->ln_Succ != NULL; node = node->ln_Succ)
+	{
+		if (!(((struct Socket *)node)->flags & SOCKET_CLOSED))
+			return TRUE;
+	}
+	return FALSE;
+}
+
 void task_main()
 {
 	struct A314Device *dev = (struct A314Device *)FindTask(NULL)->tc_UserData;
@@ -918,7 +930,7 @@ void task_main()
 	while (TRUE)
 	{
 		// Poll while anything could be waiting on the Pi.
-		dev->poll.active = dev->active_sockets.lh_TailPred != (struct Node *)&dev->active_sockets;
+		dev->poll.active = any_open_socket(dev);
 
 		dbg_trace("Invoking Wait()");
 
@@ -961,7 +973,7 @@ void task_main()
 		}
 
 		// Dead Pi (see DEAD_PI_FRAMES).
-		BOOL no_sockets = dev->active_sockets.lh_TailPred == (struct Node *)&dev->active_sockets;
+		BOOL no_sockets = !any_open_socket(dev);
 		if (no_sockets || pi_moved || !pi_irq_set)
 		{
 			irq_waiting = FALSE;
