@@ -19,6 +19,7 @@
 #include <proto/dos.h>
 
 #include <string.h>
+#include <stddef.h>
 #include <stdarg.h>
 
 #include "../a314device/a314.h"
@@ -84,6 +85,8 @@ struct MsgPort *input_mp;		// disk inserted/removed events for Workbench
 struct IOStdReq *input_ior;
 struct InputEvent disk_ie;		// the event input_ior sends (see send_disk_event())
 BOOL input_busy = FALSE;		// input_ior has been sent and not yet collected
+UBYTE disk_event_pending = 0;		// an event class still to send
+BOOL insert_event_wanted = FALSE;	// send DISKINSERTED once the volume is listed
 
 BOOL a314_open = FALSE;			// a314.device is open and our requests are ours
 BOOL a314_missing = FALSE;		// gave up on a314.device (see open_a314())
@@ -143,6 +146,7 @@ static LONG file_arg1(struct DosPacket *dp)
 
 void create_and_add_volume();
 void remove_volume_if_unused();
+void sync_volume();
 void send_disk_event(UBYTE ie_class);
 
 struct Library *A314Base;
@@ -493,6 +497,21 @@ static void abandon_requests(BOOL ior_out, BOOL rst_out)
 	a314_open = FALSE;
 }
 
+// The reply ports of abandoned requests still outstanding, for the main loop's
+// Wait(): their replies must wake it, so they are freed even when PI0: is idle.
+static ULONG abandoned_sigs()
+{
+	ULONG sigs = 0;
+	for (int i = 0; i < n_abandoned; i++)
+	{
+		if (abandoned[i].ior_out)
+			sigs |= 1UL << abandoned[i].mp->mp_SigBit;
+		if (abandoned[i].rst_out)
+			sigs |= 1UL << abandoned[i].rst_mp->mp_SigBit;
+	}
+	return sigs;
+}
+
 // Called on every wake-up of the main loop.
 static void reap_abandoned()
 {
@@ -624,8 +643,8 @@ void go_online()
 {
 	conn_gen++;
 	connected = TRUE;
+	insert_event_wanted = TRUE;	// sent by sync_volume() once PiDisk is listed
 	create_and_add_volume();
-	send_disk_event(IECLASS_DISKINSERTED);
 	dbg("Connected (generation $l)\n", conn_gen);
 }
 
@@ -635,6 +654,7 @@ void go_offline()
 		return;
 
 	connected = FALSE;
+	insert_event_wanted = FALSE;
 	if (my_volume != NULL)
 		my_volume->dl_Task = NULL;
 	remove_volume_if_unused();
@@ -719,33 +739,91 @@ void poll_connection()
 		retry_pending = FALSE;
 		start_connect();
 	}
+
+	// While connected retry_tr only waits for a volume list change (sync_volume()).
+	if (connected && retry_pending && CheckIO((struct IORequest *)retry_tr))
+	{
+		WaitIO((struct IORequest *)retry_tr);
+		retry_pending = FALSE;
+		sync_volume();
+	}
 }
 
-// The volume node goes in and out of the DOS list, and the handler must never
-// wait for a DOS lock: a task that holds one while it waits on PI0: would
-// deadlock it (so no AddDosEntry()/RemDosEntry(), which can wait on the entry
-// and delete locks). On V36+ the node is linked in or out by hand under the
-// volume list lock if AttemptLockDosList() gets it, which keeps other writers
-// out; if it is busy, and on 1.3, under Forbid(). The node is never freed, so
-// a task walking the list while it is unlinked still finds a valid dl_Next.
-static BOOL lock_volume_list()
+// The volume is listed while connected, and while locks on it are still held
+// (with dl_Task = NULL then, so DOS asks for the volume when they are used).
+//
+// The handler must never wait for a DOS lock: a task that holds one while it
+// waits on PI0: would deadlock it. So there is no AddDosEntry()/RemDosEntry(),
+// which can wait on the entry and delete locks. On V36+ the node is linked in
+// or out by hand under the volume list lock, taken with AttemptLockDosList().
+// If the lock is busy the change waits (volume_sync_pending) and is retried on
+// the next wake-up, which is within a second while connected (retry_tr). On
+// 1.3, which has no lock, it is done under Forbid(). The node is never freed,
+// so a task walking the list while it is unlinked still finds a valid dl_Next.
+BOOL volume_sync_pending = FALSE;
+
+// FALSE if the DOS list lock is busy.
+static BOOL link_volume(BOOL in)
 {
-	if (DOSBase->dl_lib.lib_Version >= 36)
+	BOOL v36 = DOSBase->dl_lib.lib_Version >= 36;
+	if (v36)
 	{
 		struct DosList *dl = AttemptLockDosList(LDF_VOLUMES | LDF_WRITE);
-		if ((ULONG)dl > 1)	// some versions return 1, not NULL, on failure
-			return TRUE;
+		if ((ULONG)dl <= 1)	// busy; some versions return 1, not NULL
+			return FALSE;
 	}
-	Forbid();
-	return FALSE;
-}
+	else
+		Forbid();
 
-static void unlock_volume_list(BOOL locked)
-{
-	if (locked)
+	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
+	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
+	BPTR me = MKBADDR(my_volume);
+
+	if (in)
+	{
+		my_volume->dl_Next = info->di_DevInfo;
+		info->di_DevInfo = me;
+	}
+	else if (info->di_DevInfo == me)
+		info->di_DevInfo = my_volume->dl_Next;
+	else
+	{
+		struct DeviceList *prev = (struct DeviceList *)BADDR(info->di_DevInfo);
+		while (prev != NULL && prev->dl_Next != me)
+			prev = (struct DeviceList *)BADDR(prev->dl_Next);
+		if (prev != NULL)
+			prev->dl_Next = my_volume->dl_Next;
+	}
+
+	if (v36)
 		UnLockDosList(LDF_VOLUMES | LDF_WRITE);
 	else
 		Permit();
+
+	volume_in_list = in;
+	return TRUE;
+}
+
+void sync_volume()
+{
+	if (my_volume == NULL)
+		return;
+
+	BOOL want = connected || my_volume->dl_LockList != 0;
+	volume_sync_pending = want != volume_in_list && !link_volume(want);
+
+	// Workbench looks for the volume when it gets the event, so not before.
+	if (connected && volume_in_list && insert_event_wanted)
+	{
+		insert_event_wanted = FALSE;
+		send_disk_event(IECLASS_DISKINSERTED);
+	}
+
+	if (volume_sync_pending && connected && !retry_pending)
+	{
+		start_timer(retry_tr, 1);	// see poll_connection()
+		retry_pending = TRUE;
+	}
 }
 
 void create_and_add_volume()
@@ -760,53 +838,22 @@ void create_and_add_volume()
 	}
 
 	my_volume->dl_Task = mp;
-
-	if (volume_in_list)
-		return;
-
-	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
-	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
-
-	BOOL locked = lock_volume_list();
-	my_volume->dl_Next = info->di_DevInfo;
-	info->di_DevInfo = MKBADDR(my_volume);
-	unlock_volume_list(locked);
-	volume_in_list = TRUE;
+	sync_volume();
 }
 
-// Take the volume out of the device list. Only when nothing holds a lock on
-// it: with locks, it stays listed with dl_Task = NULL, so DOS asks for the
-// volume (Retry/Cancel) when they are used.
+// Take the volume out of the device list once nothing holds a lock on it.
 void remove_volume_if_unused()
 {
-	if (my_volume == NULL || !volume_in_list || my_volume->dl_LockList != 0 || connected)
-		return;
-
-	struct RootNode *root = (struct RootNode *)DOSBase->dl_Root;
-	struct DosInfo *info = (struct DosInfo *)BADDR(root->rn_Info);
-	BPTR me = MKBADDR(my_volume);
-
-	BOOL locked = lock_volume_list();
-	if (info->di_DevInfo == me)
-		info->di_DevInfo = my_volume->dl_Next;
-	else
-	{
-		struct DeviceList *prev = (struct DeviceList *)BADDR(info->di_DevInfo);
-		while (prev != NULL && prev->dl_Next != me)
-			prev = (struct DeviceList *)BADDR(prev->dl_Next);
-		if (prev != NULL)
-			prev->dl_Next = my_volume->dl_Next;
-	}
-	unlock_volume_list(locked);
-	volume_in_list = FALSE;
+	sync_volume();
 }
 
-// Sent without waiting for it, so an input handler that waits on PI0: can't
-// deadlock the handler. If the previous event is still in progress, this one
-// is dropped (they are seconds apart; the next one gives the current state).
-void send_disk_event(UBYTE ie_class)
+// Disk events are sent without waiting for them, so an input handler that
+// waits on PI0: can't deadlock the handler. One event is kept until it can be
+// sent (the previous one is still in progress); a newer one replaces it, as
+// only the current state matters. The main loop calls flush_disk_event().
+void flush_disk_event()
 {
-	if (input_ior == NULL)
+	if (disk_event_pending == 0 || input_ior == NULL)
 		return;
 
 	if (input_busy)
@@ -818,7 +865,8 @@ void send_disk_event(UBYTE ie_class)
 	}
 
 	memset(&disk_ie, 0, sizeof(disk_ie));
-	disk_ie.ie_Class = ie_class;
+	disk_ie.ie_Class = disk_event_pending;
+	disk_event_pending = 0;
 
 	input_ior->io_Command = IND_WRITEEVENT;
 	input_ior->io_Data = &disk_ie;
@@ -826,6 +874,12 @@ void send_disk_event(UBYTE ie_class)
 	input_ior->io_Flags = 0;
 	SendIO((struct IORequest *)input_ior);
 	input_busy = TRUE;
+}
+
+void send_disk_event(UBYTE ie_class)
+{
+	disk_event_pending = ie_class;
+	flush_disk_event();
 }
 
 void startup_fs_handler(struct DosPacket *dp)
@@ -904,6 +958,75 @@ void startup_fs_handler(struct DosPacket *dp)
 }
 
 
+// A BCPL string from a response (which ends at end) into a FileInfoBlock field
+// of size bytes: the length byte and at most size - 1 characters (on V36+ DOS
+// makes it a C string in place), and a NUL after them if there is room.
+// Returns the length taken from the response, to find the next string in it.
+static int copy_bstr(char *dst, const char *src, int size, const char *end)
+{
+	int avail = end - src - 1;			// characters the response holds
+	int len = avail < 0 ? 0 : (unsigned char)src[0];
+	if (len > avail)
+		len = avail < 0 ? 0 : avail;
+	int n = len < size - 1 ? len : size - 1;
+	dst[0] = n;
+	memcpy(dst + 1, src + 1, n);
+	if (n + 1 < size)
+		dst[n + 1] = 0;
+	return len;
+}
+
+// The length of the last response (write_req_and_wait_for_res()).
+ULONG res_len = 0;
+
+// The smallest success response for each request type: a success with less is
+// not a real response.
+static ULONG min_success_len(short type)
+{
+	switch (type)
+	{
+	case ACTION_LOCATE_OBJECT:	return sizeof(struct LocateObjectResponse);
+	case ACTION_COPY_DIR:		return sizeof(struct CopyDirResponse);
+	case ACTION_PARENT:		return sizeof(struct ParentResponse);
+	case ACTION_CREATE_DIR:		return sizeof(struct CreateDirResponse);
+	case ACTION_FINDINPUT:
+	case ACTION_FINDOUTPUT:
+	case ACTION_FINDUPDATE:		return sizeof(struct FindXxxResponse);
+	case ACTION_READ:		return sizeof(struct ReadResponse);
+	case ACTION_WRITE:		return sizeof(struct WriteResponse);
+	case ACTION_SEEK:		return sizeof(struct SeekResponse);
+	case ACTION_INFO:		return sizeof(struct InfoResponse);
+	case ACTION_DISK_INFO:		return sizeof(struct DiskInfoResponse);
+	case ACTION_EXAMINE_OBJECT:
+	case ACTION_EXAMINE_NEXT:
+	case ACTION_EXAMINE_FH:		return offsetof(struct ExamineObjectResponse, data) + 2;	// two lengths
+	default:			return sizeof(struct FreeLockResponse);
+	}
+}
+
+// The name and the comment of an EXAMINE response must both lie within the
+// bytes received (min_success_len() guarantees the name's length byte).
+static BOOL examine_strings_ok(const char *data)
+{
+	int name = data - request_buffer;
+	int comment = name + 1 + (unsigned char)data[0];
+	return comment < (int)res_len &&
+	       comment + 1 + (unsigned char)request_buffer[comment] <= (int)res_len;
+}
+
+// A request with names must fit the request buffer; DOS names can be up to 255
+// bytes each. TRUE (and the packet replied) if it does not.
+static BOOL request_too_long(struct DosPacket *dp, int len)
+{
+	if (len <= REQ_RES_BUF_SIZE)
+		return FALSE;
+	dbg("Request of $l bytes does not fit the buffer; refused\n", (ULONG)len);
+	dp->dp_Res1 = DOSFALSE;
+	dp->dp_Res2 = ERROR_INVALID_COMPONENT_NAME;
+	reply_packet(dp);
+	return TRUE;
+}
+
 // Every response starts with has_response, success, error_code.
 static void fail_response(short error_code)
 {
@@ -913,6 +1036,16 @@ static void fail_response(short error_code)
 	res->has_response = 1;
 	res->success = 0;
 	res->error_code = error_code;
+}
+
+// A response that can't be right is a link failure: the old stream is reset,
+// the volume dropped, and the caller gets ERROR_NO_DISK.
+static void bad_response()
+{
+	if (a314_open)
+		reset_socket(FALSE);
+	go_offline();
+	fail_response(ERROR_NO_DISK);
 }
 
 // Send the request in request_buffer and wait for the response. If the Pi is
@@ -939,34 +1072,52 @@ BOOL write_req_and_wait_for_res(int len)
 	a314_msg[0] = request_buffer_address;
 	a314_msg[1] = len;
 
+	short type = ((struct FreeLockRequest *)request_buffer)->type;	// all requests start so
+
 	LONG err = a314_cmd_timed(A314_WRITE, (char *)&a314_msg[0], 8, REQ_TIMEOUT_SECS);
 	if (err == A314_WRITE_OK)
 		err = a314_cmd_timed(A314_READ, (char *)&a314_msg[1], 4, REQ_TIMEOUT_SECS);
 
+	// The request set is only looked at after a READ that completed: after a
+	// timeout it may have been abandoned (reset_socket()).
 	// The response length: at least has_response, success and error_code, and
 	// no more than the buffer (unsigned, so a bad value can't pass as negative).
-	ULONG res_len = a314_msg[1];
-	if (err == A314_READ_OK && a314_ior->a314_Length == 4 &&
-	    (res_len < sizeof(struct FreeLockResponse) || res_len > REQ_RES_BUF_SIZE))
+	res_len = 0;
+	if (err == A314_READ_OK)
 	{
-		dbg("Bad response length $l\n", res_len);
-		err = A314_READ_RESET;
+		res_len = a314_msg[1];
+		if (a314_ior->a314_Length != 4 ||
+		    res_len < sizeof(struct FreeLockResponse) || res_len > REQ_RES_BUF_SIZE)
+		{
+			dbg("Bad response ($l bytes, length $l)\n", (ULONG)a314_ior->a314_Length, res_len);
+			err = A314_READ_RESET;
+		}
 	}
 
-	if (err != A314_READ_OK || a314_ior->a314_Length != 4)
+	if (err != A314_READ_OK)
 	{
 		// A timeout has reset the socket already. Anything else (a reset or
 		// EOS from the Pi, a short read) may leave it open on one side or the
 		// other: reset it, or the old stream would stay behind.
-		if (err != LINK_TIMEOUT && a314_open)
-			reset_socket(FALSE);
-		go_offline();
-		fail_response(ERROR_NO_DISK);
+		if (err == LINK_TIMEOUT)
+		{
+			go_offline();
+			fail_response(ERROR_NO_DISK);
+		}
+		else
+			bad_response();
 		return FALSE;
 	}
 
 	if (!request_buffer_in_a314_memory)
 		ReadMemA314(request_buffer, request_buffer_address, res_len);
+
+	if (((struct FreeLockResponse *)request_buffer)->success && res_len < min_success_len(type))
+	{
+		dbg("Short success response ($l bytes) for type $l\n", res_len, (ULONG)type);
+		bad_response();
+		return FALSE;
+	}
 	return TRUE;
 }
 
@@ -1007,6 +1158,8 @@ void action_locate_object(struct DosPacket *dp)
 	req->mode = mode;
 
 	int nlen = *name;
+	if (request_too_long(dp, sizeof(struct LocateObjectRequest) + nlen))
+		return;
 	memcpy(req->name, name, nlen + 1);
 
 	write_req_and_wait_for_res(sizeof(struct LocateObjectRequest) + nlen);
@@ -1179,6 +1332,12 @@ void action_examine_object(struct DosPacket *dp)
 	write_req_and_wait_for_res(sizeof(struct ExamineObjectRequest));
 
 	struct ExamineObjectResponse *res = (struct ExamineObjectResponse *)request_buffer;
+	if (res->success && !examine_strings_ok(res->data))
+	{
+		dbg("  Malformed EXAMINE response\n");
+		bad_response();		// a link failure: the response is now the local one
+		res = (struct ExamineObjectResponse *)request_buffer;
+	}
 	if (!res->success)
 	{
 		dbg("  Failed, error code $l\n", (LONG)res->error_code);
@@ -1187,13 +1346,9 @@ void action_examine_object(struct DosPacket *dp)
 	}
 	else
 	{
-		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
-
-		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		const char *end = request_buffer + res_len;
+		int nlen = copy_bstr(fib->fib_FileName, &res->data[0], sizeof(fib->fib_FileName), end);
+		copy_bstr(fib->fib_Comment, &res->data[1 + nlen], sizeof(fib->fib_Comment), end);
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
@@ -1230,6 +1385,12 @@ void action_examine_next(struct DosPacket *dp)
 	write_req_and_wait_for_res(sizeof(struct ExamineNextRequest));
 
 	struct ExamineNextResponse *res = (struct ExamineNextResponse *)request_buffer;
+	if (res->success && !examine_strings_ok(res->data))
+	{
+		dbg("  Malformed EXAMINE response\n");
+		bad_response();		// a link failure: the response is now the local one
+		res = (struct ExamineNextResponse *)request_buffer;
+	}
 	if (!res->success)
 	{
 		dbg("  Failed, error code $l\n", (LONG)res->error_code);
@@ -1238,13 +1399,9 @@ void action_examine_next(struct DosPacket *dp)
 	}
 	else
 	{
-		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
-
-		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		const char *end = request_buffer + res_len;
+		int nlen = copy_bstr(fib->fib_FileName, &res->data[0], sizeof(fib->fib_FileName), end);
+		copy_bstr(fib->fib_Comment, &res->data[1 + nlen], sizeof(fib->fib_Comment), end);
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
@@ -1280,6 +1437,12 @@ void action_examine_fh(struct DosPacket *dp)
 	write_req_and_wait_for_res(sizeof(struct ExamineFhRequest));
 
 	struct ExamineFhResponse *res = (struct ExamineFhResponse *)request_buffer;
+	if (res->success && !examine_strings_ok(res->data))
+	{
+		dbg("  Malformed EXAMINE response\n");
+		bad_response();		// a link failure: the response is now the local one
+		res = (struct ExamineFhResponse *)request_buffer;
+	}
 	if (!res->success)
 	{
 		dbg("  Failed, error code $l\n", (LONG)res->error_code);
@@ -1288,13 +1451,9 @@ void action_examine_fh(struct DosPacket *dp)
 	}
 	else
 	{
-		int nlen = (unsigned char)(res->data[0]);
-		memcpy(fib->fib_FileName, res->data, nlen + 1);
-		fib->fib_FileName[nlen + 1] = 0;
-
-		int clen = (unsigned char)(res->data[nlen + 1]);
-		memcpy(fib->fib_Comment, &(res->data[nlen + 1]), clen + 1);
-		fib->fib_Comment[clen + 1] = 0;
+		const char *end = request_buffer + res_len;
+		int nlen = copy_bstr(fib->fib_FileName, &res->data[0], sizeof(fib->fib_FileName), end);
+		copy_bstr(fib->fib_Comment, &res->data[1 + nlen], sizeof(fib->fib_Comment), end);
 
 		fib->fib_DiskKey = res->disk_key;
 		fib->fib_DirEntryType = res->entry_type;
@@ -1336,6 +1495,8 @@ void action_findxxx(struct DosPacket *dp)
 	req->key = lock == NULL ? 0 : lock->fl_Key;
 
 	int nlen = *name;
+	if (request_too_long(dp, sizeof(struct FindXxxRequest) + nlen))
+		return;
 	memcpy(req->name, name, nlen + 1);
 
 	write_req_and_wait_for_res(sizeof(struct FindXxxRequest) + nlen);
@@ -1426,6 +1587,17 @@ void action_read(struct DosPacket *dp)
 			return;
 		}
 
+		if (res->actual < 0 || res->actual > to_read)
+		{
+			// More than asked for would overrun the caller's buffer.
+			dbg("  Bad READ result $l for $l\n", (LONG)res->actual, (LONG)to_read);
+			bad_response();
+			dp->dp_Res1 = -1;
+			dp->dp_Res2 = ERROR_NO_DISK;
+			reply_packet(dp);
+			return;
+		}
+
 		if (res->actual)
 		{
 			ReadMemA314(dst, data_buffer_address, res->actual);
@@ -1477,6 +1649,16 @@ void action_write(struct DosPacket *dp)
 			dbg("  Failed, error code $l\n", (LONG)res->error_code);
 			dp->dp_Res1 = total_written != 0 ? total_written : -1;	// Write() is -1 on error
 			dp->dp_Res2 = res->error_code;
+			reply_packet(dp);
+			return;
+		}
+
+		if (res->actual < 0 || res->actual > to_write)
+		{
+			dbg("  Bad WRITE result $l for $l\n", (LONG)res->actual, (LONG)to_write);
+			bad_response();
+			dp->dp_Res1 = total_written != 0 ? total_written : -1;
+			dp->dp_Res2 = ERROR_NO_DISK;
 			reply_packet(dp);
 			return;
 		}
@@ -1570,6 +1752,8 @@ void action_delete_object(struct DosPacket *dp)
 	req->key = lock == NULL ? 0 : lock->fl_Key;
 
 	int nlen = *name;
+	if (request_too_long(dp, sizeof(struct DeleteObjectRequest) + nlen))
+		return;
 	memcpy(req->name, name, nlen + 1);
 
 	write_req_and_wait_for_res(sizeof(struct DeleteObjectRequest) + nlen);
@@ -1611,6 +1795,8 @@ void action_rename_object(struct DosPacket *dp)
 
 	int nlen = *name;
 	int nnlen = *new_name;
+	if (request_too_long(dp, sizeof(struct RenameObjectRequest) + nlen + nnlen))
+		return;
 
 	req->name_len = nlen;
 	req->new_name_len = nnlen;
@@ -1653,6 +1839,8 @@ void action_create_dir(struct DosPacket *dp)
 	req->key = lock == NULL ? 0 : lock->fl_Key;
 
 	int nlen = *name;
+	if (request_too_long(dp, sizeof(struct CreateDirRequest) + nlen))
+		return;
 	memcpy(req->name, name, nlen + 1);
 
 	write_req_and_wait_for_res(sizeof(struct CreateDirRequest) + nlen);
@@ -1694,6 +1882,8 @@ void action_set_protect(struct DosPacket *dp)
 	req->mask = mask;
 
 	int nlen = *name;
+	if (request_too_long(dp, sizeof(struct SetProtectRequest) + nlen))
+		return;
 	memcpy(req->name, name, nlen + 1);
 
 	write_req_and_wait_for_res(sizeof(struct SetProtectRequest) + nlen);
@@ -1732,6 +1922,8 @@ void action_set_comment(struct DosPacket *dp)
 
 	int nlen = *name;
 	int clen = *comment;
+	if (request_too_long(dp, sizeof(struct SetCommentRequest) + nlen + clen))
+		return;
 
 	req->name_len = nlen;
 	req->comment_len = clen;
@@ -2113,10 +2305,14 @@ void start(__reg("a0") struct DosPacket *startup_packet)
 	while (1)
 	{
 		ULONG a314_sig = a314_open ? (1UL << a314_mp->mp_SigBit) : 0;
-		Wait(mp_sig | retry_sig | a314_sig);
+		ULONG input_sig = (disk_event_pending && input_busy) ? (1UL << input_mp->mp_SigBit) : 0;
+		Wait(mp_sig | retry_sig | a314_sig | input_sig | abandoned_sigs());
 
 		poll_connection();
 		reap_abandoned();
+		if (volume_sync_pending)
+			sync_volume();
+		flush_disk_event();
 
 		struct StandardPacket *sp;
 		while ((sp = (struct StandardPacket *)GetMsg(mp)) != NULL)

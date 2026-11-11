@@ -11,6 +11,7 @@ import os
 import struct
 import glob
 import collections
+import hashlib
 import logging
 import json
 import shutil
@@ -45,11 +46,13 @@ MSG_RESET               = 13
 # Bytes received from a314d that do not make a whole message yet.
 rx_buf = bytearray()
 
+class DaemonLost(Exception):
+    """The connection to a314d closed."""
+
 def recv_more():
     data = drv.recv(65536)
     if not data:
-        logger.error('Connection to a314d was closed, terminating.')
-        exit(-1)
+        raise DaemonLost()
     rx_buf.extend(data)
 
 def take_msg():
@@ -278,17 +281,73 @@ class ObjectLock(object):
         self.mode = mode
         self.path = path
         self.entry_it = None
+        self.shown = {}         # the directory's names for the Amiga (dir_names())
 
 locks = {}
 
 next_key = 1
 
+# The longest name and comment a FileInfoBlock holds: fib_FileName[108] and
+# fib_Comment[80] take a length byte and the characters (DOS makes them C
+# strings in place).
+MAX_NAME_LEN    = 107
+MAX_COMMENT_LEN = 79
+
 def bcpl_string(s, maxlen):
-    # A length byte, then at most maxlen bytes: a FileInfoBlock holds 107 for
-    # a name and 79 for a comment, and a response must fit the Amiga's
-    # 256-byte request/response buffer. The length is counted after encoding.
+    # A length byte, then at most maxlen bytes. The length is counted after
+    # encoding, and the response must fit the Amiga's request/response buffer.
     b = s.encode('latin-1', 'ignore')[:maxlen]
     return bytes([len(b)]) + b
+
+def amiga_name_ok(name):
+    # A name the Amiga can see as it is: latin-1, short enough, and without
+    # ':' or '/', which AmigaDOS reads as a volume or directory separator.
+    if ':' in name or '/' in name:
+        return False
+    try:
+        return len(name.encode('latin-1')) <= MAX_NAME_LEN
+    except UnicodeEncodeError:
+        return False
+
+def stand_in(name, digits, suffix=''):
+    # For a name the Amiga can't show as it is: what fits of it (other
+    # characters, ':' and '/' as '_'), a '~', hex digits of a hash of the real
+    # name and an optional suffix, together never longer than MAX_NAME_LEN.
+    h = hashlib.sha1(name.encode('utf-8', 'surrogateescape')).hexdigest()[:digits]
+    shown = ''.join(c if ord(c) < 256 and c not in ':/' else '_' for c in name)
+    return shown[:MAX_NAME_LEN - 1 - len(h) - len(suffix)] + '~' + h + suffix
+
+def dir_names(path):
+    # Every entry of a directory -> the name the Amiga sees for it. Names it
+    # can show are kept; the others get a stand-in, with more hash digits until
+    # no other entry (case-insensitively, as AmigaDOS compares) has that name.
+    # Listing (EXAMINE) and lookup (find_path()) both use this, so a stand-in
+    # always leads to the same file.
+    entries = sorted(os.listdir(path))
+    shown = {}
+    taken = set(e.lower() for e in entries if amiga_name_ok(e))
+    for e in entries:
+        if amiga_name_ok(e):
+            shown[e] = e
+            continue
+        for digits in range(8, 41, 4):
+            name = stand_in(e, digits)
+            if name.lower() not in taken:
+                break
+        else:
+            n = 2
+            while name.lower() in taken:
+                name = stand_in(e, 32, '.' + str(n))
+                n += 1
+        taken.add(name.lower())
+        shown[e] = name
+    return shown
+
+def amiga_name(path, name):
+    # The name the Amiga sees for entry name of directory path.
+    if amiga_name_ok(name):
+        return name
+    return dir_names(path).get(name, stand_in(name, 8))
 
 def get_key():
     global next_key
@@ -333,6 +392,13 @@ def find_path(key, name):
                     cp = cp + (e,)
                     found = True
                     break
+            if not found:
+                # A stand-in for a name the Amiga can't show (dir_names()).
+                for e, shown in dir_names(p).items():
+                    if shown != e and comp.lower() == shown.lower():
+                        cp = cp + (e,)
+                        found = True
+                        break
             if not found:
                 if len(name) == 0:
                     cp = cp + (comp,)
@@ -441,7 +507,7 @@ def process_examine_object(key):
         fn = 'PiDisk'
         path = '.'
     else:
-        fn = ol.path[-1]
+        fn = amiga_name('/'.join(ol.path[:-1]) or '.', ol.path[-1])
         path = '/'.join(ol.path)
 
     days, mins, ticks = mtime_to_dmt(os.path.getmtime(path))
@@ -454,10 +520,11 @@ def process_examine_object(key):
         size = 0
         type_ = ST_USERDIR
         ol.entry_it = os.scandir(path)
+        ol.shown = dir_names(path)
 
     size = min(size, 2 ** 31 - 1)
-    fn = bcpl_string(fn, 107)
-    comment = bcpl_string(comment, 79)
+    fn = bcpl_string(fn, MAX_NAME_LEN)
+    comment = bcpl_string(comment, MAX_COMMENT_LEN)
     return struct.pack('>HHHhIIIII', 1, 0, 666, type_, size, protection, days, mins, ticks) + fn + comment
 
 def process_examine_next(key, disk_key):
@@ -481,8 +548,8 @@ def process_examine_next(key, disk_key):
     if not entry:
         return struct.pack('>HH', 0, ERROR_NO_MORE_ENTRIES)
 
-    fn = entry.name
-    path = ('/'.join(ol.path + (fn,)))
+    path = ('/'.join(ol.path + (entry.name,)))
+    fn = ol.shown.get(entry.name) or amiga_name(os.path.dirname(path) or '.', entry.name)
 
     days, mins, ticks = mtime_to_dmt(entry.stat().st_mtime)
     protection, comment = read_metadata(path)
@@ -495,15 +562,17 @@ def process_examine_next(key, disk_key):
         type_ = ST_USERDIR
 
     size = min(size, 2 ** 31 - 1)
-    fn = bcpl_string(fn, 107)
-    comment = bcpl_string(comment, 79)
+    fn = bcpl_string(fn, MAX_NAME_LEN)
+    comment = bcpl_string(comment, MAX_COMMENT_LEN)
     return struct.pack('>HHHhIIIII', 1, 0, disk_key, type_, size, protection, days, mins, ticks) + fn + comment
 
 def process_examine_fh(arg1):
     logger.debug('ACTION_EXAMINE_FH, arg1: %s', arg1)
 
-    fn = open_file_handles[arg1].f.name
-    path = os.path.realpath(fn)
+    opened = open_file_handles[arg1].f.name
+    path = os.path.realpath(opened)
+    # Its name (not a symlink target, not the path it was opened with).
+    fn = amiga_name(os.path.dirname(opened) or '.', os.path.basename(opened))
     days, mins, ticks = mtime_to_dmt(os.path.getmtime(path))
     protection, comment = read_metadata(path)
 
@@ -515,8 +584,8 @@ def process_examine_fh(arg1):
         type_ = ST_USERDIR
 
     size = min(size, 2 ** 31 - 1)
-    fn = bcpl_string(fn, 107)
-    comment = bcpl_string(comment, 79)
+    fn = bcpl_string(fn, MAX_NAME_LEN)
+    comment = bcpl_string(comment, MAX_COMMENT_LEN)
     return struct.pack('>HHHhIIIII', 1, 0, 666, type_, size, protection, days, mins, ticks) + fn + comment
 
 
@@ -884,73 +953,106 @@ try:
 except ValueError:
     idx = -1
 
-if idx != -1:
+def connect_to_a314d():
+    # Standalone: connect to a314d and register the service, trying again every
+    # second while a314d is not there. False if the registration is refused.
+    global drv
+    while True:
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(('localhost', 7110))
+            drv = sock
+            send_register_req(b'a314fs')
+            stream_id, ptype, payload = wait_for_msg()
+            return payload[0] == 1
+        except (OSError, DaemonLost):
+            if sock is not None:
+                sock.close()
+            del rx_buf[:]
+            time.sleep(1)
+
+ondemand = idx != -1
+if ondemand:
     fd = int(sys.argv[idx + 1])
     drv = socket.socket(fileno=fd)
-else:
-    drv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    drv.connect(('localhost', 7110))
-
-    send_register_req(b'a314fs')
-    stream_id, ptype, payload = wait_for_msg()
-    if payload[0] != 1:
-        logger.error('Unable to register service a314fs, shutting down')
-        drv.close()
-        done = True
+elif not connect_to_a314d():
+    logger.error('Unable to register service a314fs, shutting down')
+    drv.close()
+    done = True
 
 if not done:
     os.chdir(SHARED_DIRECTORY)
     logger.info('a314fs is running, shared directory: %s', SHARED_DIRECTORY)
 
 while not done:
-    stream_id, ptype, payload = next_msg()
+    try:
+        stream_id, ptype, payload = next_msg()
 
-    if ptype == MSG_CONNECT:
-        if payload == b'a314fs':
-            if current_stream_id is not None:
-                send_reset(current_stream_id)
-            drop_stream_state()
-            current_stream_id = stream_id
-            send_connect_response(stream_id, 0)
-        else:
-            send_connect_response(stream_id, 3)
-    elif ptype == MSG_DATA:
-        if stream_id != current_stream_id:
-            logger.debug('Ignoring DATA for stream %d (not the current stream)', stream_id)
-            continue
-        address, length = struct.unpack('>II', payload)
-        try:
-            req = read_mem(address + 2, length - 2)
+        if ptype == MSG_CONNECT:
+            if payload == b'a314fs':
+                if current_stream_id is not None:
+                    send_reset(current_stream_id)
+                drop_stream_state()
+                current_stream_id = stream_id
+                send_connect_response(stream_id, 0)
+            else:
+                send_connect_response(stream_id, 3)
+        elif ptype == MSG_DATA:
+            if stream_id != current_stream_id:
+                logger.debug('Ignoring DATA for stream %d (not the current stream)', stream_id)
+                continue
+            address, length = struct.unpack('>II', payload)
             try:
-                res = process_request(req)
+                req = read_mem(address + 2, length - 2)
+                try:
+                    res = process_request(req)
+                except StreamReset:
+                    raise   # from read_mem()/write_mem() in ACTION_READ/WRITE
+                except Exception:
+                    # e.g. a lock or file key from before a reset: answer with an
+                    # error instead of exiting (the Amiga would lose PI0:).
+                    logger.exception('Request failed; answering with an error')
+                    res = struct.pack('>HH', 0, ERROR_INVALID_LOCK)
+                if len(res) + 2 > REQ_RES_BUF_SIZE:
+                    logger.error('Response of %d bytes does not fit the Amiga buffer', len(res))
+                    res = struct.pack('>HH', 0, ERROR_OBJECT_TOO_LARGE)
+                write_mem(address + 2, res)
             except StreamReset:
-                raise   # from read_mem()/write_mem() in ACTION_READ/WRITE
-            except Exception:
-                # e.g. a lock or file key from before a reset: answer with an
-                # error instead of exiting (the Amiga would lose PI0:).
-                logger.exception('Request failed; answering with an error')
-                res = struct.pack('>HH', 0, ERROR_INVALID_LOCK)
-            if len(res) + 2 > REQ_RES_BUF_SIZE:
-                logger.error('Response of %d bytes does not fit the Amiga buffer', len(res))
-                res = struct.pack('>HH', 0, ERROR_OBJECT_TOO_LARGE)
-            write_mem(address + 2, res)
-        except StreamReset:
-            logger.warning('Stream reset by the Amiga during a request; request dropped')
-            continue
-        send_data(stream_id, struct.pack('>I', len(res) + 2))
-    elif ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
-        # The answer to a request given up on after a reset.
-        if stale_mem_responses > 0:
-            stale_mem_responses -= 1
-        logger.debug('Ignoring a late memory response (request dropped after a reset)')
-    elif ptype == MSG_EOS:
-        if stream_id == current_stream_id:
-            logger.debug('Got EOS, stream closed')
-            send_eos(stream_id)
-            drop_stream_state()
-            current_stream_id = None
-    elif ptype == MSG_RESET:
-        if stream_id == current_stream_id:
-            logger.debug('Got RESET, stream closed')
-            drop_stream_state()
-            current_stream_id = None
+                logger.warning('Stream reset by the Amiga during a request; request dropped')
+                continue
+            send_data(stream_id, struct.pack('>I', len(res) + 2))
+        elif ptype in (MSG_READ_MEM_RES, MSG_WRITE_MEM_RES):
+            # The answer to a request given up on after a reset.
+            if stale_mem_responses > 0:
+                stale_mem_responses -= 1
+            logger.debug('Ignoring a late memory response (request dropped after a reset)')
+        elif ptype == MSG_EOS:
+            if stream_id == current_stream_id:
+                logger.debug('Got EOS, stream closed')
+                send_eos(stream_id)
+                drop_stream_state()
+                current_stream_id = None
+        elif ptype == MSG_RESET:
+            if stream_id == current_stream_id:
+                logger.debug('Got RESET, stream closed')
+                drop_stream_state()
+                current_stream_id = None
+    except (DaemonLost, OSError):
+        # a314d went away (it restarted, or closed us after a failed transfer):
+        # EOF, or an error sending to it. File errors in a request are caught
+        # above. An on-demand instance ends; a standalone one registers again.
+        if ondemand:
+            logger.error('Connection to a314d was closed, terminating.')
+            exit(-1)
+        logger.warning('Connection to a314d lost; registering again')
+        drv.close()
+        drop_stream_state()
+        pending_msgs.clear()
+        del rx_buf[:]
+        stale_mem_responses = 0
+        current_stream_id = None
+        if not connect_to_a314d():
+            logger.error('Unable to register service a314fs, shutting down')
+            drv.close()
+            done = True
