@@ -50,10 +50,20 @@ class DaemonLost(Exception):
     """The connection to a314d closed."""
 
 def recv_more():
-    data = drv.recv(65536)
+    try:
+        data = drv.recv(65536)
+    except OSError as e:
+        raise DaemonLost() from e
     if not data:
         raise DaemonLost()
     rx_buf.extend(data)
+
+def drv_send(m):
+    # A socket error is a lost a314d, not a file error in the request.
+    try:
+        drv.sendall(m)
+    except OSError as e:
+        raise DaemonLost() from e
 
 def take_msg():
     # The next whole message from rx_buf, or None.
@@ -75,11 +85,11 @@ def wait_for_msg():
 
 def send_register_req(name):
     m = struct.pack('=IIB', len(name), 0, MSG_REGISTER_REQ) + name
-    drv.sendall(m)
+    drv_send(m)
 
 def send_read_mem_req(address, length):
     m = struct.pack('=IIBII', 8, 0, MSG_READ_MEM_REQ, address, length)
-    drv.sendall(m)
+    drv_send(m)
 
 class StreamReset(Exception):
     """The Amiga reset the a314fs stream while a request was in progress."""
@@ -147,7 +157,7 @@ def read_mem(address, length):
 
 def send_write_mem_req(address, data):
     m = struct.pack('=IIBI', 4 + len(data), 0, MSG_WRITE_MEM_REQ, address) + data
-    drv.sendall(m)
+    drv_send(m)
 
 def write_mem(address, data):
     check_stream()
@@ -156,19 +166,19 @@ def write_mem(address, data):
 
 def send_connect_response(stream_id, result):
     m = struct.pack('=IIBB', 1, stream_id, MSG_CONNECT_RESPONSE, result)
-    drv.sendall(m)
+    drv_send(m)
 
 def send_data(stream_id, data):
     m = struct.pack('=IIB', len(data), stream_id, MSG_DATA) + data
-    drv.sendall(m)
+    drv_send(m)
 
 def send_eos(stream_id):
     m = struct.pack('=IIB', 0, stream_id, MSG_EOS)
-    drv.sendall(m)
+    drv_send(m)
 
 def send_reset(stream_id):
     m = struct.pack('=IIB', 0, stream_id, MSG_RESET)
-    drv.sendall(m)
+    drv_send(m)
 
 ACTION_NIL              = 0
 ACTION_GET_BLOCK        = 2
@@ -1007,7 +1017,7 @@ while not done:
                 req = read_mem(address + 2, length - 2)
                 try:
                     res = process_request(req)
-                except StreamReset:
+                except (StreamReset, DaemonLost):
                     raise   # from read_mem()/write_mem() in ACTION_READ/WRITE
                 except Exception:
                     # e.g. a lock or file key from before a reset: answer with an
