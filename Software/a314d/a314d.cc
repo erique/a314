@@ -1142,7 +1142,7 @@ static int init_driver()
         logger_warning("The spidev.bufsiz argument in /boot/cmdline.txt is set incorrectly, it should be 65536\n");
 
 #if defined(MODEL_TF)
-    const uint32_t limit = 12*1000*1000;   // tf4060v2 run-time clock switching: FPGA fabric down to ~50 MHz (was 25 MHz)
+    const uint32_t limit = 12*1000*1000;
     if (speed > limit)
     {
         speed = limit;
