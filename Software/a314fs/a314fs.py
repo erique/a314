@@ -850,9 +850,12 @@ def process_set_comment(key, name, comment):
 def process_same_lock(key1, key2):
     logger.debug('ACTION_SAME_LOCK, key1: %s key2: %s', key1, key2)
 
-    if not (key1 in locks and key2 in locks):
+    # Key 0 is a NULL lock: the root.
+    if not ((key1 == 0 or key1 in locks) and (key2 == 0 or key2 in locks)):
         return struct.pack('>HH', 0, LOCK_DIFFERENT)
-    elif locks[key1].path == locks[key2].path:
+    path1 = () if key1 == 0 else locks[key1].path
+    path2 = () if key2 == 0 else locks[key2].path
+    if path1 == path2:
         return struct.pack('>HH', 1, LOCK_SAME)
     else:
         return struct.pack('>HH', 0, LOCK_SAME_VOLUME)
