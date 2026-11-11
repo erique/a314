@@ -1965,8 +1965,8 @@ void action_same_lock(struct DosPacket *dp)
 	struct SameLockRequest *req = (struct SameLockRequest *)request_buffer;
 	req->has_response = 0;
 	req->type = dp->dp_Type;
-	req->key1 = lock1->fl_Key;
-	req->key2 = lock2->fl_Key;
+	req->key1 = lock1 == NULL ? 0 : lock1->fl_Key;
+	req->key2 = lock2 == NULL ? 0 : lock2->fl_Key;
 
 	write_req_and_wait_for_res(sizeof(struct SameLockRequest));
 
