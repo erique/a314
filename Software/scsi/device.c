@@ -125,6 +125,7 @@ struct Drive* make_drive(struct A314ScsiBase* base, UWORD number)
     d->blocksize = 512;
     d->blockshift = 9;
     NewList((struct List*)&d->changeints);
+    NewList((struct List*)&d->removeints);
 
     base->drives[number] = d;
 
@@ -343,9 +344,9 @@ static void notify_change(struct Drive* d)
         struct IOStdReq* ior = (struct IOStdReq*)n;
         Cause((struct Interrupt*)ior->io_Data);
     }
-    if (d->removeint)
+    for (struct MinNode* n = d->removeints.mlh_Head; n->mln_Succ; n = n->mln_Succ)
     {
-        Cause(d->removeint);
+        Cause(((struct RemoveInt*)n)->is);
     }
     Permit();
 }
@@ -563,6 +564,46 @@ void task_body(void)
 // Device vectors
 // ---------------------------------------------------------------------------
 
+// Set (is != NULL) or clear the TD_REMOVE interrupt of the opener with this
+// IORequest. FALSE: no memory.
+static BOOL set_remove_int(struct Drive* d, struct IORequest* ior, struct Interrupt* is)
+{
+    struct RemoveInt* fresh = NULL;
+    if (is)
+    {
+        fresh = (struct RemoveInt*)AllocMem(sizeof(struct RemoveInt), MEMF_PUBLIC | MEMF_CLEAR);
+        if (!fresh)
+        {
+            return FALSE;
+        }
+        fresh->ior = ior;
+        fresh->is = is;
+    }
+
+    Forbid();
+    struct RemoveInt* old = NULL;
+    for (struct MinNode* n = d->removeints.mlh_Head; n->mln_Succ; n = n->mln_Succ)
+    {
+        if (((struct RemoveInt*)n)->ior == ior)
+        {
+            old = (struct RemoveInt*)n;
+            Remove((struct Node*)n);
+            break;
+        }
+    }
+    if (fresh)
+    {
+        AddTail((struct List*)&d->removeints, (struct Node*)fresh);
+    }
+    Permit();
+
+    if (old)
+    {
+        FreeMem(old, sizeof(struct RemoveInt));
+    }
+    return TRUE;
+}
+
 static void begin_io(__reg("a6") struct A314ScsiBase* base,
                      __reg("a1") struct IOStdReq* ior)
 {
@@ -618,9 +659,13 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
         case TD_REMOVE:
         {
             struct Drive* d = (struct Drive*)ior->io_Unit;
-            if (d)
+            if (!d)
             {
-                d->removeint = (struct Interrupt*)ior->io_Data;
+                ior->io_Error = IOERR_BADADDRESS;
+            }
+            else if (!set_remove_int(d, (struct IORequest*)ior, (struct Interrupt*)ior->io_Data))
+            {
+                ior->io_Error = TDERR_NoMem;
             }
             break;
         }
@@ -712,6 +757,10 @@ static BPTR close(__reg("a6") struct A314ScsiBase* base,
     if (d && d->opencount)
     {
         d->opencount--;
+    }
+    if (d)
+    {
+        set_remove_int(d, (struct IORequest*)ior, NULL);
     }
 
     ior->io_Unit = NULL;
