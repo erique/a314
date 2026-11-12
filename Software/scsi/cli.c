@@ -108,6 +108,24 @@ static BOOL unique_name(struct Library* DOSBase, UBYTE* bname, UBYTE maxlen)
     return FALSE;
 }
 
+// Is this DeviceNode itself on the DOS list? DOS leaves the BootNodes it
+// mounted at boot on the MountList.
+static BOOL in_dos_list(struct Library* DOSBase, struct DeviceNode* dn)
+{
+    BOOL found = FALSE;
+    struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
+    while ((dl = NextDosEntry(dl, LDF_DEVICES)))
+    {
+        if ((struct DeviceNode*)dl == dn)
+        {
+            found = TRUE;
+            break;
+        }
+    }
+    UnLockDosList(LDF_DEVICES | LDF_READ);
+    return found;
+}
+
 int memcmp(const void* a, const void* b, size_t n)
 {
     const UBYTE* pa = (const UBYTE*)a;
@@ -165,6 +183,12 @@ void mount_boot_nodes(struct Library* ExpansionBase)
             UBYTE len = bname[0] < sizeof(name) ? bname[0] : sizeof(name) - 1;
             memcpy(name, &bname[1], len);
             name[len] = 0;
+
+            if (in_dos_list(DOSBase, dn))
+            {
+                kprintf("a314scsi: %s was mounted at boot\n", name);
+                continue;
+            }
 
             struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
             struct DosList* found = FindDosEntry(dl, (STRPTR)name, LDF_DEVICES);
