@@ -157,10 +157,12 @@ static void retire_device(struct Library* DOSBase, struct DeviceNode* dn)
     name[len] = ':';
     name[len + 1] = 0;
 
+    // The packets go to the handler's port: a volume may have the device's
+    // name, so looking the device up by name could find the volume instead.
     struct MsgPort* port = dn->dn_Task;
     if (port)
     {
-        if (!Inhibit((STRPTR)name, DOSTRUE))
+        if (!DoPkt(port, ACTION_INHIBIT, DOSTRUE, 0, 0, 0, 0))
         {
             kprintf("a314scsi: %s stays, not inhibited\n", name);
             return;
@@ -169,7 +171,7 @@ static void retire_device(struct Library* DOSBase, struct DeviceNode* dn)
         Delay(TICKS_PER_SECOND);
         if (handler_in_use(DOSBase, port) || !DoPkt(port, ACTION_DIE, 0, 0, 0, 0, 0))
         {
-            Inhibit((STRPTR)name, DOSFALSE);
+            DoPkt(port, ACTION_INHIBIT, DOSFALSE, 0, 0, 0, 0);
             kprintf("a314scsi: %s stays, its handler is in use or won't quit\n", name);
             return;
         }
@@ -284,6 +286,7 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
     }
 
     UWORD added = 0;
+    UWORD atboot = 0;
     for (UWORD i = 0; i < count; i++)
     {
         struct DeviceNode* dn = pending[i];
@@ -298,6 +301,7 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
             if (in_dos_list(DOSBase, dn))
             {
                 kprintf("a314scsi: %s was mounted at boot\n", name);
+                atboot++;
                 continue;
             }
 
@@ -328,7 +332,7 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
         CloseLibrary(DOSBase);
     }
 
-    kprintf("a314scsi: mounted %ld of %ld node(s)\n", (LONG)added, (LONG)count);
+    kprintf("a314scsi: mounted %ld of %ld node(s)\n", (LONG)added, (LONG)(count - atboot));
 
     ReleaseSemaphore(&base->mountsem);
 }
