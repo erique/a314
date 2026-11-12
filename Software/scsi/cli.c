@@ -143,9 +143,11 @@ int memcmp(const void* a, const void* b, size_t n)
 // Mount the partitions whose BootNodes are on the MountList. Each one is
 // detached under Forbid, then AddDosNode'd outside it (AddDosNode with
 // ADNF_STARTPROC creates a process), so running this again mounts nothing twice.
-// It must run in a process.
-void mount_boot_nodes(struct Library* ExpansionBase)
+// Runs are serialised by the device's mountsem. It must run in a process.
+void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
 {
+    ObtainSemaphore(&base->mountsem);
+
     struct DeviceNode* pending[MAX_PENDING];
     LONG pri[MAX_PENDING];
     UWORD count = 0;
@@ -217,6 +219,8 @@ void mount_boot_nodes(struct Library* ExpansionBase)
     }
 
     kprintf("a314scsi: mounted %ld node(s)\n", (LONG)count);
+
+    ReleaseSemaphore(&base->mountsem);
 }
 
 LONG cli_main(void)
@@ -259,7 +263,7 @@ LONG cli_main(void)
         return RETURN_FAIL;
     }
 
-    mount_boot_nodes(ExpansionBase);
+    mount_boot_nodes(ExpansionBase, (struct A314ScsiBase*)ior.io_Device);
 
     CloseDevice((struct IORequest*)&ior);
     DeletePort(port);

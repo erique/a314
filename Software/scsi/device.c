@@ -354,19 +354,21 @@ static void notify_change(struct Drive* d)
 // discovered. TRUE if partitions were added to the MountList.
 static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
 {
+    UBYTE bit = 1 << number;
     struct Drive* d = find_drive(base, number);
     if (!d)
     {
+        // Discovery takes the unit's UNIT ATTENTION.
         d = make_drive(base, number);
+        base->uaunits &= ~bit;
         return d && (d->flags & DRVF_PRESENT) && mount_drive(base, d);
     }
 
-    UBYTE bit = 1 << number;
     BOOL changed = (base->uaunits & bit) != 0;
-    base->uaunits &= ~bit;
-
     BOOL was = (d->flags & DRVF_PRESENT) != 0;
     UBYTE state = probe_medium(base, d, &changed);
+    // The probe took the UNIT ATTENTION, so the change is handled here once.
+    base->uaunits &= ~bit;
     if (state == MEDIUM_UNKNOWN)
     {
         if (changed)
@@ -391,10 +393,17 @@ static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
 // Entry of the process that mounts partitions found after DOS is running.
 static void mounter(void)
 {
+    Forbid();
+    struct A314ScsiBase* base = (struct A314ScsiBase*)FindName(&SysBase->DeviceList, (STRPTR)device_name);
+    Permit();
+
     struct Library* ExpansionBase = OpenLibrary((STRPTR)EXPANSIONNAME, 0);
+    if (base && ExpansionBase)
+    {
+        mount_boot_nodes(ExpansionBase, base);
+    }
     if (ExpansionBase)
     {
-        mount_boot_nodes(ExpansionBase);
         CloseLibrary(ExpansionBase);
     }
 }
@@ -755,6 +764,8 @@ static struct Library* init_device(__reg("a6") struct ExecBase* sys_base,
         base->configdev->cd_Rom.er_Type = ERTF_DIAGVALID;
         *(APTR*)&base->configdev->cd_Rom.er_Reserved0c = diag_area;
     }
+
+    InitSemaphore(&base->mountsem);
 
     BYTE sig = AllocSignal(-1);
     base->inittask = FindTask(NULL);
