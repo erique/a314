@@ -203,7 +203,7 @@ static void mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
 
     me->boot_node.bn_Node.ln_Type   = NT_BOOTNODE;
     me->boot_node.bn_Node.ln_Pri    = bootable ? (BYTE)bootpri : -128;
-    me->boot_node.bn_Node.ln_Name   = NULL;
+    me->boot_node.bn_Node.ln_Name   = (char*)base->configdev;
     me->boot_node.bn_DeviceNode     = (APTR)&me->dev_node;
 
     kprintf("a314scsi: mount partition (bootpri=%ld bootable=%ld)\n", bootpri, (ULONG)bootable);

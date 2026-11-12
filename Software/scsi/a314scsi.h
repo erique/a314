@@ -59,6 +59,7 @@ struct A314ScsiBase
     BPTR                    seglist;
 
     struct Drive*           drives[A314SCSI_MAX_DRIVES];
+    struct ConfigDev*       configdev;      // makes the BootNodes bootable (see romtag.asm)
 
     struct MsgPort*         reqport;        // command queue to the io task
     struct Task             iotask;         // embedded io task (tc_UserData -> base)
@@ -80,6 +81,9 @@ struct A314ScsiBase
     ULONG                   initsig;
     volatile UBYTE          started;
 };
+
+// romtag.asm
+extern UBYTE diag_area[];
 
 // device.c
 extern const char device_name[];
