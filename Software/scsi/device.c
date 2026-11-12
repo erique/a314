@@ -10,6 +10,9 @@
 
 #include <dos/dos.h>
 
+#include <libraries/configregs.h>
+#include <libraries/configvars.h>
+
 #include <proto/exec.h>
 
 #include <string.h>
@@ -510,6 +513,15 @@ static struct Library* init_device(__reg("a6") struct ExecBase* sys_base,
         UWORD negsize = base->device.dd_Library.lib_NegSize;
         FreeMem((UBYTE*)base - negsize, negsize + base->device.dd_Library.lib_PosSize);
         return NULL;
+    }
+
+    // A private ConfigDev, never added to the board list, whose DiagArea lets
+    // strap boot from our partitions. Without it they mount but can't boot.
+    base->configdev = (struct ConfigDev*)AllocMem(sizeof(struct ConfigDev), MEMF_PUBLIC | MEMF_CLEAR);
+    if (base->configdev)
+    {
+        base->configdev->cd_Rom.er_Type = ERTF_DIAGVALID;
+        *(APTR*)&base->configdev->cd_Rom.er_Reserved0c = diag_area;
     }
 
     BYTE sig = AllocSignal(-1);
