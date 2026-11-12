@@ -9,11 +9,15 @@
 #include <devices/scsidisk.h>
 
 #include <dos/dos.h>
+#include <dos/dostags.h>
+
+#include <libraries/expansion.h>
 
 #include <libraries/configregs.h>
 #include <libraries/configvars.h>
 
 #include <proto/exec.h>
+#include <proto/dos.h>
 
 #include <string.h>
 
@@ -296,6 +300,110 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
 // Processing task
 // ---------------------------------------------------------------------------
 
+// Seconds between connect/discovery attempts while no drive has been found.
+#define RESCAN_SECS 5
+
+// Connect if needed and probe every unit the host might serve; absent units
+// fail INQUIRY in make_drive() and are skipped. Partitions of the drives found
+// are added to the MountList. TRUE if any drive is known.
+static BOOL discover_drives(struct A314ScsiBase* base)
+{
+    if (!base->connected && !a314_connect(base))
+    {
+        return FALSE;
+    }
+
+    BOOL found = FALSE;
+    for (UWORD unit = 0; unit < A314SCSI_MAX_DRIVES; unit++)
+    {
+        struct Drive* d = make_drive(base, unit);
+        if (d)
+        {
+            mount_drive(base, d);
+            found = TRUE;
+        }
+    }
+    return found;
+}
+
+// Entry of the process that mounts partitions found after DOS is running.
+static void mounter(void)
+{
+    struct Library* ExpansionBase = OpenLibrary((STRPTR)EXPANSIONNAME, 0);
+    if (ExpansionBase)
+    {
+        mount_boot_nodes(ExpansionBase);
+        CloseLibrary(ExpansionBase);
+    }
+}
+
+// Drives found before DOS runs are mounted by DOS at boot, from the MountList.
+// Once DOS runs, nothing reads the MountList, so a process mounts them.
+static void start_mounter(void)
+{
+    Forbid();
+    BOOL dosup = FindName(&SysBase->LibList, (STRPTR)DOSNAME) != NULL;
+    Permit();
+    if (!dosup)
+    {
+        return;
+    }
+
+    struct Library* DOSBase = OpenLibrary((STRPTR)DOSNAME, 36);
+    if (!DOSBase)
+    {
+        return;
+    }
+
+    // Everything a process would take from its parent is given, as the io
+    // task is not one.
+    struct TagItem tags[] =
+    {
+        { NP_Entry,         (ULONG)mounter },
+        { NP_Name,          (ULONG)"a314scsi mount" },
+        { NP_StackSize,     TASK_STACK_SIZE },
+        { NP_Input,         0 },
+        { NP_CloseInput,    FALSE },
+        { NP_Output,        0 },
+        { NP_CloseOutput,   FALSE },
+        { NP_CurrentDir,    0 },
+        { NP_HomeDir,       0 },
+        { NP_ConsoleTask,   0 },
+        { NP_WindowPtr,     0 },
+        { NP_CopyVars,      FALSE },
+        { TAG_DONE,         0 },
+    };
+    if (!CreateNewProc(tags))
+    {
+        kprintf("a314scsi: CreateNewProc FAILED\n");
+    }
+
+    CloseLibrary(DOSBase);
+}
+
+static void start_rescan_timer(struct A314ScsiBase* base)
+{
+    base->rescantr.tr_node.io_Command = TR_ADDREQUEST;
+    base->rescantr.tr_time.tv_secs = RESCAN_SECS;
+    base->rescantr.tr_time.tv_micro = 0;
+    SendIO((struct IORequest*)&base->rescantr);
+    base->rescanpending = TRUE;
+}
+
+static void rescan(struct A314ScsiBase* base)
+{
+    kprintf("a314scsi: rescan\n");
+    base->drivesfound = discover_drives(base);
+    if (base->drivesfound)
+    {
+        start_mounter();
+    }
+    else
+    {
+        start_rescan_timer(base);
+    }
+}
+
 static void startup(struct A314ScsiBase* base)
 {
     kprintf("a314scsi: task startup\n");
@@ -310,19 +418,10 @@ static void startup(struct A314ScsiBase* base)
     // a314.device was opened in init_device's caller context (see init_device).
     // Here in the io task we only connect - the reply port must be owned by this
     // task, which does every subsequent A314 transaction.
-    if (!a314_connect(base))
+    base->drivesfound = discover_drives(base);
+    if (!base->drivesfound)
     {
-        kprintf("a314scsi: connect FAILED\n");
-        return;
-    }
-
-    // Probe every unit the host might serve; absent units fail INQUIRY in
-    // make_drive() and are simply skipped.
-    for (UWORD unit = 0; unit < A314SCSI_MAX_DRIVES; unit++)
-    {
-        struct Drive* d = make_drive(base, unit);
-        if (d)
-            mount_drive(base, d);
+        kprintf("a314scsi: no drives yet\n");
     }
 }
 
@@ -340,16 +439,35 @@ void task_body(void)
     if (!base->reqport)
         return; // startup failed; the device is unusable
 
+    // The rescan timer replies to a314port, which a314_connect() created.
+    ULONG waitmask = 1UL << base->reqport->mp_SigBit;
+    if (base->a314port)
+    {
+        waitmask |= 1UL << base->a314port->mp_SigBit;
+        base->rescantr = base->tmotr;
+        if (!base->drivesfound)
+        {
+            start_rescan_timer(base);
+        }
+    }
+
     for (;;)
     {
-        WaitPort(base->reqport);
-
         struct IOStdReq* ior;
         while ((ior = (struct IOStdReq*)GetMsg(base->reqport)))
         {
             process_request(base, ior);
             ReplyMsg(&ior->io_Message);
         }
+
+        if (base->rescanpending && CheckIO((struct IORequest*)&base->rescantr))
+        {
+            WaitIO((struct IORequest*)&base->rescantr);
+            base->rescanpending = FALSE;
+            rescan(base);
+        }
+
+        Wait(waitmask);
     }
 }
 
