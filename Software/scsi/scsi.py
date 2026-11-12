@@ -290,9 +290,13 @@ class ScsiService(object):
                 rl, _, _ = select.select([self.a314d], [], [], 10.0)
             except KeyboardInterrupt:
                 break
-            for s in rl:
-                if s == self.a314d:
-                    self.handle_a314d_readable()
+            try:
+                for s in rl:
+                    if s == self.a314d:
+                        self.handle_a314d_readable()
+            except ConnectionError:
+                logger.error('Connection to a314d lost, shutting down')
+                break
 
         self.a314d.close()
         logger.info('SCSI service stopped')
