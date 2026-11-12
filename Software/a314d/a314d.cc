@@ -524,8 +524,172 @@ static int check_spidev_bufsiz()
     return 0;
 }
 
+#if defined(MODEL_TF)
+// The TF4060 shares SCK/MOSI/MISO between this Pi (the A314 link, select on
+// GPIO7) and the FPGA's flash master, which reads the SPI ROM for the Amiga
+// (tf4060v2 #123). The FPGA takes the bus only while GPIO7 is idle, holds CE0
+// (GPIO8) low while it has it, and ignores GPIO7 meanwhile. So before every
+// transfer: wait for CE0 to be high, assert GPIO7, wait a moment (longer than
+// the FPGA's input synchroniser and its grant-to-CE0 delay), and check CE0
+// again: if the Amiga got the bus in that same instant, release GPIO7 and wait
+// for it. This needs the spi-a314 overlay that moves the kernel's chip select
+// off GPIO7; with an older overlay GPIO7 belongs to the kernel and only the
+// CE0 check before each transfer is left.
+//
+// The Pi's SPI block also drives SCLK (and MOSI) whenever the pins are in ALT0,
+// between transfers too, against the FPGA during the Amiga's flash reads. So
+// GPIO10/11 stay inputs (the overlay pulls SCLK down, MOSI up) and are switched
+// to ALT0 only while this Pi has the bus.
+#define TF_PIN_SEL      7
+#define TF_SEL_SETTLE_NS 2000
+#define TF_BUS_WAIT_SECS 5          // the Amiga holds CE0 longer only if it hung
+static int tf_sel_fd = -1;          // our select (GPIO7), -1 = the kernel has it
+static volatile uint32_t *tf_gpio = NULL;   // /dev/gpiomem: GPIO10/11 function
+static int init_gpio_irq();
+
+static int64_t elapsed_ns(const struct timespec *t0)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)(t.tv_sec - t0->tv_sec) * 1000000000LL + (t.tv_nsec - t0->tv_nsec);
+}
+
+static bool tf_ce0_low()
+{
+    gpio_v2_line_values v = { 0, (uint64_t)-1 };
+    if (gpio_irq_fd < 0 || ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &v))
+        return false;
+    return v.bits == 0;
+}
+
+static void tf_set_sel(bool on)
+{
+    gpio_v2_line_values v = { on ? 0ULL : 1ULL, 1 };   // active low
+    ioctl(tf_sel_fd, GPIO_V2_LINE_SET_VALUES_IOCTL, &v);
+}
+
+// GPFSEL1 bits 2:0 = GPIO10 (MOSI), bits 5:3 = GPIO11 (SCLK); ALT0 = 4
+static void tf_spi_pins(bool spi)
+{
+    if (!tf_gpio)
+        return;
+    uint32_t v = tf_gpio[1] & ~0x3fu;
+    if (spi)
+        v |= (4u << 0) | (4u << 3);
+    tf_gpio[1] = v;
+}
+
+static void init_tf_bus()
+{
+    // CE0 is read through the GPIO8 line, so request it before the first transfer
+    init_gpio_irq();
+
+    int chip_fd = open("/dev/gpiochip0", O_RDWR | O_CLOEXEC);
+    if (chip_fd >= 0)
+    {
+        struct gpio_v2_line_request req = {};
+        req.offsets[0] = TF_PIN_SEL;
+        strcpy(req.consumer, "a314d-sel");
+        req.config.flags = GPIO_V2_LINE_FLAG_OUTPUT;
+        req.config.num_attrs = 1;
+        req.config.attrs[0].attr.id = GPIO_V2_LINE_ATTR_ID_OUTPUT_VALUES;
+        req.config.attrs[0].attr.values = 1;    // idle (high)
+        req.config.attrs[0].mask = 1;
+        req.num_lines = 1;
+        if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) == 0)
+            tf_sel_fd = req.fd;
+        close(chip_fd);
+    }
+    if (tf_sel_fd < 0)
+        logger_warning("GPIO7 belongs to the kernel (old spi-a314 overlay?): no SPI bus handshake with the TF4060, only a CE0 check\n");
+    else
+        logger_info("SPI bus handshake on GPIO7 / CE0\n");
+
+    // the GPIO function registers are the BCM2835 layout up to the Pi 4 only
+    char compat[256] = {0};
+    int cfd = open("/proc/device-tree/compatible", O_RDONLY);
+    if (cfd >= 0)
+    {
+        ssize_t n = read(cfd, compat, sizeof(compat) - 1);
+        close(cfd);
+        for (ssize_t i = 0; i < n; i++)
+            if (!compat[i])
+                compat[i] = ' ';
+    }
+    if (strstr(compat, "bcm2712"))
+        logger_warning("Pi 5: SCLK/MOSI stay in ALT0 between transfers\n");
+    else
+    {
+        int fd = open("/dev/gpiomem", O_RDWR | O_SYNC | O_CLOEXEC);
+        if (fd >= 0)
+        {
+            void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            if (m != MAP_FAILED)
+                tf_gpio = (volatile uint32_t *)m;
+        }
+        if (!tf_gpio)
+            logger_warning("Unable to map /dev/gpiomem: SCLK/MOSI stay in ALT0 between transfers\n");
+    }
+    tf_spi_pins(false);
+}
+
+static void shutdown_tf_bus()
+{
+    tf_spi_pins(false);
+    if (tf_sel_fd >= 0)
+        tf_set_sel(false);
+}
+
+// Wait until this Pi may drive the SPI bus; false after TF_BUS_WAIT_SECS
+static bool tf_bus_acquire()
+{
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    useconds_t back = 10;
+    static bool warned = false;
+    for (;;)
+    {
+        if (!tf_ce0_low())
+        {
+            if (tf_sel_fd < 0)
+                return true;
+            tf_set_sel(true);
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            while (elapsed_ns(&ts) < TF_SEL_SETTLE_NS)
+                ;
+            if (!tf_ce0_low())
+            {
+                warned = false;
+                return true;
+            }
+            tf_set_sel(false);      // the Amiga got the bus in the same instant
+        }
+        if (elapsed_ns(&t0) > TF_BUS_WAIT_SECS * 1000000000LL)
+        {
+            if (!warned)
+                logger_warning("The TF4060 has held the SPI bus (CE0) for %d s\n", TF_BUS_WAIT_SECS);
+            warned = true;
+            return false;
+        }
+        usleep(back);
+        if (back < 1000)
+            back *= 2;
+    }
+}
+#endif
+
 static int spi_transfer(int len)
 {
+#if defined(MODEL_TF)
+    if (!tf_bus_acquire())
+    {
+        spi_error = true;
+        return -1;
+    }
+    tf_spi_pins(true);
+#endif
     struct spi_ioc_transfer tr =
     {
         .tx_buf = (uintptr_t)tx_buf,
@@ -538,6 +702,11 @@ static int spi_transfer(int len)
     };
 
     int r = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+#if defined(MODEL_TF)
+    tf_spi_pins(false);
+    if (tf_sel_fd >= 0)
+        tf_set_sel(false);
+#endif
     if (r < 0)
         spi_error = true;
     return r;
@@ -552,6 +721,46 @@ static int spi_protocol_version()
     logger_info("SPI protocol version = %d\n", rx_buf[SPI_PROTO_HDR_LEN]);
     return (int)rx_buf[SPI_PROTO_HDR_LEN];
 }
+
+#if defined(MODEL_TF)
+// Longest data part of one shared RAM transfer. The Amiga's flash access waits
+// while this Pi has the SPI bus (an access that does not poll for the grant is
+// held on the bus), so long reads and writes go in pieces of ~180 us at 12 MHz.
+#define TF_SPI_CHUNK 256
+static void spi_read_shm_rxbuf_one(unsigned int address, unsigned int length);
+static void spi_write_shm_one(unsigned int address, uint8_t *buf, unsigned int length);
+
+static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
+{
+    if (length <= TF_SPI_CHUNK)
+    {
+        spi_read_shm_rxbuf_one(address, length);
+        return;
+    }
+    static uint8_t data[sizeof(rx_buf)];
+    for (unsigned int off = 0; off < length; off += TF_SPI_CHUNK)
+    {
+        unsigned int n = std::min(length - off, (unsigned int)TF_SPI_CHUNK);
+        spi_read_shm_rxbuf_one(address + off, n);
+        if (spi_error)
+            return;
+        memcpy(&data[off], &rx_buf[READ_SRAM_HDR_LEN], n);
+    }
+    memcpy(&rx_buf[READ_SRAM_HDR_LEN], data, length);
+}
+
+static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int length)
+{
+    for (unsigned int off = 0; off < length; off += TF_SPI_CHUNK)
+    {
+        spi_write_shm_one(address + off, buf + off, std::min(length - off, (unsigned int)TF_SPI_CHUNK));
+        if (spi_error)
+            return;
+    }
+}
+#define spi_read_shm_rxbuf spi_read_shm_rxbuf_one
+#define spi_write_shm spi_write_shm_one
+#endif
 
 static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 {
@@ -571,6 +780,10 @@ static void spi_read_shm_rxbuf(unsigned int address, unsigned int length)
 
     spi_transfer(length + READ_SRAM_HDR_LEN);
 }
+
+#if defined(MODEL_TF)
+#undef spi_read_shm_rxbuf
+#endif
 
 static void spi_read_shm(unsigned char *data, unsigned int address, unsigned int length)
 {
@@ -595,6 +808,9 @@ static void spi_write_shm(unsigned int address, uint8_t *buf, unsigned int lengt
     memcpy(&tx_buf[3], buf, length);
     spi_transfer(length + 3);
 }
+#if defined(MODEL_TF)
+#undef spi_write_shm
+#endif
 
 #if defined(MODEL_TF)
 
@@ -1049,6 +1265,9 @@ static void shutdown_gpio()
 
 static int init_gpio_irq()
 {
+    if (gpio_irq_fd >= 0)
+        return 0;       // TF: already requested by init_tf_bus()
+
     int chip_fd = open("/dev/gpiochip0", O_RDWR);
     if (chip_fd < 0)
         return -1;
@@ -1150,6 +1369,7 @@ static int init_driver()
         speed = limit;
         logger_info("SPI speed limited to %d\n", speed);
     }
+    init_tf_bus();
 #endif
 
     spi_proto_ver = spi_protocol_version();
@@ -1187,6 +1407,8 @@ static void shutdown_driver()
     shutdown_gpio_irq();
 #if defined(MODEL_TD)
     shutdown_spi();
+#elif defined(MODEL_TF)
+    shutdown_tf_bus();      // SCLK/MOSI parked, GPIO7 idle
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     shutdown_gpio();
 #endif
