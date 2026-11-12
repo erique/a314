@@ -5,14 +5,17 @@
         compatible = "brcm,bcm2835";
 
         /*
-          GPIO8 (normally SPI0-CE0) is used when the ICE40 is bus master, accessing the ROM.
-          To not have conflicting pulls, we change the CE0 to use GPIO7 (normally SPI0-CE1) and CE1 to use GPIO25 instead (which isn't connected to anything).
-          This way '/dev/spidev0,0' can still be used by a314d and we also disable `/dev/spidev0,1` as an extra precaution.
+          GPIO8 (normally SPI0-CE0) is the ICE40's flash chip select: the FPGA drives it when it
+          reads the ROM for the Amiga. GPIO7 is the TF4060's A314 select. a314d drives GPIO7
+          itself for the SPI bus handshake with the FPGA (tf4060v2 #123), so the kernel's chip
+          selects go elsewhere: CE0 to GPIO26 (not connected on the TF4060 r5) and CE1 to GPIO25
+          as before (INT6CP on r5, through SJ1; kept driven high, inactive, as before).
+          '/dev/spidev0,0' is still the device a314d opens; `/dev/spidev0,1` stays disabled.
         */
         fragment@0 {
                 target = <&spi0_cs_pins>;
                 frag0: __overlay__ {
-                        brcm,pins = <7 25>;
+                        brcm,pins = <26 25>;
                 };
         };
 
@@ -26,7 +29,19 @@
         fragment@2 {
                 target = <&spi0>;
                 frag2: __overlay__ {
-                        cs-gpios = <&gpio 7 1>, <&gpio 25 1>;
+                        cs-gpios = <&gpio 26 1>, <&gpio 25 1>;
+                };
+        };
+
+        /*
+          a314d keeps SCLK and MOSI as inputs between its transfers (the Pi's SPI block drives
+          them whenever they are in ALT0): pull SCLK down to its idle level and MOSI up.
+          spi0_pins is GPIO 9 (MISO), 10 (MOSI), 11 (SCLK).
+        */
+        fragment@3 {
+                target = <&spi0_pins>;
+                frag3: __overlay__ {
+                        brcm,pull = <0 2 1>;
                 };
         };
 };
