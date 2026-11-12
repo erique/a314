@@ -236,6 +236,15 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     return TRUE;
 }
 
+// Was this DeviceNode made by mount_partition()?
+BOOL is_mount_entry(struct DeviceNode* dn)
+{
+    struct MountEntry* me = (struct MountEntry*)dn;
+    return dn->dn_Startup == MKBADDR(&me->fssm)
+        && me->fssm.fssm_Device == MKBADDR(me->exec_name)
+        && me->fssm.fssm_Environ == MKBADDR(me->env_vec);
+}
+
 // Free a partition that mount_partition() made and that is not mounted.
 void free_partition(struct DeviceNode* dn)
 {
