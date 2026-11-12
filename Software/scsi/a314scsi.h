@@ -8,14 +8,17 @@
 #include <exec/tasks.h>
 #include <exec/lists.h>
 #include <exec/libraries.h>
+#include <exec/interrupts.h>
 
 #include <dos/dos.h> // BPTR
 #include <dos/dosextens.h> // struct Process
+#include <dos/filehandler.h> // struct DeviceNode
 
 #include <devices/scsidisk.h> // struct SCSICmd
 #include <devices/timer.h> // struct timerequest
 
 #include "../a314device/a314.h" // struct A314_IORequest
+#include "a314scsi_protocol.h" // struct A314ScsiRes
 
 #define DEVICE_NAME "a314scsi.device"
 #define DEVICE_VERSION 1
@@ -35,6 +38,9 @@
 // Largest single a314 transfer == the a314-memory bounce buffer.
 #define A314SCSI_MAX_XFER (4UL * 1024)
 
+// Every unit is removable: the host's hdf can be removed or replaced.
+#define ALL_UNITS_MASK ((1UL << A314SCSI_MAX_DRIVES) - 1)
+
 // Drive flags.
 #define DRVF_PRESENT (1 << 0)
 #define DRVF_WRITEPROT (1 << 1)
@@ -51,6 +57,11 @@ struct Drive
     ULONG           blocksize;
     ULONG           blocks;         // total block count
     UBYTE           sense[24];      // last auto/request sense
+
+    // Medium changes (TD_CHANGENUM, TD_ADDCHANGEINT, TD_REMOVE)
+    ULONG           changecount;
+    struct MinList  changeints;     // TD_ADDCHANGEINT requests, io_Data = Interrupt
+    struct Interrupt* removeint;    // TD_REMOVE
 };
 
 struct A314ScsiBase
@@ -71,8 +82,11 @@ struct A314ScsiBase
 
     // a314 transport (opened and used only by the io task)
     struct MsgPort*         a314port;       // replies of a314ior, rstior and tmotr
-    struct A314_IORequest   a314ior;
-    struct A314_IORequest   rstior;         // resets the socket while a314ior is out
+    struct A314_IORequest   a314ior;        // CONNECT and WRITE
+    struct A314_IORequest   readior;        // the READ, outstanding while connected
+    struct A314_IORequest   rstior;         // resets the socket while others are out
+    struct A314ScsiRes      rbuf;           // what readior reads: a response or an event
+    UBYTE                   readpending;
     struct timerequest      tmotr;          // a314 request timeouts
     struct Library*         a314base;
     ULONG                   socket;
@@ -80,10 +94,14 @@ struct A314ScsiBase
     UBYTE                   connected;
     UBYTE                   stuck;          // a314.device stopped replying
 
-    // Background rescan while no drive has been found (the Pi was not up yet)
+    // Reconnect timer, running while the link is down
     struct timerequest      rescantr;
     UBYTE                   rescanpending;
-    UBYTE                   drivesfound;
+
+    // Units to ask about their medium: from host events (changedunits) and
+    // from UNIT ATTENTION seen on a command (uaunits)
+    UBYTE                   changedunits;
+    UBYTE                   uaunits;
 
     // io-task startup handshake back to init_device
     struct Task*            inittask;
@@ -109,13 +127,15 @@ LONG scsi_rw(struct A314ScsiBase* base, struct Drive* d, ULONG lba, ULONG blocks
 // a314hw.c
 BOOL a314_open_device(struct A314ScsiBase* base);
 BOOL a314_connect(struct A314ScsiBase* base);
+void a314_poll(struct A314ScsiBase* base);
 LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd);
 
 // cli.c
 void mount_boot_nodes(struct Library* ExpansionBase);
 
 // rdb.c
-void mount_drive(struct A314ScsiBase* base, struct Drive* d);
+BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d);
+void free_partition(struct DeviceNode* dn);
 
 // lseg.c
 BPTR load_seglist(struct A314ScsiBase* base, struct Drive* d, ULONG first_block);

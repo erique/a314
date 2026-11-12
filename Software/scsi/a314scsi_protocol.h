@@ -8,12 +8,18 @@
 // A SCSI CDB is tunneled to the host; bulk data is NOT inlined but moved
 // through a314 shared memory at 'address' (an a314-space address).
 //
+// The host also sends an event, unasked, when the medium of a unit may have
+// changed; the Amiga then asks that unit (TEST UNIT READY). Responses and
+// events arrive through the same, always outstanding, A314_READ.
+//
 // Python struct formats (host side):
 //   request : ">BBBB16sBBHII"  (32 bytes)
 //   response: ">BBBBBBHI"      (12 bytes)
+//   event   : ">BB10x"         (12 bytes)
 
-#define A314SCSI_CMD_REQ    1   // Amiga -> host
-#define A314SCSI_CMD_RES    2   // host  -> Amiga
+#define A314SCSI_CMD_REQ        1   // Amiga -> host
+#define A314SCSI_CMD_RES        2   // host  -> Amiga
+#define A314SCSI_EVT_CHANGED    3   // host  -> Amiga
 
 #define A314SCSI_DIR_NONE   0
 #define A314SCSI_DIR_READ   1   // device -> host: host writes data into a314 mem
@@ -47,6 +53,13 @@ struct A314ScsiRes
     UBYTE pad;           //                            @5
     UWORD reserved;      //                            @6
     ULONG actual_length; //                            @8
+}; // sizeof == 12
+
+struct A314ScsiEvent
+{
+    UBYTE kind;          // A314SCSI_EVT_CHANGED       @0
+    UBYTE unit;          // drive/unit number          @1
+    UBYTE pad[10];       //                            @2
 }; // sizeof == 12
 
 #pragma pack(pop)
