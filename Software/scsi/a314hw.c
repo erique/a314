@@ -109,6 +109,7 @@ BOOL a314_open_device(struct A314ScsiBase* base)
     }
 
     base->rstior = base->a314ior;
+    base->readior = base->a314ior;
 
     return TRUE;
 }
@@ -141,9 +142,14 @@ static BOOL wait_io_timed(struct A314ScsiBase* base, struct IORequest* io, ULONG
 }
 
 // Reset the socket from rstior, so neither side keeps it. a314.device then
-// replies a314ior too, if it is outstanding (iorpending).
+// replies a314ior too, if it is outstanding (iorpending), and readior.
 static void reset_socket(struct A314ScsiBase* base, BOOL iorpending)
 {
+    if (base->stuck)
+    {
+        return;
+    }
+
     base->rstior.a314_Request.io_Command = A314_RESET;
     base->rstior.a314_Request.io_Error = 0;
     base->rstior.a314_Socket = base->socket;
@@ -153,7 +159,9 @@ static void reset_socket(struct A314ScsiBase* base, BOOL iorpending)
 
     BOOL rstback = wait_io_timed(base, &base->rstior.a314_Request, RESET_TIMEOUT_SECS);
     BOOL iorback = !iorpending || wait_io_timed(base, &base->a314ior.a314_Request, RESET_TIMEOUT_SECS);
-    if (!rstback || !iorback)
+    BOOL readback = !base->readpending || wait_io_timed(base, &base->readior.a314_Request, RESET_TIMEOUT_SECS);
+    base->readpending = 0;
+    if (!rstback || !iorback || !readback)
     {
         // The requests may still be replied later, so they are never reused.
         kprintf("a314scsi: a314.device does not reply; link disabled\n");
@@ -187,6 +195,60 @@ static LONG a314_cmd(struct A314ScsiBase* base, UWORD command, APTR buffer, ULON
     return LINK_TIMEOUT;
 }
 
+static void arm_read(struct A314ScsiBase* base)
+{
+    base->readior.a314_Request.io_Command = A314_READ;
+    base->readior.a314_Request.io_Error = 0;
+    base->readior.a314_Socket = base->socket;
+    base->readior.a314_Buffer = (STRPTR)&base->rbuf;
+    base->readior.a314_Length = sizeof(base->rbuf);
+    SendIO(&base->readior.a314_Request);
+    base->readpending = 1;
+}
+
+// The link is lost (err is the failed request's io_Error). The socket is reset
+// unless the host already did (resetcode) or a timeout did, and readior is
+// collected either way.
+static void drop_link(struct A314ScsiBase* base, LONG err, LONG resetcode)
+{
+    kprintf("a314scsi: link lost err=%ld\n", err);
+    base->connected = 0;
+    if (base->stuck)
+    {
+        return;
+    }
+    if (err != resetcode && err != LINK_TIMEOUT)
+    {
+        reset_socket(base, FALSE);
+    }
+    else if (base->readpending)
+    {
+        if (wait_io_timed(base, &base->readior.a314_Request, RESET_TIMEOUT_SECS))
+        {
+            base->readpending = 0;
+        }
+        else
+        {
+            reset_socket(base, FALSE);
+        }
+    }
+}
+
+// Take what readior read. TRUE: it is a response, in rbuf.
+static BOOL take_packet(struct A314ScsiBase* base)
+{
+    if (base->rbuf.kind == A314SCSI_EVT_CHANGED)
+    {
+        struct A314ScsiEvent* e = (struct A314ScsiEvent*)&base->rbuf;
+        if (e->unit < A314SCSI_MAX_DRIVES)
+        {
+            base->changedunits |= 1 << e->unit;
+        }
+        return FALSE;
+    }
+    return base->rbuf.kind == A314SCSI_CMD_RES;
+}
+
 // Connect to the host 'scsi' service. Runs in the io task, which owns the reply
 // port used for this and every subsequent a314 request.
 BOOL a314_connect(struct A314ScsiBase* base)
@@ -199,6 +261,7 @@ BOOL a314_connect(struct A314ScsiBase* base)
             return FALSE;
         }
         base->a314ior.a314_Request.io_Message.mn_ReplyPort = base->a314port;
+        base->readior.a314_Request.io_Message.mn_ReplyPort = base->a314port;
         base->rstior.a314_Request.io_Message.mn_ReplyPort = base->a314port;
         base->tmotr.tr_node.io_Message.mn_ReplyPort = base->a314port;
     }
@@ -213,35 +276,76 @@ BOOL a314_connect(struct A314ScsiBase* base)
     }
 
     base->connected = 1;
+    arm_read(base);
+
+    // Events sent while disconnected are lost: ask every unit again.
+    base->changedunits = ALL_UNITS_MASK;
+
     kprintf("a314scsi: connected to 'scsi' (socket=%lx)\n", base->socket);
     return TRUE;
 }
 
-// One request/response round trip. On failure the link is marked down, and
-// the socket is reset unless the host or a timeout already did.
+// Take an event, or notice a lost link, while no command is running.
+void a314_poll(struct A314ScsiBase* base)
+{
+    if (!base->readpending || !CheckIO(&base->readior.a314_Request))
+    {
+        return;
+    }
+
+    WaitIO(&base->readior.a314_Request);
+    base->readpending = 0;
+
+    LONG err = base->readior.a314_Request.io_Error;
+    if (err != A314_READ_OK)
+    {
+        drop_link(base, err, A314_READ_RESET);
+        return;
+    }
+
+    take_packet(base);
+    arm_read(base);
+}
+
+// One request/response round trip. Events that arrive meanwhile are taken.
 static LONG a314_txn(struct A314ScsiBase* base, struct A314ScsiReq* req, struct A314ScsiRes* res)
 {
     LONG err = a314_cmd(base, A314_WRITE, req, sizeof(struct A314ScsiReq), REQ_TIMEOUT_SECS);
-    if (err == A314_WRITE_OK)
+    if (err != A314_WRITE_OK)
     {
-        err = a314_cmd(base, A314_READ, res, sizeof(struct A314ScsiRes), REQ_TIMEOUT_SECS);
-        if (err == A314_READ_OK)
+        drop_link(base, err, A314_WRITE_RESET);
+        return IOERR_ABORTED;
+    }
+
+    for (;;)
+    {
+        if (!wait_io_timed(base, &base->readior.a314_Request, REQ_TIMEOUT_SECS))
+        {
+            kprintf("a314scsi: response timed out\n");
+            reset_socket(base, FALSE);
+            base->connected = 0;
+            return IOERR_ABORTED;
+        }
+        base->readpending = 0;
+
+        err = base->readior.a314_Request.io_Error;
+        if (err != A314_READ_OK)
+        {
+            drop_link(base, err, A314_READ_RESET);
+            return IOERR_ABORTED;
+        }
+
+        BOOL isres = take_packet(base);
+        if (isres)
+        {
+            memcpy(res, &base->rbuf, sizeof(*res));
+        }
+        arm_read(base);
+        if (isres)
         {
             return 0;
         }
-        if (err != A314_READ_RESET && err != LINK_TIMEOUT)
-        {
-            reset_socket(base, FALSE);
-        }
     }
-    else if (err != A314_WRITE_RESET && err != LINK_TIMEOUT)
-    {
-        reset_socket(base, FALSE);
-    }
-
-    kprintf("a314scsi: txn err=%ld\n", err);
-    base->connected = 0;
-    return IOERR_ABORTED;
 }
 
 LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
@@ -335,6 +439,12 @@ LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
 
     if (res.scsi_status != SCSI_STATUS_GOOD)
     {
+        // The medium may have changed: the io task asks the unit again.
+        if ((res.sense_key & SCSI_SENSE_KEY_MASK) == SCSI_SK_UNIT_ATTENTION && d)
+        {
+            base->uaunits |= 1 << d->number;
+        }
+
         if (cmd->scsi_SenseData && cmd->scsi_SenseLength >= 14)
         {
             memset(cmd->scsi_SenseData, 0, cmd->scsi_SenseLength);

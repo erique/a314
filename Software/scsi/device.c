@@ -46,6 +46,52 @@ struct Drive* find_drive(struct A314ScsiBase* base, UWORD number)
     return base->drives[number];
 }
 
+// Medium state of a unit, from TEST UNIT READY.
+#define MEDIUM_PRESENT  0
+#define MEDIUM_ABSENT   1
+#define MEDIUM_UNKNOWN  2   // the link failed; nothing is known
+
+static BOOL sense_key_is(struct Drive* d, LONG err, UBYTE key)
+{
+    return err == HFERR_BadStatus && (d->sense[2] & SCSI_SENSE_KEY_MASK) == key;
+}
+
+// Ask the unit about its medium and update DRVF_PRESENT, the capacity and
+// DRVF_WRITEPROT. *changed is set if the unit reported a medium change.
+static UBYTE probe_medium(struct A314ScsiBase* base, struct Drive* d, BOOL* changed)
+{
+    // UNIT ATTENTION is reported once per change; the next try then tells
+    // whether a medium is there.
+    LONG err = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        err = scsi_test_ready(base, d);
+        if (!sense_key_is(d, err, SCSI_SK_UNIT_ATTENTION))
+        {
+            break;
+        }
+        *changed = TRUE;
+    }
+
+    if (err == HFERR_BadStatus)
+    {
+        d->flags &= ~(DRVF_PRESENT | DRVF_WRITEPROT);
+        return MEDIUM_ABSENT;
+    }
+    if (err || scsi_read_capacity(base, d) != 0)
+    {
+        return MEDIUM_UNKNOWN;
+    }
+
+    d->flags &= ~DRVF_WRITEPROT;
+    scsi_mode_sense_wp(base, d);
+    d->flags |= DRVF_PRESENT;
+
+    kprintf("a314scsi: unit %ld blocks=%ld bs=%ld\n", (ULONG)d->number, d->blocks, d->blocksize);
+    return MEDIUM_PRESENT;
+}
+
+// Is there a unit at this number? Its medium may still be absent.
 static BOOL discover_drive(struct A314ScsiBase* base, struct Drive* d)
 {
     kprintf("a314scsi: discover unit %ld\n", (ULONG)d->number);
@@ -58,28 +104,8 @@ static BOOL discover_drive(struct A314ScsiBase* base, struct Drive* d)
 
     kprintf("a314scsi: INQUIRY type=%ld\n", (ULONG)d->devtype);
 
-    // A few TEST UNIT READY tries in case the medium needs a moment;
-    // the a314 round-trip itself paces the retries.
-    for (int i = 0; i < 5; i++)
-    {
-        if (scsi_test_ready(base, d) == 0)
-        {
-            break;
-        }
-    }
-
-    if (scsi_read_capacity(base, d) != 0)
-    {
-        kprintf("a314scsi: READ CAPACITY failed\n");
-        return FALSE;
-    }
-
-    scsi_mode_sense_wp(base, d);
-
-    d->flags |= DRVF_PRESENT;
-
-    kprintf("a314scsi: unit %ld blocks=%ld bs=%ld\n", (ULONG)d->number, d->blocks, d->blocksize);
-
+    BOOL changed = FALSE;
+    probe_medium(base, d, &changed);
     return TRUE;
 }
 
@@ -98,6 +124,7 @@ struct Drive* make_drive(struct A314ScsiBase* base, UWORD number)
     d->number = number;
     d->blocksize = 512;
     d->blockshift = 9;
+    NewList((struct List*)&d->changeints);
 
     base->drives[number] = d;
 
@@ -209,6 +236,8 @@ static const UWORD nsd_supported[] =
     TD_CHANGENUM,
     TD_CHANGESTATE,
     TD_PROTSTATUS,
+    TD_ADDCHANGEINT,
+    TD_REMCHANGEINT,
     TD_GETGEOMETRY,
     TD_READ64,
     TD_WRITE64,
@@ -300,30 +329,63 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
 // Processing task
 // ---------------------------------------------------------------------------
 
-// Seconds between connect/discovery attempts while no drive has been found.
+// Seconds between reconnect attempts while the link is down.
 #define RESCAN_SECS 5
 
-// Connect if needed and probe every unit the host might serve; absent units
-// fail INQUIRY in make_drive() and are skipped. Partitions of the drives found
-// are added to the MountList. TRUE if any drive is known.
-static BOOL discover_drives(struct A314ScsiBase* base)
+// Tell everyone who asked (TD_ADDCHANGEINT, TD_REMOVE) that the medium changed.
+static void notify_change(struct Drive* d)
 {
-    if (!base->connected && !a314_connect(base))
+    d->changecount++;
+
+    Forbid();
+    for (struct MinNode* n = d->changeints.mlh_Head; n->mln_Succ; n = n->mln_Succ)
+    {
+        struct IOStdReq* ior = (struct IOStdReq*)n;
+        Cause((struct Interrupt*)ior->io_Data);
+    }
+    if (d->removeint)
+    {
+        Cause(d->removeint);
+    }
+    Permit();
+}
+
+// Bring a unit up to date with its medium. A unit seen for the first time is
+// discovered. TRUE if partitions were added to the MountList.
+static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
+{
+    struct Drive* d = find_drive(base, number);
+    if (!d)
+    {
+        d = make_drive(base, number);
+        return d && (d->flags & DRVF_PRESENT) && mount_drive(base, d);
+    }
+
+    UBYTE bit = 1 << number;
+    BOOL changed = (base->uaunits & bit) != 0;
+    base->uaunits &= ~bit;
+
+    BOOL was = (d->flags & DRVF_PRESENT) != 0;
+    UBYTE state = probe_medium(base, d, &changed);
+    if (state == MEDIUM_UNKNOWN)
+    {
+        if (changed)
+        {
+            base->uaunits |= bit;
+        }
+        return FALSE;
+    }
+
+    BOOL now = state == MEDIUM_PRESENT;
+    if (now == was && !changed)
     {
         return FALSE;
     }
 
-    BOOL found = FALSE;
-    for (UWORD unit = 0; unit < A314SCSI_MAX_DRIVES; unit++)
-    {
-        struct Drive* d = make_drive(base, unit);
-        if (d)
-        {
-            mount_drive(base, d);
-            found = TRUE;
-        }
-    }
-    return found;
+    kprintf("a314scsi: unit %ld medium %s\n", (ULONG)number, now ? "changed" : "removed");
+    d->flags &= ~DRVF_MOUNTED;
+    notify_change(d);
+    return now && mount_drive(base, d);
 }
 
 // Entry of the process that mounts partitions found after DOS is running.
@@ -390,17 +452,26 @@ static void start_rescan_timer(struct A314ScsiBase* base)
     base->rescanpending = TRUE;
 }
 
-static void rescan(struct A314ScsiBase* base)
+// Ask the units the host or a UNIT ATTENTION pointed at. Partitions found
+// once DOS runs are mounted by a process (see start_mounter).
+static void process_changes(struct A314ScsiBase* base)
 {
-    kprintf("a314scsi: rescan\n");
-    base->drivesfound = discover_drives(base);
-    if (base->drivesfound)
+    BOOL mounted = FALSE;
+    for (UWORD unit = 0; unit < A314SCSI_MAX_DRIVES && base->connected; unit++)
+    {
+        UBYTE bit = 1 << unit;
+        if ((base->changedunits | base->uaunits) & bit)
+        {
+            base->changedunits &= ~bit;
+            if (check_unit(base, unit))
+            {
+                mounted = TRUE;
+            }
+        }
+    }
+    if (mounted)
     {
         start_mounter();
-    }
-    else
-    {
-        start_rescan_timer(base);
     }
 }
 
@@ -417,11 +488,15 @@ static void startup(struct A314ScsiBase* base)
 
     // a314.device was opened in init_device's caller context (see init_device).
     // Here in the io task we only connect - the reply port must be owned by this
-    // task, which does every subsequent A314 transaction.
-    base->drivesfound = discover_drives(base);
-    if (!base->drivesfound)
+    // task, which does every subsequent A314 transaction. Connecting marks every
+    // unit to be asked.
+    if (a314_connect(base))
     {
-        kprintf("a314scsi: no drives yet\n");
+        process_changes(base);
+    }
+    else
+    {
+        kprintf("a314scsi: not connected yet\n");
     }
 }
 
@@ -436,20 +511,12 @@ void task_body(void)
     if (base->inittask)
         Signal(base->inittask, base->initsig);
 
-    if (!base->reqport)
+    if (!base->reqport || !base->a314port)
         return; // startup failed; the device is unusable
 
-    // The rescan timer replies to a314port, which a314_connect() created.
-    ULONG waitmask = 1UL << base->reqport->mp_SigBit;
-    if (base->a314port)
-    {
-        waitmask |= 1UL << base->a314port->mp_SigBit;
-        base->rescantr = base->tmotr;
-        if (!base->drivesfound)
-        {
-            start_rescan_timer(base);
-        }
-    }
+    // readior, the a314 timeouts and rescantr all reply to a314port.
+    ULONG waitmask = (1UL << base->reqport->mp_SigBit) | (1UL << base->a314port->mp_SigBit);
+    base->rescantr = base->tmotr;
 
     for (;;)
     {
@@ -460,11 +527,23 @@ void task_body(void)
             ReplyMsg(&ior->io_Message);
         }
 
+        a314_poll(base);
+
         if (base->rescanpending && CheckIO((struct IORequest*)&base->rescantr))
         {
             WaitIO((struct IORequest*)&base->rescantr);
             base->rescanpending = FALSE;
-            rescan(base);
+            if (!base->connected)
+            {
+                a314_connect(base);
+            }
+        }
+
+        process_changes(base);
+
+        if (!base->connected && !base->rescanpending)
+        {
+            start_rescan_timer(base);
         }
 
         Wait(waitmask);
@@ -497,9 +576,45 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
         }
 
         case TD_CHANGENUM:
-            // Fixed disk: the media never changes, so the count stays 0.
-            ior->io_Actual = 0;
+        {
+            struct Drive* d = (struct Drive*)ior->io_Unit;
+            ior->io_Actual = d ? d->changecount : 0;
             break;
+        }
+
+        case TD_ADDCHANGEINT:
+        {
+            // Kept, not replied, until TD_REMCHANGEINT; io_Data is the
+            // Interrupt to Cause() on every medium change.
+            struct Drive* d = (struct Drive*)ior->io_Unit;
+            if (!d)
+            {
+                ior->io_Error = IOERR_BADADDRESS;
+                break;
+            }
+            ior->io_Flags &= ~IOF_QUICK;
+            Forbid();
+            AddTail((struct List*)&d->changeints, &ior->io_Message.mn_Node);
+            Permit();
+            return;
+        }
+
+        case TD_REMCHANGEINT:
+            // The request that TD_ADDCHANGEINT kept, with its command changed.
+            Forbid();
+            Remove(&ior->io_Message.mn_Node);
+            Permit();
+            break;
+
+        case TD_REMOVE:
+        {
+            struct Drive* d = (struct Drive*)ior->io_Unit;
+            if (d)
+            {
+                d->removeint = (struct Interrupt*)ior->io_Data;
+            }
+            break;
+        }
 
         case TD_PROTSTATUS:
         {
@@ -514,7 +629,6 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
         case TD_SEEK:
         case TD_SEEK64:
         case NSCMD_TD_SEEK64:
-        case TD_REMOVE:
             // No-ops.
             break;
 

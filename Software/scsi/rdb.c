@@ -125,13 +125,13 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
     return n;
 }
 
-static void mount_partition(struct A314ScsiBase* base, struct Drive* d, struct PartitionBlock* pb,
+static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct PartitionBlock* pb,
                             struct LoadedFS* fstab, ULONG fscount, struct ExpansionBase* expansion)
 {
     struct MountEntry* me = (struct MountEntry*)AllocMem(sizeof(struct MountEntry), MEMF_PUBLIC | MEMF_CLEAR);
     if (!me)
     {
-        return;
+        return FALSE;
     }
 
     const ULONG* env = (const ULONG*)pb->pb_Environment;
@@ -211,15 +211,25 @@ static void mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     Forbid();
     Enqueue(&expansion->MountList, &me->boot_node.bn_Node);
     Permit();
+    return TRUE;
 }
 
-void mount_drive(struct A314ScsiBase* base, struct Drive* d)
+// Free a partition that mount_partition() made and that is not mounted.
+void free_partition(struct DeviceNode* dn)
 {
+    FreeMem(dn, sizeof(struct MountEntry));
+}
+
+// Add the drive's RDB partitions to the MountList. TRUE if any were added.
+BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
+{
+    BOOL added = FALSE;
+
     kprintf("a314scsi: mount_drive unit=%ld blocksize=%ld\n", (ULONG)d->number, d->blocksize);
 
     if (d->flags & DRVF_MOUNTED)
     {
-        return;
+        return FALSE;
     }
 
     // One block buffer serves the whole routine: first the RDB scan, then each
@@ -228,7 +238,7 @@ void mount_drive(struct A314ScsiBase* base, struct Drive* d)
     if (!buf)
     {
         kprintf("a314scsi: mount_drive AllocMem FAILED\n");
-        return;
+        return FALSE;
     }
 
     // Find the RigidDiskBlock within the first few sectors.
@@ -288,7 +298,10 @@ void mount_drive(struct A314ScsiBase* base, struct Drive* d)
                 ULONG next = pb->pb_Next;
                 if (!(pb->pb_Flags & PBFF_NOMOUNT))
                 {
-                    mount_partition(base, d, pb, fstab, fscount, expansion);
+                    if (mount_partition(base, d, pb, fstab, fscount, expansion))
+                    {
+                        added = TRUE;
+                    }
                 }
                 part_block = next;
             }
@@ -303,4 +316,5 @@ void mount_drive(struct A314ScsiBase* base, struct Drive* d)
     }
 
     FreeMem(buf, d->blocksize);
+    return added;
 }
