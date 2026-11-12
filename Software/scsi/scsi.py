@@ -37,9 +37,11 @@ STATUS_GOOD = 0x00
 STATUS_CHECK_CONDITION = 0x02
 
 SENSE_NOT_READY = 0x02
+SENSE_MEDIUM_ERROR = 0x03
 SENSE_ILLEGAL_REQUEST = 0x05
 SENSE_UNIT_ATTENTION = 0x06
 
+ASC_WRITE_ERROR = 0x0C
 ASC_MEDIUM_CHANGED = 0x28
 ASC_LUN_NOT_SUPPORTED = 0x25
 ASC_MEDIUM_NOT_PRESENT = 0x3A
@@ -61,7 +63,8 @@ class DiskImage(object):
 
     def open(self) -> bool:
         try:
-            self.f = open(self.filename, 'r+b' if self.writable else 'rb')
+            # Unbuffered, so every write reaches the kernel at once.
+            self.f = open(self.filename, 'r+b' if self.writable else 'rb', buffering=0)
             self.f.seek(0, 2)
             self.blocks = self.f.tell() // self.block_size
             self._compute_geometry()
@@ -89,6 +92,17 @@ class DiskImage(object):
         self.heads = 16
         self.sectors = 63
         self.cylinders = max(1, self.blocks // (self.heads * self.sectors))
+
+    # Put everything written so far on the storage behind the hdf.
+    def sync(self) -> bool:
+        if not self.f or not self.writable:
+            return True
+        try:
+            os.fsync(self.f.fileno())
+            return True
+        except OSError as e:
+            logger.error('fsync of %s failed: %s', self.filename, e)
+            return False
 
     def close(self):
         if self.f:
@@ -269,6 +283,10 @@ class ScsiService(object):
             return (STATUS_GOOD, 0, 0, 0, self.read_capacity10(img))
         if op == 0x1A:                                   # MODE SENSE(6)
             return (STATUS_GOOD, 0, 0, 0, self.mode_sense6(img, cdb)[:alloc or 255])
+        if op == 0x35:                                   # SYNCHRONIZE CACHE(10)
+            if not img.sync():
+                return (STATUS_CHECK_CONDITION, SENSE_MEDIUM_ERROR, ASC_WRITE_ERROR, 0, b'')
+            return (STATUS_GOOD, 0, 0, 0, b'')
         if op in (0x08, 0x28):                           # READ(6)/READ(10)
             lba, blocks = self.rw_params(cdb)
             data = img.read(lba, blocks)

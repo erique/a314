@@ -135,6 +135,7 @@ LONG scsi_inquiry(struct A314ScsiBase* base, struct Drive* d);
 LONG scsi_read_capacity(struct A314ScsiBase* base, struct Drive* d);
 LONG scsi_mode_sense_wp(struct A314ScsiBase* base, struct Drive* d);
 LONG scsi_rw(struct A314ScsiBase* base, struct Drive* d, ULONG lba, ULONG blocks, APTR buf, BOOL write);
+LONG scsi_sync_cache(struct A314ScsiBase* base, struct Drive* d);
 
 // a314hw.c
 BOOL a314_open_device(struct A314ScsiBase* base);

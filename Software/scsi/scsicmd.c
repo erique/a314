@@ -154,3 +154,12 @@ LONG scsi_rw(struct A314ScsiBase* base, struct Drive* d, ULONG lba, ULONG blocks
     cdb[8] = (UBYTE)blocks;
     return run_cdb(base, d, cdb, 10, buf, length, dir);
 }
+
+LONG scsi_sync_cache(struct A314ScsiBase* base, struct Drive* d)
+{
+    UBYTE cdb[10];
+
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = SCSI_CMD_SYNCHRONIZE_CACHE_10;
+    return run_cdb(base, d, cdb, 10, NULL, 0, A314SCSI_DIR_NONE);
+}

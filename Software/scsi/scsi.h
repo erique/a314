@@ -9,6 +9,7 @@
 #define SCSI_CMD_READ_CAPACITY_10 		0x25
 #define SCSI_CMD_READ_10 				0x28
 #define SCSI_CMD_WRITE_10 				0x2A
+#define SCSI_CMD_SYNCHRONIZE_CACHE_10 	0x35
 
 // INQUIRY standard data.
 #define SCSI_INQ_PDT_MASK 	0x1F // byte 0: peripheral device type

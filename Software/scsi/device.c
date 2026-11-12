@@ -274,6 +274,15 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
 
     switch (ior->io_Command)
     {
+        case CMD_UPDATE:
+            // The host writes its cache to the hdf. Only a failed write
+            // matters to the filesystem, so the outcome is not reported.
+            if (d && (d->flags & DRVF_PRESENT) && !(d->flags & DRVF_WRITEPROT))
+            {
+                scsi_sync_cache(base, d);
+            }
+            break;
+
         case CMD_READ:
         case TD_READ64:
         case NSCMD_TD_READ64:
@@ -678,7 +687,6 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
         }
 
         case CMD_CLEAR:
-        case CMD_UPDATE:
         case TD_MOTOR:
         case TD_SEEK:
         case TD_SEEK64:
