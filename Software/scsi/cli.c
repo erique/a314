@@ -108,22 +108,125 @@ static BOOL unique_name(struct Library* DOSBase, UBYTE* bname, UBYTE maxlen)
     return FALSE;
 }
 
-// Is this DeviceNode itself on the DOS list? DOS leaves the BootNodes it
-// mounted at boot on the MountList.
-static BOOL in_dos_list(struct Library* DOSBase, struct DeviceNode* dn)
+// Is this DeviceNode on the locked DOS list that starts at dl?
+static BOOL on_dos_list(struct Library* DOSBase, struct DosList* dl, struct DeviceNode* dn)
 {
-    BOOL found = FALSE;
-    struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
     while ((dl = NextDosEntry(dl, LDF_DEVICES)))
     {
         if ((struct DeviceNode*)dl == dn)
         {
-            found = TRUE;
-            break;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// Is this DeviceNode itself on the DOS list? DOS leaves the BootNodes it
+// mounted at boot on the MountList.
+static BOOL in_dos_list(struct Library* DOSBase, struct DeviceNode* dn)
+{
+    struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
+    BOOL found = on_dos_list(DOSBase, dl, dn);
+    UnLockDosList(LDF_DEVICES | LDF_READ);
+    return found;
+}
+
+// Does a volume, or a lock on one, still belong to this handler?
+static BOOL handler_in_use(struct Library* DOSBase, struct MsgPort* port)
+{
+    BOOL used = FALSE;
+    struct DosList* dl = LockDosList(LDF_VOLUMES | LDF_READ);
+    while (!used && (dl = NextDosEntry(dl, LDF_VOLUMES)))
+    {
+        BPTR lock = dl->dol_misc.dol_volume.dol_LockList;
+        used = dl->dol_Task == port || (lock && ((struct FileLock*)BADDR(lock))->fl_Task == port);
+    }
+    UnLockDosList(LDF_VOLUMES | LDF_READ);
+    return used;
+}
+
+// Remove a DOS device of ours whose partition the unit's new medium doesn't
+// have. A running handler is inhibited and asked to quit; one that is still
+// in use, or won't quit, keeps its device.
+static void retire_device(struct Library* DOSBase, struct DeviceNode* dn)
+{
+    char name[40];
+    UBYTE* bname = (UBYTE*)BADDR(dn->dn_Name);
+    UBYTE len = bname[0] < sizeof(name) - 1 ? bname[0] : sizeof(name) - 2;
+    memcpy(name, &bname[1], len);
+    name[len] = ':';
+    name[len + 1] = 0;
+
+    struct MsgPort* port = dn->dn_Task;
+    if (port)
+    {
+        if (!Inhibit((STRPTR)name, DOSTRUE))
+        {
+            kprintf("a314scsi: %s stays, not inhibited\n", name);
+            return;
+        }
+        // Let Workbench and others let go of the volume that just went away.
+        Delay(TICKS_PER_SECOND);
+        if (handler_in_use(DOSBase, port) || !DoPkt(port, ACTION_DIE, 0, 0, 0, 0, 0))
+        {
+            Inhibit((STRPTR)name, DOSFALSE);
+            kprintf("a314scsi: %s stays, its handler is in use or won't quit\n", name);
+            return;
+        }
+    }
+
+    struct DosList* dl = LockDosList(LDF_DEVICES | LDF_WRITE);
+    BOOL removed = on_dos_list(DOSBase, dl, dn) && dn->dn_Task == port && RemDosEntry((struct DosList*)dn);
+    UnLockDosList(LDF_DEVICES | LDF_WRITE);
+
+    kprintf("a314scsi: %s %s\n", name, removed ? "retired" : "stays");
+
+    // A handler that quit may still be finishing with its DeviceNode, so only
+    // a node whose handler never ran is freed.
+    if (removed && !port)
+    {
+        free_partition(dn);
+    }
+}
+
+// Retire our DOS devices on the units in pending whose partitions the new
+// media no longer have.
+static void retire_orphans(struct Library* DOSBase, struct DeviceNode** pending, UWORD count)
+{
+    struct DeviceNode* orphans[MAX_PENDING];
+    UWORD n = 0;
+
+    struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
+    while (n < MAX_PENDING && (dl = NextDosEntry(dl, LDF_DEVICES)))
+    {
+        struct DeviceNode* dn = (struct DeviceNode*)dl;
+        if (!is_ours(dn) || !is_mount_entry(dn))
+        {
+            continue;
+        }
+
+        ULONG unit = ((struct FileSysStartupMsg*)BADDR(dn->dn_Startup))->fssm_Unit;
+        BOOL unitchanged = FALSE;
+        BOOL kept = FALSE;
+        for (UWORD i = 0; i < count; i++)
+        {
+            if (((struct FileSysStartupMsg*)BADDR(pending[i]->dn_Startup))->fssm_Unit == unit)
+            {
+                unitchanged = TRUE;
+                kept = kept || same_partition(dl, pending[i]);
+            }
+        }
+        if (unitchanged && !kept)
+        {
+            orphans[n++] = dn;
         }
     }
     UnLockDosList(LDF_DEVICES | LDF_READ);
-    return found;
+
+    for (UWORD i = 0; i < n; i++)
+    {
+        retire_device(DOSBase, orphans[i]);
+    }
 }
 
 int memcmp(const void* a, const void* b, size_t n)
@@ -175,6 +278,12 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
     // filesystem takes the new medium through the change interrupt. Another
     // device with the same name gets the partition renamed.
     struct Library* DOSBase = OpenLibrary((STRPTR)DOSNAME, 36);
+    if (DOSBase)
+    {
+        retire_orphans(DOSBase, pending, count);
+    }
+
+    UWORD added = 0;
     for (UWORD i = 0; i < count; i++)
     {
         struct DeviceNode* dn = pending[i];
@@ -212,13 +321,14 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
         }
         kprintf("a314scsi: AddDosNode pri=%ld\n", pri[i]);
         AddDosNode(pri[i], ADNF_STARTPROC, dn);
+        added++;
     }
     if (DOSBase)
     {
         CloseLibrary(DOSBase);
     }
 
-    kprintf("a314scsi: mounted %ld node(s)\n", (LONG)count);
+    kprintf("a314scsi: mounted %ld of %ld node(s)\n", (LONG)added, (LONG)count);
 
     ReleaseSemaphore(&base->mountsem);
 }

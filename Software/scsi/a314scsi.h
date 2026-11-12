@@ -147,6 +147,7 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base);
 
 // rdb.c
 BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d);
+BOOL is_mount_entry(struct DeviceNode* dn);
 void free_partition(struct DeviceNode* dn);
 
 // lseg.c
