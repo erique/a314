@@ -10,6 +10,7 @@
 #include <exec/libraries.h>
 
 #include <dos/dos.h> // BPTR
+#include <dos/dosextens.h> // struct Process
 
 #include <devices/scsidisk.h> // struct SCSICmd
 #include <devices/timer.h> // struct timerequest
@@ -63,6 +64,9 @@ struct A314ScsiBase
 
     struct MsgPort*         reqport;        // command queue to the io task
     struct Task             iotask;         // embedded io task (tc_UserData -> base)
+    // The io task calls CreateNewProc() (see start_mounter), and dos.library
+    // may write the caller's Process fields, so it gets room for them.
+    UBYTE                   iotaskpad[sizeof(struct Process) - sizeof(struct Task)];
     APTR                    stack;
 
     // a314 transport (opened and used only by the io task)
@@ -75,6 +79,11 @@ struct A314ScsiBase
     ULONG                   bounce;         // a314-space bounce buffer
     UBYTE                   connected;
     UBYTE                   stuck;          // a314.device stopped replying
+
+    // Background rescan while no drive has been found (the Pi was not up yet)
+    struct timerequest      rescantr;
+    UBYTE                   rescanpending;
+    UBYTE                   drivesfound;
 
     // io-task startup handshake back to init_device
     struct Task*            inittask;
@@ -101,6 +110,9 @@ LONG scsi_rw(struct A314ScsiBase* base, struct Drive* d, ULONG lba, ULONG blocks
 BOOL a314_open_device(struct A314ScsiBase* base);
 BOOL a314_connect(struct A314ScsiBase* base);
 LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd);
+
+// cli.c
+void mount_boot_nodes(struct Library* ExpansionBase);
 
 // rdb.c
 void mount_drive(struct A314ScsiBase* base, struct Drive* d);

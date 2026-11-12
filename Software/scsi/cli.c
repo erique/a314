@@ -56,6 +56,44 @@ int memcmp(const void* a, const void* b, size_t n)
     return 0;
 }
 
+// Mount the partitions whose BootNodes are on the MountList. Each one is
+// detached under Forbid, then AddDosNode'd outside it (AddDosNode with
+// ADNF_STARTPROC creates a process), so running this again mounts nothing twice.
+// It must run in a process.
+void mount_boot_nodes(struct Library* ExpansionBase)
+{
+    struct DeviceNode* pending[MAX_PENDING];
+    LONG pri[MAX_PENDING];
+    UWORD count = 0;
+
+    struct List* ml = &((struct ExpansionBase*)ExpansionBase)->MountList;
+
+    Forbid();
+    struct Node* n = ml->lh_Head;
+    while (n->ln_Succ && count < MAX_PENDING)
+    {
+        struct Node* next = n->ln_Succ;
+        struct BootNode* bn = (struct BootNode*)n;
+        if (is_ours((struct DeviceNode*)bn->bn_DeviceNode))
+        {
+            Remove(n);
+            pending[count] = (struct DeviceNode*)bn->bn_DeviceNode;
+            pri[count] = (LONG)(BYTE)bn->bn_Node.ln_Pri;
+            count++;
+        }
+        n = next;
+    }
+    Permit();
+
+    for (UWORD i = 0; i < count; i++)
+    {
+        kprintf("a314scsi: AddDosNode pri=%ld\n", pri[i]);
+        AddDosNode(pri[i], ADNF_STARTPROC, pending[i]);
+    }
+
+    kprintf("a314scsi: mounted %ld node(s)\n", (LONG)count);
+}
+
 LONG cli_main(void)
 {
     kprintf("a314scsi: cli enter\n");
@@ -96,42 +134,11 @@ LONG cli_main(void)
         return RETURN_FAIL;
     }
 
-    // Detach our BootNodes from the MountList under Forbid, then AddDosNode them
-    // outside it (AddDosNode with ADNF_STARTPROC creates a process). Removing
-    // them makes repeated runs idempotent.
-    struct DeviceNode* pending[MAX_PENDING];
-    LONG pri[MAX_PENDING];
-    UWORD count = 0;
-
-    struct List* ml = &((struct ExpansionBase*)ExpansionBase)->MountList;
-
-    Forbid();
-    struct Node* n = ml->lh_Head;
-    while (n->ln_Succ && count < MAX_PENDING)
-    {
-        struct Node* next = n->ln_Succ;
-        struct BootNode* bn = (struct BootNode*)n;
-        if (is_ours((struct DeviceNode*)bn->bn_DeviceNode))
-        {
-            Remove(n);
-            pending[count] = (struct DeviceNode*)bn->bn_DeviceNode;
-            pri[count] = (LONG)(BYTE)bn->bn_Node.ln_Pri;
-            count++;
-        }
-        n = next;
-    }
-    Permit();
-
-    for (UWORD i = 0; i < count; i++)
-    {
-        kprintf("a314scsi: cli AddDosNode pri=%ld\n", pri[i]);
-        AddDosNode(pri[i], ADNF_STARTPROC, pending[i]);
-    }
+    mount_boot_nodes(ExpansionBase);
 
     CloseDevice((struct IORequest*)&ior);
     DeletePort(port);
     CloseLibrary(ExpansionBase);
 
-    kprintf("a314scsi: cli mounted %ld node(s)\n", (LONG)count);
     return RETURN_OK;
 }
