@@ -48,6 +48,14 @@
 #define DRVF_REMOVABLE (1 << 2)
 #define DRVF_MOUNTED (1 << 3)
 
+// A TD_REMOVE interrupt, one per opener's IORequest
+struct RemoveInt
+{
+    struct MinNode      node;
+    struct IORequest*   ior;
+    struct Interrupt*   is;
+};
+
 struct Drive
 {
     UWORD           number;         // unit number
@@ -62,7 +70,7 @@ struct Drive
     // Medium changes (TD_CHANGENUM, TD_ADDCHANGEINT, TD_REMOVE)
     ULONG           changecount;
     struct MinList  changeints;     // TD_ADDCHANGEINT requests, io_Data = Interrupt
-    struct Interrupt* removeint;    // TD_REMOVE
+    struct MinList  removeints;     // TD_REMOVE, struct RemoveInt
 };
 
 struct A314ScsiBase
