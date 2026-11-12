@@ -83,6 +83,8 @@ BOOL a314_open_device(struct A314ScsiBase* base)
     if (base->bounce == INVALID_A314_ADDRESS)
     {
         kprintf("a314scsi: AllocMemA314 FAILED\n");
+        CloseDevice(&base->a314ior.a314_Request);
+        base->a314base = NULL;
         return FALSE;
     }
 

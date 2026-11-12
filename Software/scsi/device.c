@@ -307,7 +307,7 @@ static void startup(struct A314ScsiBase* base)
     // a314.device was opened in init_device's caller context (see init_device).
     // Here in the io task we only connect - the reply port must be owned by this
     // task, which does every subsequent A314 transaction.
-    if (!base->a314base || !a314_connect(base))
+    if (!a314_connect(base))
     {
         kprintf("a314scsi: connect FAILED\n");
         return;
@@ -501,11 +501,15 @@ static struct Library* init_device(__reg("a6") struct ExecBase* sys_base,
     }
 
     // Open a314.device here, in the caller's (normal process) context. Opening it
-    // from the freshly-created io task hangs. If it fails the device still loads;
-    // the io task just won't connect.
+    // from the freshly-created io task hangs. Without a314.device or its A314
+    // memory the device cannot work, so it does not load.
     if (!a314_open_device(base))
     {
         kprintf("a314scsi: a314_open_device FAILED\n");
+        FreeMem(base->stack, TASK_STACK_SIZE);
+        UWORD negsize = base->device.dd_Library.lib_NegSize;
+        FreeMem((UBYTE*)base - negsize, negsize + base->device.dd_Library.lib_PosSize);
+        return NULL;
     }
 
     BYTE sig = AllocSignal(-1);
