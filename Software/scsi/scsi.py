@@ -3,9 +3,12 @@
 
 import json
 import logging
+import os
 import select
+import signal
 import socket
 import struct
+import time
 from typing import Dict, List, Optional
 
 from a314d import A314d
@@ -19,7 +22,12 @@ CONF_FILE = '/etc/opt/a314/scsi.conf'
 # Wire protocol (matches a314scsi_protocol.h).
 REQ_FMT = '>BBBB16sBBHII'   # kind,unit,cdb_len,rsv,cdb,dir,pad,rsv,data_length,address
 RES_FMT = '>BBBBBBHI'       # kind,status,sense_key,asc,ascq,pad,rsv,actual_length
+EVT_FMT = '>BB10x'          # kind,unit
 CMD_RES = 2
+EVT_CHANGED = 3
+
+# How often the hdf files are checked for removal or replacement.
+MEDIA_CHECK_SECS = 2.0
 
 DIR_NONE = 0
 DIR_READ = 1
@@ -30,6 +38,13 @@ STATUS_CHECK_CONDITION = 0x02
 
 SENSE_NOT_READY = 0x02
 SENSE_ILLEGAL_REQUEST = 0x05
+SENSE_UNIT_ATTENTION = 0x06
+
+ASC_MEDIUM_CHANGED = 0x28
+ASC_LUN_NOT_SUPPORTED = 0x25
+ASC_MEDIUM_NOT_PRESENT = 0x3A
+
+OP_INQUIRY = 0x12
 
 
 class DiskImage(object):
@@ -75,6 +90,11 @@ class DiskImage(object):
         self.sectors = 63
         self.cylinders = max(1, self.blocks // (self.heads * self.sectors))
 
+    def close(self):
+        if self.f:
+            self.f.close()
+            self.f = None
+
     def read(self, lba: int, blocks: int) -> Optional[bytes]:
         if not self.f or lba + blocks > self.blocks:
             return None
@@ -91,12 +111,57 @@ class DiskImage(object):
         return True
 
 
+# A configured unit and the hdf in it. Every unit is removable: the hdf may be
+# missing, removed or replaced at any time, and the unit then reports the
+# medium as not present, or once as changed (UNIT ATTENTION).
+class Unit(object):
+    def __init__(self, filename: str, writable: bool, block_size: int):
+        self.filename = filename
+        self.writable = writable
+        self.block_size = block_size
+        self.image: Optional[DiskImage] = None
+        self.ident = None           # identity of the hdf file behind image
+        self.attention = False
+
+    def file_ident(self):
+        try:
+            st = os.stat(self.filename)
+            return (st.st_dev, st.st_ino, st.st_size)
+        except OSError:
+            return None
+
+    # Pick up a removed, inserted or replaced hdf. True if the medium changed.
+    def refresh(self) -> bool:
+        ident = self.file_ident()
+        if ident == self.ident:
+            return False
+        if self.image:
+            self.image.close()
+            self.image = None
+        self.ident = ident
+        if ident is not None:
+            img = DiskImage(self.filename, self.writable, self.block_size)
+            if img.open():
+                self.image = img
+        else:
+            logger.info('No medium: %s', self.filename)
+        self.attention = True
+        return True
+
+    def close(self):
+        if self.image:
+            self.image.close()
+            self.image = None
+
+
 class ScsiService(object):
     def __init__(self):
         self.a314d = A314d(SERVICE_NAME)
         self.current_stream_id: Optional[int] = None
         self.rbuf = b''
-        self.images: Dict[int, DiskImage] = {}
+        self.units: Dict[int, Unit] = {}
+        self.reload_pending = False
+        self.next_media_check = 0.0
 
         # Pending bulk transfers awaiting a314 memory completion.
         self.mem_write_queue = []   # (stream_id, status, sense_key, asc, ascq, actual)
@@ -108,19 +173,43 @@ class ScsiService(object):
                 j = json.load(f)
         except Exception as e:
             logger.warning('No config (%s): %s', CONF_FILE, e)
-            return
+            j = {}
+
+        conf = {}
         for e in j.get('units', []):
-            unit = e['unit']
-            img = DiskImage(e['filename'], e.get('rw', False), e.get('block_size', 512))
-            if img.open():
-                self.images[unit] = img
+            conf[e['unit']] = (e['filename'], e.get('rw', False), e.get('block_size', 512))
+
+        changed = []
+        for unit in list(self.units):
+            u = self.units[unit]
+            if conf.get(unit) != (u.filename, u.writable, u.block_size):
+                u.close()
+                del self.units[unit]
+                changed.append(unit)
+        for unit, (filename, rw, block_size) in conf.items():
+            if unit not in self.units:
+                self.units[unit] = Unit(filename, rw, block_size)
+                if unit not in changed:
+                    changed.append(unit)
+        self.check_media(changed)
+
+    # Check every hdf; tell the Amiga which units changed (it then asks them).
+    def check_media(self, changed=None):
+        changed = list(changed or [])
+        for unit, u in self.units.items():
+            if u.refresh() and unit not in changed:
+                changed.append(unit)
+        if changed and self.current_stream_id is not None:
+            for unit in changed:
+                logger.info('Unit %d changed', unit)
+                self.a314d.send_data(self.current_stream_id, struct.pack(EVT_FMT, EVT_CHANGED, unit))
 
     # --- SCSI CDB execution --------------------------------------------------
 
     def inquiry_data(self, img: DiskImage) -> bytes:
         d = bytearray(36)
         d[0] = 0x00              # direct-access block device
-        d[1] = 0x00              # not removable
+        d[1] = 0x80              # removable
         d[2] = 0x02              # SCSI-2
         d[3] = 0x02              # response data format
         d[4] = 31                # additional length
@@ -207,10 +296,21 @@ class ScsiService(object):
         kind, unit, cdb_len, _, cdb, direction, _, _, data_length, address = struct.unpack(REQ_FMT, data)
         cdb = cdb[:cdb_len]
 
-        img = self.images.get(unit)
-        if img is None:
-            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_NOT_READY, 0x3A, 0, 0)
+        u = self.units.get(unit)
+        if u is None:
+            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, ASC_LUN_NOT_SUPPORTED, 0, 0)
             return
+
+        # INQUIRY describes the unit, not the medium, so it always answers.
+        if cdb[0] != OP_INQUIRY:
+            if u.attention:
+                u.attention = False
+                self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_UNIT_ATTENTION, ASC_MEDIUM_CHANGED, 0, 0)
+                return
+            if u.image is None:
+                self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
+                return
+        img = u.image
 
         if direction == DIR_WRITE:
             self.mem_read_queue.append((stream_id, unit, bytes(cdb)))
@@ -237,8 +337,12 @@ class ScsiService(object):
         stream_id, unit, cdb = self.mem_read_queue.pop(0)
         if stream_id != self.current_stream_id:
             return
-        img = self.images.get(unit)
-        if img is None or cdb[0] not in (0x0A, 0x2A):  # WRITE(6)/WRITE(10)
+        u = self.units.get(unit)
+        img = u.image if u else None
+        if img is None:
+            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
+            return
+        if cdb[0] not in (0x0A, 0x2A):  # WRITE(6)/WRITE(10)
             self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x20, 0, 0)
             return
         lba, _ = self.rw_params(cdb)
@@ -281,19 +385,32 @@ class ScsiService(object):
             self.rbuf = self.rbuf[9 + plen:]
             self.process_drv_msg(stream_id, ptype, payload)
 
+    def request_reload(self, signum, frame):
+        self.reload_pending = True
+
     def run(self):
+        signal.signal(signal.SIGHUP, self.request_reload)
         self.load_config()
         logger.info('SCSI service is running')
 
         while True:
             try:
-                rl, _, _ = select.select([self.a314d], [], [], 10.0)
+                rl, _, _ = select.select([self.a314d], [], [], MEDIA_CHECK_SECS)
             except KeyboardInterrupt:
                 break
+
             try:
                 for s in rl:
                     if s == self.a314d:
                         self.handle_a314d_readable()
+
+                if self.reload_pending:
+                    self.reload_pending = False
+                    logger.info('Reloading %s', CONF_FILE)
+                    self.load_config()
+                if time.monotonic() >= self.next_media_check:
+                    self.next_media_check = time.monotonic() + MEDIA_CHECK_SECS
+                    self.check_media()
             except ConnectionError:
                 logger.error('Connection to a314d lost, shutting down')
                 break
