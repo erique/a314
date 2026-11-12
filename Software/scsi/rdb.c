@@ -10,9 +10,11 @@
 #include <libraries/expansionbase.h>
 
 #include <devices/hardblocks.h>
+#include <resources/filesysres.h>
 
 #include <proto/exec.h>
 
+#include <stddef.h>
 #include <string.h>
 
 #include "a314scsi.h"
@@ -21,24 +23,12 @@
 #define SysBase (*(struct ExecBase**)4)
 
 #define RDB_SCAN_LIMIT 16 // the RDB must live within the first 16 blocks
-#define MAX_LOADED_FS 8
 
 // fhb_PatchFlags bits (which DeviceNode fields the FSHB overrides).
 #define FSPF_TYPE       (1 << 0)
 #define FSPF_STACKSIZE  (1 << 4)
 #define FSPF_PRIORITY   (1 << 5)
 #define FSPF_GLOBALVEC  (1 << 8)
-
-struct LoadedFS
-{
-    ULONG   dostype;
-    BPTR    seglist;
-    ULONG   globalvec;
-    ULONG   patchflags;
-    ULONG   stacksize;
-    LONG    priority;
-    ULONG   dntype;
-};
 
 struct MountEntry
 {
@@ -75,8 +65,25 @@ static void set_bcpl(char* dst, const char* src, UBYTE len)
     }
 }
 
-// Walk the RDB FileSysHeaderBlock list, loading each filesystem's seglist.
-static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG fshList, struct LoadedFS* tab)
+// The newest FileSystem.resource entry for this DOSType. Call under Forbid.
+static struct FileSysEntry* find_filesystem(struct FileSysResource* fsr, ULONG dostype)
+{
+    struct FileSysEntry* best = NULL;
+    for (struct Node* n = fsr->fsr_FileSysEntries.lh_Head; n->ln_Succ; n = n->ln_Succ)
+    {
+        struct FileSysEntry* fse = (struct FileSysEntry*)n;
+        if (fse->fse_DosType == dostype && (!best || fse->fse_Version > best->fse_Version))
+        {
+            best = fse;
+        }
+    }
+    return best;
+}
+
+// Walk the RDB FileSysHeaderBlock list and add each filesystem that
+// FileSystem.resource doesn't have in this or a newer version, so every
+// filesystem is loaded once and shared by all partitions using it.
+static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG fshList, struct FileSysResource* fsr)
 {
     APTR buf = AllocMem(d->blocksize, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf)
@@ -86,7 +93,7 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
 
     ULONG n = 0;
     ULONG b = fshList;
-    while (b != 0xFFFFFFFFUL && b != 0 && n < MAX_LOADED_FS)
+    while (b != 0xFFFFFFFFUL && b != 0)
     {
         if (!read_block(base, d, b, buf))
         {
@@ -99,23 +106,36 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
             break;
         }
 
-        ULONG dostype = fhb->fhb_DosType;
-        ULONG seg = fhb->fhb_SegListBlocks;
         ULONG next = fhb->fhb_Next;
+        kprintf("a314scsi: FSHD dostype=%lx version=%lx segblock=%ld\n", fhb->fhb_DosType, fhb->fhb_Version, fhb->fhb_SegListBlocks);
 
-        kprintf("a314scsi: FSHD dostype=%lx segblock=%ld\n", dostype, seg);
+        Forbid();
+        struct FileSysEntry* have = find_filesystem(fsr, fhb->fhb_DosType);
+        BOOL needed = !have || have->fse_Version < fhb->fhb_Version;
+        Permit();
 
-        BPTR seglist = load_seglist(base, d, seg);
-        if (seglist)
+        if (needed)
         {
-            tab[n].dostype      = dostype;
-            tab[n].seglist      = seglist;
-            tab[n].globalvec    = fhb->fhb_GlobalVec;
-            tab[n].patchflags   = fhb->fhb_PatchFlags;
-            tab[n].stacksize    = fhb->fhb_StackSize;
-            tab[n].priority     = fhb->fhb_Priority;
-            tab[n].dntype       = fhb->fhb_Type;
-            n++;
+            struct FileSysEntry* fse = (struct FileSysEntry*)AllocMem(sizeof(struct FileSysEntry), MEMF_PUBLIC | MEMF_CLEAR);
+            if (fse)
+            {
+                // The FileSysEntry fields from fse_DosType on are laid out as
+                // the FileSysHeaderBlock's from fhb_DosType on.
+                CopyMem(&fhb->fhb_DosType, &fse->fse_DosType, sizeof(struct FileSysEntry) - offsetof(struct FileSysEntry, fse_DosType));
+                fse->fse_Node.ln_Name = (char*)device_name;
+                fse->fse_SegList = load_seglist(base, d, fhb->fhb_SegListBlocks);
+                if (fse->fse_SegList)
+                {
+                    Forbid();
+                    AddHead(&fsr->fsr_FileSysEntries, &fse->fse_Node);
+                    Permit();
+                    n++;
+                }
+                else
+                {
+                    FreeMem(fse, sizeof(struct FileSysEntry));
+                }
+            }
         }
 
         b = next;
@@ -126,7 +146,7 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
 }
 
 static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct PartitionBlock* pb,
-                            struct LoadedFS* fstab, ULONG fscount, struct ExpansionBase* expansion)
+                            struct FileSysResource* fsr, struct ExpansionBase* expansion)
 {
     struct MountEntry* me = (struct MountEntry*)AllocMem(sizeof(struct MountEntry), MEMF_PUBLIC | MEMF_CLEAR);
     if (!me)
@@ -169,33 +189,35 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     me->dev_node.dn_Name        = MKBADDR(me->drive_name);
     me->dev_node.dn_GlobalVec   = -1;
 
-    // If the partition's DOSType matches a filesystem we loaded from the RDB,
-    // point the DeviceNode at it (patching the fields the FSHB requests).
+    // If FileSystem.resource has a filesystem for the partition's DOSType,
+    // point the DeviceNode at it (patching the fields its entry requests).
     ULONG dostype = env[DE_DOSTYPE];
-    for (ULONG i = 0; i < fscount; i++)
+    Forbid();
+    struct FileSysEntry* fse = fsr ? find_filesystem(fsr, dostype) : NULL;
+    if (fse)
     {
-        if (fstab[i].dostype == dostype)
+        me->dev_node.dn_SegList = fse->fse_SegList;
+        if (fse->fse_PatchFlags & FSPF_GLOBALVEC)
         {
-            me->dev_node.dn_SegList = fstab[i].seglist;
-            if (fstab[i].patchflags & FSPF_GLOBALVEC)
-            {
-                me->dev_node.dn_GlobalVec = fstab[i].globalvec;
-            }
-            if (fstab[i].patchflags & FSPF_TYPE)
-            {
-                me->dev_node.dn_Type = fstab[i].dntype;
-            }
-            if (fstab[i].patchflags & FSPF_STACKSIZE)
-            {
-                me->dev_node.dn_StackSize = fstab[i].stacksize;
-            }
-            if (fstab[i].patchflags & FSPF_PRIORITY)
-            {
-                me->dev_node.dn_Priority = fstab[i].priority;
-            }
-            kprintf("a314scsi: partition FS dostype=%lx -> seglist %lx\n", dostype, (ULONG)fstab[i].seglist);
-            break;
+            me->dev_node.dn_GlobalVec = fse->fse_GlobalVec;
         }
+        if (fse->fse_PatchFlags & FSPF_TYPE)
+        {
+            me->dev_node.dn_Type = fse->fse_Type;
+        }
+        if (fse->fse_PatchFlags & FSPF_STACKSIZE)
+        {
+            me->dev_node.dn_StackSize = fse->fse_StackSize;
+        }
+        if (fse->fse_PatchFlags & FSPF_PRIORITY)
+        {
+            me->dev_node.dn_Priority = fse->fse_Priority;
+        }
+    }
+    Permit();
+    if (fse)
+    {
+        kprintf("a314scsi: partition FS dostype=%lx -> seglist %lx\n", dostype, (ULONG)me->dev_node.dn_SegList);
     }
 
     LONG bootpri = (LONG)env[DE_BOOTPRI];
@@ -274,9 +296,12 @@ BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
         ULONG fsh_list = rdb->rdb_FileSysHeaderList;
         ULONG part_block = rdb->rdb_PartitionList;
 
-        struct LoadedFS fstab[MAX_LOADED_FS];
-        ULONG fscount = load_filesystems(base, d, fsh_list, fstab);
-        kprintf("a314scsi: %ld filesystem(s) loaded\n", fscount);
+        struct FileSysResource* fsr = (struct FileSysResource*)OpenResource((STRPTR)FSRNAME);
+        if (fsr)
+        {
+            ULONG fscount = load_filesystems(base, d, fsh_list, fsr);
+            kprintf("a314scsi: %ld filesystem(s) loaded\n", fscount);
+        }
 
         // Enqueue every partition on the expansion MountList (opened once).
         struct ExpansionBase* expansion = (struct ExpansionBase*)OpenLibrary((STRPTR)EXPANSIONNAME, 0);
@@ -298,7 +323,7 @@ BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
                 ULONG next = pb->pb_Next;
                 if (!(pb->pb_Flags & PBFF_NOMOUNT))
                 {
-                    if (mount_partition(base, d, pb, fstab, fscount, expansion))
+                    if (mount_partition(base, d, pb, fsr, expansion))
                     {
                         added = TRUE;
                     }
