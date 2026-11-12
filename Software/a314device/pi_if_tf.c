@@ -318,7 +318,7 @@ ULONG a314base_alloc_mem(__reg("a6") struct A314Device *dev, __reg("d0") ULONG l
 {
 	dbg_trace("a314base_alloc_mem: $l bytes", length);
 	length = ( length + 63 ) & (~63);
-	void *p = AllocMem(length, MEMF_A314 | MEMF_CLEAR);
+	void *p = AllocMem(length, MEMF_A314 | MEMF_CLEAR | MEMF_NO_EXPUNGE);
 	if (!p)
 		return INVALID_A314_ADDRESS;
 	return cpu_to_a314_address(dev,  p);

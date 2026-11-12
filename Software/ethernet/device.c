@@ -580,7 +580,7 @@ static void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req 
 	{
 		struct BufDesc *bd = &et_bufs[i];
 
-		bd->bd_Buffer = AllocMem(RAW_MTU, MEMF_A314);
+		bd->bd_Buffer = AllocMem(RAW_MTU, MEMF_A314 | MEMF_NO_EXPUNGE);
 		bd->bd_BufferIsMapped = bd->bd_Buffer != NULL;
 
 		if (bd->bd_BufferIsMapped)
