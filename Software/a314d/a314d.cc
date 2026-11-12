@@ -568,12 +568,82 @@ static void wait_for_ce0_released()
     if (warned)
         logger_warning("CE0 is deasserted; continuing..\n");
 }
+
+// The FPGA (tf4060v2 #123) gives the bus to the Amiga's flash access only
+// while CE1 (the A314 select) is released, and asserts CE0 while the Amiga has
+// it. So before a transfer: wait for CE0 released, assert CE1 (an spidev
+// message with no data and cs_change set leaves it asserted), and read CE0
+// again: if the Amiga got the bus in that same instant, release CE1 and wait.
+// The transfer itself then runs with CE1 already asserted and releases it.
+static void cs_only(bool hold)
+{
+    struct spi_ioc_transfer tr = {};
+    tr.speed_hz = speed;
+    tr.bits_per_word = bits;
+    tr.cs_change = hold;
+    ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+}
+
+static void acquire_bus()
+{
+    if (gpio_irq_fd < 0)
+        return;
+    for (;;)
+    {
+        wait_for_ce0_released();
+        cs_only(true);
+        if (!ce0_asserted())
+            return;
+        cs_only(false);
+    }
+}
+
+// The Pi's SPI block drives SCLK and MOSI whenever the pins are in ALT0, also
+// between transfers, against the FPGA during the Amiga's flash reads. So they
+// are inputs between transfers (the overlay pulls SCLK down, MOSI up).
+// GPFSEL1: bits 2:0 = GPIO10 (MOSI), 5:3 = GPIO11 (SCLK); ALT0 = 4. The GPIO
+// registers are the BCM2835 layout up to the Pi 4 only, not on a Pi 5.
+static volatile uint32_t *gpio_regs = NULL;
+
+static void spi_pins(bool alt0)
+{
+    if (!gpio_regs)
+        return;
+    uint32_t v = gpio_regs[1] & ~0x3fu;
+    if (alt0)
+        v |= (4u << 0) | (4u << 3);
+    gpio_regs[1] = v;
+}
+
+static void init_spi_pins()
+{
+    char compat[256] = {0};
+    int fd = open("/proc/device-tree/compatible", O_RDONLY);
+    if (fd >= 0)
+    {
+        read(fd, compat, sizeof(compat) - 1);
+        close(fd);
+    }
+    if (memmem(compat, sizeof(compat), "bcm2712", 7))
+        return;
+    fd = open("/dev/gpiomem", O_RDWR | O_SYNC | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m != MAP_FAILED)
+    {
+        gpio_regs = (volatile uint32_t *)m;
+        spi_pins(false);
+    }
+}
 #endif
 
 static int spi_transfer(int len)
 {
 #if defined(MODEL_TF)
-    wait_for_ce0_released();
+    acquire_bus();
+    spi_pins(true);
 #endif
 
     struct spi_ioc_transfer tr =
@@ -588,6 +658,9 @@ static int spi_transfer(int len)
     };
 
     int r = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+#if defined(MODEL_TF)
+    spi_pins(false);
+#endif
     if (r < 0)
         spi_error = true;
     return r;
@@ -1200,6 +1273,7 @@ static int init_driver()
         speed = limit;
         logger_info("SPI speed limited to %d\n", speed);
     }
+    init_spi_pins();
 #endif
 
     spi_proto_ver = spi_protocol_version();
@@ -1237,6 +1311,8 @@ static void shutdown_driver()
     shutdown_gpio_irq();
 #if defined(MODEL_TD)
     shutdown_spi();
+#elif defined(MODEL_TF)
+    spi_pins(true);         // ALT0 again for other spidev users (tfdiag)
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     shutdown_gpio();
 #endif
