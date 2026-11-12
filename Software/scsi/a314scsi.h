@@ -12,6 +12,7 @@
 #include <dos/dos.h> // BPTR
 
 #include <devices/scsidisk.h> // struct SCSICmd
+#include <devices/timer.h> // struct timerequest
 
 #include "../a314device/a314.h" // struct A314_IORequest
 
@@ -64,12 +65,15 @@ struct A314ScsiBase
     APTR                    stack;
 
     // a314 transport (opened and used only by the io task)
-    struct MsgPort*         a314port;
+    struct MsgPort*         a314port;       // replies of a314ior, rstior and tmotr
     struct A314_IORequest   a314ior;
+    struct A314_IORequest   rstior;         // resets the socket while a314ior is out
+    struct timerequest      tmotr;          // a314 request timeouts
     struct Library*         a314base;
     ULONG                   socket;
     ULONG                   bounce;         // a314-space bounce buffer
     UBYTE                   connected;
+    UBYTE                   stuck;          // a314.device stopped replying
 
     // io-task startup handshake back to init_device
     struct Task*            inittask;
