@@ -568,12 +568,99 @@ static void wait_for_ce0_released()
     if (warned)
         logger_warning("CE0 is deasserted; continuing..\n");
 }
+
+// The FPGA gives the SPI bus to the Amiga's flash reads only while CE1 (the
+// A314 select) is released, and asserts CE0 while the Amiga has it. So before
+// a transfer: wait for CE0 released, assert CE1 (an spidev message with no data
+// and cs_change set leaves it asserted), and read CE0 again: if the Amiga got
+// the bus in that same instant, release CE1 and wait again. The transfer then
+// runs with CE1 already asserted and releases it.
+static void cs_only(bool hold)
+{
+    struct spi_ioc_transfer tr = {};
+    tr.speed_hz = speed;
+    tr.bits_per_word = bits;
+    tr.cs_change = hold;
+    if (ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr) < 0)
+        spi_error = true;
+}
+
+static void acquire_bus()
+{
+    if (gpio_irq_fd < 0)
+        return;
+    for (;;)
+    {
+        wait_for_ce0_released();
+        cs_only(true);
+        if (!ce0_asserted())
+            return;
+        cs_only(false);
+    }
+}
+
+// The Pi's SPI block drives SCLK and MOSI whenever the pins are in ALT0, also
+// between transfers, against the FPGA during the Amiga's flash reads. So they
+// are inputs between transfers (the overlay pulls SCLK down, MOSI up). These
+// are the BCM2835 GPIO registers, as on every Pi up to the Pi 4.
+#define GPIOMEM_SIZE        4096
+#define GPFSEL1             1       // word index: function select of GPIO 10-19
+#define GPFSEL_BITS         3
+#define GPFSEL_MASK         7u
+#define GPFSEL_INPUT        0u
+#define GPFSEL_ALT0         4u
+#define GPFSEL_SHIFT(pin)   (((pin) % 10) * GPFSEL_BITS)
+#define GPIO_SPI0_MOSI      10
+#define GPIO_SPI0_SCLK      11
+
+static volatile uint32_t *gpio_regs = NULL;
+
+static void spi_pins(bool alt0)
+{
+    if (!gpio_regs)
+        return;
+    uint32_t fsel = alt0 ? GPFSEL_ALT0 : GPFSEL_INPUT;
+    uint32_t v = gpio_regs[GPFSEL1];
+    v &= ~((GPFSEL_MASK << GPFSEL_SHIFT(GPIO_SPI0_MOSI)) | (GPFSEL_MASK << GPFSEL_SHIFT(GPIO_SPI0_SCLK)));
+    v |= (fsel << GPFSEL_SHIFT(GPIO_SPI0_MOSI)) | (fsel << GPFSEL_SHIFT(GPIO_SPI0_SCLK));
+    gpio_regs[GPFSEL1] = v;
+}
+
+static void init_spi_pins()
+{
+    static const char pi5[] = "bcm2712";
+    char compat[256] = {0};
+    int fd = open("/proc/device-tree/compatible", O_RDONLY);
+    if (fd >= 0)
+    {
+        if (read(fd, compat, sizeof(compat) - 1) < 0)
+            compat[0] = 0;
+        close(fd);
+    }
+    if (memmem(compat, sizeof(compat), pi5, strlen(pi5)))
+    {
+        logger_warning("SCLK/MOSI stay driven between transfers: no BCM2835 GPIO registers on this Pi\n");
+        return;
+    }
+    fd = open("/dev/gpiomem", O_RDWR | O_SYNC | O_CLOEXEC);
+    void *m = fd < 0 ? MAP_FAILED : mmap(NULL, GPIOMEM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (fd >= 0)
+        close(fd);
+    if (m == MAP_FAILED)
+    {
+        logger_warning("SCLK/MOSI stay driven between transfers: can't map /dev/gpiomem\n");
+        return;
+    }
+    gpio_regs = (volatile uint32_t *)m;
+    spi_pins(false);
+}
 #endif
 
 static int spi_transfer(int len)
 {
 #if defined(MODEL_TF)
-    wait_for_ce0_released();
+    acquire_bus();
+    spi_pins(true);
 #endif
 
     struct spi_ioc_transfer tr =
@@ -588,6 +675,9 @@ static int spi_transfer(int len)
     };
 
     int r = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+#if defined(MODEL_TF)
+    spi_pins(false);
+#endif
     if (r < 0)
         spi_error = true;
     return r;
@@ -1200,6 +1290,7 @@ static int init_driver()
         speed = limit;
         logger_info("SPI speed limited to %d\n", speed);
     }
+    init_spi_pins();
 #endif
 
     spi_proto_ver = spi_protocol_version();
@@ -1237,6 +1328,8 @@ static void shutdown_driver()
     shutdown_gpio_irq();
 #if defined(MODEL_TD)
     shutdown_spi();
+#elif defined(MODEL_TF)
+    spi_pins(true);         // ALT0 again for other spidev users (tfdiag)
 #elif defined(MODEL_FE) || defined(MODEL_CP)
     shutdown_gpio();
 #endif

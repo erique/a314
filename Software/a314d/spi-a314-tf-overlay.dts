@@ -29,4 +29,16 @@
                         cs-gpios = <&gpio 7 1>, <&gpio 25 1>;
                 };
         };
+
+        /*
+          a314d keeps SCLK and MOSI as inputs between its transfers (the Pi drives them
+          whenever they are in ALT0, against the TF4060's flash master):
+          pull SCLK down to its idle level and MOSI up. spi0_pins: GPIO 9, 10, 11.
+        */
+        fragment@3 {
+                target = <&spi0_pins>;
+                frag3: __overlay__ {
+                        brcm,pull = <0 2 1>;
+                };
+        };
 };
