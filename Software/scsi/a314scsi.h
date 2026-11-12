@@ -9,6 +9,7 @@
 #include <exec/lists.h>
 #include <exec/libraries.h>
 #include <exec/interrupts.h>
+#include <exec/semaphores.h>
 
 #include <dos/dos.h> // BPTR
 #include <dos/dosextens.h> // struct Process
@@ -103,6 +104,9 @@ struct A314ScsiBase
     UBYTE                   changedunits;
     UBYTE                   uaunits;
 
+    // Held while partitions are taken from the MountList and mounted
+    struct SignalSemaphore  mountsem;
+
     // io-task startup handshake back to init_device
     struct Task*            inittask;
     ULONG                   initsig;
@@ -131,7 +135,7 @@ void a314_poll(struct A314ScsiBase* base);
 LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd);
 
 // cli.c
-void mount_boot_nodes(struct Library* ExpansionBase);
+void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base);
 
 // rdb.c
 BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d);
