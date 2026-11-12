@@ -62,7 +62,7 @@ static struct UsbDevice *global_dev_base = NULL;
 #define SIGB_OP_REQ     SIGBREAKB_CTRL_E
 #define SIGB_A314_WRITE SIGBREAKB_CTRL_F
 
-#define USB_DATA_BUF_SIZE 32768
+#define USB_DATA_BUF_SIZE 4096   // shared with the other A314 services
 #define TASK_STACK_SIZE   8192
 
 // Global USB state
@@ -699,6 +699,10 @@ static void process_async_control_xfer(struct UsbDevice *dev, struct IOUsbHWReq 
     // Poseidon stores wLength as little-endian USB wire order.
     UWORD wLength = swap16(ioreq->iouh_SetupData.wLength);
 
+    // The host writes IN data to the shared buffer, so never ask for more.
+    if (is_in && wLength > dev->dataBufferSize)
+        wLength = dev->dataBufferSize;
+
     if (!is_in && wLength > 0 && ioreq->iouh_Data)
     {
         if (wLength > dev->dataBufferSize)
@@ -721,8 +725,8 @@ static void process_async_control_xfer(struct UsbDevice *dev, struct IOUsbHWReq 
     req_buf[5] = (ioreq->iouh_SetupData.wValue >> 8) & 0xFF;
     req_buf[6] = ioreq->iouh_SetupData.wIndex & 0xFF;
     req_buf[7] = (ioreq->iouh_SetupData.wIndex >> 8) & 0xFF;
-    req_buf[8] = ioreq->iouh_SetupData.wLength & 0xFF;
-    req_buf[9] = (ioreq->iouh_SetupData.wLength >> 8) & 0xFF;
+    req_buf[8] = (wLength >> 8) & 0xFF;
+    req_buf[9] = wLength & 0xFF;
     // Shared buffer address (BE)
     req_buf[10] = (dev->dataBufferAddr >> 24) & 0xFF;
     req_buf[11] = (dev->dataBufferAddr >> 16) & 0xFF;
@@ -768,7 +772,11 @@ static void process_async_int_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ior
     ULONG req_id;
     UBYTE is_in = (ioreq->iouh_Dir == 2);  // UHDIR_IN
     UBYTE endpoint = (UBYTE)(ioreq->iouh_Endpoint | (is_in ? 0x80 : 0x00));
-    UWORD length = (UWORD)ioreq->iouh_Length;
+    ULONG length = ioreq->iouh_Length;
+
+    // The host writes IN data to the shared buffer, so never ask for more.
+    if (is_in && length > dev->dataBufferSize)
+        length = dev->dataBufferSize;
 
     if (!is_in && length > 0 && ioreq->iouh_Data)
     {
@@ -793,7 +801,11 @@ static void process_async_bulk_xfer(struct UsbDevice *dev, struct IOUsbHWReq *io
     ULONG req_id;
     UBYTE is_in = (ioreq->iouh_Dir == 2);
     UBYTE endpoint = (UBYTE)(ioreq->iouh_Endpoint | (is_in ? 0x80 : 0x00));
-    UWORD length = (UWORD)ioreq->iouh_Length;
+    ULONG length = ioreq->iouh_Length;
+
+    // The host writes IN data to the shared buffer, so never ask for more.
+    if (is_in && length > dev->dataBufferSize)
+        length = dev->dataBufferSize;
 
     if (!is_in && length > 0 && ioreq->iouh_Data)
     {
