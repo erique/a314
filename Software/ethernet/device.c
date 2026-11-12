@@ -528,7 +528,6 @@ static void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req 
 
 	copyfrom = (buf_copy_func_t)GetTagData(S2_CopyFromBuff, 0, (struct TagItem *)ios2->ios2_BufferManagement);
 	copyto = (buf_copy_func_t)GetTagData(S2_CopyToBuff, 0, (struct TagItem *)ios2->ios2_BufferManagement);
-	ios2->ios2_BufferManagement = (void *)0xdeadbeefUL;
 
 	memset(&a314_mp, 0, sizeof(a314_mp));
 	a314_mp.mp_Node.ln_Pri = 0;
@@ -615,6 +614,7 @@ static void open(__reg("a6") struct Library *dev, __reg("a1") struct IOSana2Req 
 	if (device_start_error)
 		goto error;
 
+	ios2->ios2_BufferManagement = (void *)0xdeadbeefUL;
 	ios2->ios2_Req.io_Error = 0;
 	return;
 
