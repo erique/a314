@@ -14,7 +14,7 @@
 // Device information
 #define DEVICE_NAME             "a314usb.device"
 #define DEVICE_VERSION          1
-#define DEVICE_REVISION         0
+#define DEVICE_REVISION         1
 
 // USB Hardware Commands (Poseidon standard)
 #define UHCMD_QUERYDEVICE       (CMD_NONSTD + 0)  // 9
@@ -26,6 +26,11 @@
 #define UHCMD_ISOXFER           (CMD_NONSTD + 4)  // 13
 #define UHCMD_INTXFER           (CMD_NONSTD + 5)  // 14
 #define UHCMD_BULKXFER          (CMD_NONSTD + 6)  // 15
+
+// iouh_Dir
+#define UHDIR_SETUP             0
+#define UHDIR_OUT               1
+#define UHDIR_IN                2
 
 // Error codes
 #define UHIOERR_NO_ERROR        0
@@ -96,6 +101,19 @@ struct MsgPort;
 struct Task;
 struct MinList;
 
+// Interrupt transfers pending on the host at once
+#define INT_PARKED_MAX          32
+// AbortIO() calls the device task hasn't handled yet
+#define ABORT_MAX               16
+
+struct ParkedXfer
+{
+    struct IOUsbHWReq *ioreq;         // NULL: slot free
+    ULONG req_id;
+    UWORD length;
+    UBYTE is_in;
+};
+
 // Device structure
 struct UsbDevice
 {
@@ -130,8 +148,19 @@ struct UsbDevice
     BOOL pending_read;
     UBYTE res_msg_buf[256];
 
-    // Current in-flight transfer; a bulk transfer goes in pieces
+    // Interrupt transfers pending on the host
+    struct ParkedXfer parked[INT_PARKED_MAX];
+
+    // Control and bulk transfers waiting for the shared buffer
+    struct MinList waiting;
+
+    struct IOUsbHWReq *abort_reqs[ABORT_MAX];
+    UWORD abort_count;
+
+    // The control or bulk transfer that has the shared buffer; a bulk
+    // transfer goes in pieces
     struct IOUsbHWReq *current_ioreq;
+    ULONG current_req_id;
     UBYTE current_resp_type;
     UBYTE current_is_in;
     UWORD current_max_len;            // length of the piece in flight

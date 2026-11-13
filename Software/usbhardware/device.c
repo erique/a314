@@ -9,8 +9,12 @@
  *    and frees the buffer when the last opener closes or the stream dies.
  *  - BeginIO queues transfer requests to the device task via op_req_mp.
  *  - The device task uses separate read_ior/write_ior for concurrent I/O:
- *    DoIO for writes (short), SendIO for reads (response), main loop waits on
- *    both SIGB_A314 (read complete) and SIGB_OP_REQ (new request).
+ *    DoIO for writes (short), and a read (SendIO) for the host's replies that
+ *    stays pending while connected. Replies carry the request id.
+ *  - Interrupt transfers stay pending on the host until the device has data,
+ *    as on real USB, and several can be pending at once; their data travels
+ *    in the request and reply messages. Control and bulk transfers go one at
+ *    a time through the shared buffer.
  *  - Poseidon stores wValue/wIndex/wLength as little-endian (USB wire order);
  *    we swap them to big-endian for our protocol.
  *  - Transfer data goes through a shared memory buffer (AllocMemA314) that the
@@ -27,6 +31,7 @@
 #include <exec/tasks.h>
 #include <exec/lists.h>
 #include <proto/exec.h>
+#include <clib/alib_protos.h>
 #include <utility/tagitem.h>
 #include <proto/utility.h>
 #include <string.h>
@@ -40,7 +45,7 @@
 
 // Device ID strings
 const char device_name[] = DEVICE_NAME;
-const char id_string[] = DEVICE_NAME " 0.6 (2026)";
+const char id_string[] = DEVICE_NAME " 1.1 (13.11.2026)";
 
 // Verbose per-transfer logging
 #define VERBOSE 0
@@ -88,11 +93,15 @@ static ULONG dev_abort_io(__reg("a6") struct UsbDevice *dev,
 static void task_entry(void);
 static void handle_a314_response(struct UsbDevice *dev);
 static void handle_op_requests(struct UsbDevice *dev);
-static void send_xfer_request(struct UsbDevice *dev, struct IOUsbHWReq *ioreq,
-                               UBYTE *req_buf, UWORD req_len,
-                               UBYTE resp_type, UBYTE is_in, UWORD max_len);
+static void handle_aborts(struct UsbDevice *dev);
+static void start_buffer_xfer(struct UsbDevice *dev);
+static void build_data_xfer_req(UBYTE *req_buf, UBYTE kind,
+                                 struct UsbDevice *dev,
+                                 struct IOUsbHWReq *ioreq,
+                                 UBYTE endpoint, UWORD length,
+                                 ULONG req_id);
+static void send_bulk_piece(struct UsbDevice *dev, struct IOUsbHWReq *ioreq);
 static void process_async_control_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq);
-static void process_async_int_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq);
 static void process_async_bulk_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq);
 
 
@@ -152,6 +161,7 @@ static struct UsbDevice *init_device(__reg("a6") struct ExecBase *sys_base,
     dev->device_task = NULL;
     dev->task_stack = NULL;
     dev->expunge_task = NULL;
+    dev->abort_count = 0;
     dev->task_ready = FALSE;
     dev->connected = FALSE;
     dev->connect_failed = FALSE;
@@ -431,10 +441,19 @@ static void dev_begin_io(__reg("a6") struct UsbDevice *dev,
         ReplyMsg(&ioreq->iouh_Req.io_Message);
 }
 
+// The device task does the abort: it alone touches the transfer lists.
 static ULONG dev_abort_io(__reg("a6") struct UsbDevice *dev,
                            __reg("a1") struct IOUsbHWReq *ioreq)
 {
-    return IOERR_NOCMD;
+    Forbid();
+    if (ioreq->iouh_Req.io_Message.mn_Node.ln_Type != NT_REPLYMSG &&
+        dev->abort_count < ABORT_MAX)
+    {
+        dev->abort_reqs[dev->abort_count++] = ioreq;
+    }
+    Permit();
+    Signal(dev->device_task, 1L << SIGB_OP_REQ);
+    return 0;
 }
 
 
@@ -442,7 +461,51 @@ static ULONG dev_abort_io(__reg("a6") struct UsbDevice *dev,
 // Device task
 // ============================================================================
 
-// Connect to the usbhw service and allocate the shared data buffer.
+static void put_be32(UBYTE *p, ULONG v)
+{
+    p[0] = (v >> 24) & 0xFF;
+    p[1] = (v >> 16) & 0xFF;
+    p[2] = (v >> 8) & 0xFF;
+    p[3] = v & 0xFF;
+}
+
+static ULONG get_be32(const UBYTE *p)
+{
+    return ((ULONG)p[0] << 24) | ((ULONG)p[1] << 16) | ((ULONG)p[2] << 8) | p[3];
+}
+
+// Reply to a transfer. A pending abort of it is dropped, so that it can't hit
+// the request's next use.
+static void reply_ioreq(struct UsbDevice *dev, struct IOUsbHWReq *ioreq,
+                        BYTE error, ULONG actual)
+{
+    Forbid();
+    UWORD j = 0;
+    for (UWORD i = 0; i < dev->abort_count; i++)
+    {
+        if (dev->abort_reqs[i] != ioreq)
+            dev->abort_reqs[j++] = dev->abort_reqs[i];
+    }
+    dev->abort_count = j;
+    Permit();
+
+    ioreq->iouh_Req.io_Error = error;
+    ioreq->iouh_Actual = actual;
+    ReplyMsg(&ioreq->iouh_Req.io_Message);
+}
+
+static void post_read(struct UsbDevice *dev)
+{
+    dev->read_ior->a314_Request.io_Command = A314_READ;
+    dev->read_ior->a314_Socket = dev->a314_socket;
+    dev->read_ior->a314_Buffer = (STRPTR)dev->res_msg_buf;
+    dev->read_ior->a314_Length = sizeof(dev->res_msg_buf);
+    SendIO(&dev->read_ior->a314_Request);
+    dev->pending_read = TRUE;
+}
+
+// Connect to the usbhw service, allocate the shared data buffer, and keep a
+// read for the host's replies pending from then on.
 static BOOL connect_service(struct UsbDevice *dev)
 {
     dev->read_ior->a314_Request.io_Command = A314_CONNECT;
@@ -477,14 +540,23 @@ static BOOL connect_service(struct UsbDevice *dev)
             SERVICE_NAME, dev->dataBufferAddr, dev->dataBufferSize);
     dev->connected = TRUE;
     dev->connect_failed = FALSE;
+    post_read(dev);
     return TRUE;
 }
 
-// Reset the stream and free the shared data buffer. No read may be pending.
+// Reset the stream, free the shared data buffer, and fail every transfer that
+// was started or waits for the buffer.
 static void disconnect_service(struct UsbDevice *dev)
 {
     if (!dev->connected)
         return;
+
+    if (dev->pending_read)
+    {
+        AbortIO(&dev->read_ior->a314_Request);
+        WaitIO(&dev->read_ior->a314_Request);
+        dev->pending_read = FALSE;
+    }
 
     dev->write_ior->a314_Request.io_Command = A314_RESET;
     dev->write_ior->a314_Socket = dev->a314_socket;
@@ -494,6 +566,58 @@ static void disconnect_service(struct UsbDevice *dev)
     dev->dataBufferAddr = INVALID_A314_ADDRESS;
     dev->connected = FALSE;
     kprintf("a314usb.device: Disconnected from %s", SERVICE_NAME);
+
+    if (dev->current_ioreq)
+    {
+        struct IOUsbHWReq *ioreq = dev->current_ioreq;
+        dev->current_ioreq = NULL;
+        reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, dev->xfer_offset);
+    }
+
+    struct IOUsbHWReq *ioreq;
+    while ((ioreq = (struct IOUsbHWReq *)RemHead((struct List *)&dev->waiting)))
+        reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, 0);
+
+    for (UWORD i = 0; i < INT_PARKED_MAX; i++)
+    {
+        if (dev->parked[i].ioreq)
+        {
+            ioreq = dev->parked[i].ioreq;
+            dev->parked[i].ioreq = NULL;
+            reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, 0);
+        }
+    }
+}
+
+// Write one request to the host. A failed write means the stream is gone.
+static BOOL send_request(struct UsbDevice *dev, UBYTE *req_buf, UWORD req_len)
+{
+    dev->write_ior->a314_Request.io_Command = A314_WRITE;
+    dev->write_ior->a314_Socket = dev->a314_socket;
+    dev->write_ior->a314_Buffer = (STRPTR)req_buf;
+    dev->write_ior->a314_Length = req_len;
+    DoIO(&dev->write_ior->a314_Request);
+
+    if (dev->write_ior->a314_Request.io_Error != A314_WRITE_OK)
+    {
+        kprintf("a314usb.device: A314_WRITE err=%ld",
+                (LONG)dev->write_ior->a314_Request.io_Error);
+        disconnect_service(dev);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL nothing_in_flight(struct UsbDevice *dev)
+{
+    if (dev->current_ioreq || !IsListEmpty((struct List *)&dev->waiting))
+        return FALSE;
+    for (UWORD i = 0; i < INT_PARKED_MAX; i++)
+    {
+        if (dev->parked[i].ioreq)
+            return FALSE;
+    }
+    return TRUE;
 }
 
 static void task_entry(void)
@@ -530,6 +654,7 @@ static void task_entry(void)
     dev->connected = FALSE;
     dev->pending_read = FALSE;
     dev->current_ioreq = NULL;
+    NewList((struct List *)&dev->waiting);
     dev->task_ready = TRUE;
 
     // Signal init task that we're ready
@@ -551,20 +676,14 @@ static void task_entry(void)
         if (signals & (1L << SIGB_A314))
             handle_a314_response(dev);
 
-        // Always try to pick up queued op requests; the SIGB_OP_REQ bit
-        // may have been consumed earlier while a transfer was in flight.
         handle_op_requests(dev);
+        handle_aborts(dev);
+        start_buffer_xfer(dev);
 
-        if (dev->lib.lib_OpenCnt == 0 && !dev->pending_read)
+        if (dev->lib.lib_OpenCnt == 0 && nothing_in_flight(dev))
             disconnect_service(dev);
     }
 
-    if (dev->pending_read)
-    {
-        AbortIO(&dev->read_ior->a314_Request);
-        WaitIO(&dev->read_ior->a314_Request);
-        dev->pending_read = FALSE;
-    }
     disconnect_service(dev);
 
     kprintf("a314usb.device: task exiting");
@@ -583,66 +702,27 @@ fail:
 
 
 // ============================================================================
-// Response handler + transfer dispatcher
+// Host replies, requests and aborts
 // ============================================================================
 
-static void send_bulk_piece(struct UsbDevice *dev, struct IOUsbHWReq *ioreq);
-
-static void reply_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq, BYTE error)
+// A reply to the control or bulk transfer that has the shared buffer.
+static void handle_buffer_reply(struct UsbDevice *dev, UBYTE kind, UBYTE status,
+                                UWORD actual_length, ULONG req_id)
 {
-    ioreq->iouh_Req.io_Error = error;
-    ioreq->iouh_Actual = dev->xfer_offset;
-    ReplyMsg(&ioreq->iouh_Req.io_Message);
-}
+    struct IOUsbHWReq *ioreq = dev->current_ioreq;
 
-static void handle_a314_response(struct UsbDevice *dev)
-{
-    struct IOUsbHWReq *ioreq;
-    UBYTE status;
-    UWORD actual_length, copy_len;
-
-    if (!dev->pending_read)
-        return;
-    if (!GetMsg(dev->a314_mp))
-        return;
-
-    WaitIO(&dev->read_ior->a314_Request);
-    dev->pending_read = FALSE;
-
-    ioreq = dev->current_ioreq;
-    dev->current_ioreq = NULL;
-
-    if (dev->read_ior->a314_Request.io_Error != A314_READ_OK)
+    if (!ioreq || kind != dev->current_resp_type || req_id != dev->current_req_id)
     {
-        kprintf("a314usb.device: stream lost err=%ld",
-                (LONG)dev->read_ior->a314_Request.io_Error);
-        disconnect_service(dev);
-        if (ioreq)
-            reply_xfer(dev, ioreq, UHIOERR_HOSTERROR);
+        kprintf("a314usb.device: unexpected reply kind=%ld id=%ld",
+                (ULONG)kind, req_id);
         return;
     }
-
-    if (!ioreq)
-        return;
-
-    if (dev->read_ior->a314_Length < 8 ||
-        dev->res_msg_buf[0] != dev->current_resp_type)
-    {
-        kprintf("a314usb.device: bad resp len=%ld kind=%ld want=%ld",
-                dev->read_ior->a314_Length,
-                (ULONG)dev->res_msg_buf[0],
-                (ULONG)dev->current_resp_type);
-        reply_xfer(dev, ioreq, UHIOERR_HOSTERROR);
-        return;
-    }
-
-    status = dev->res_msg_buf[1];
-    actual_length = (dev->res_msg_buf[2] << 8) | dev->res_msg_buf[3];
 
     switch (status)
     {
         case USB_STATUS_OK:
-            copy_len = actual_length;
+        {
+            UWORD copy_len = actual_length;
             if (copy_len > dev->current_max_len)
                 copy_len = dev->current_max_len;
             if (dev->current_is_in && copy_len > 0 && ioreq->iouh_Data)
@@ -651,99 +731,294 @@ static void handle_a314_response(struct UsbDevice *dev)
             dev->xfer_offset += copy_len;
             // A full piece of a bulk transfer is followed by the next one; a
             // short IN piece ends the transfer.
-            if (dev->current_resp_type == USB_BULK_TRANSFER_RES &&
+            if (kind == USB_BULK_TRANSFER_RES &&
                 copy_len == dev->current_max_len &&
                 dev->xfer_offset < ioreq->iouh_Length)
             {
                 send_bulk_piece(dev, ioreq);
                 return;
             }
-            reply_xfer(dev, ioreq, UHIOERR_NO_ERROR);
+            dev->current_ioreq = NULL;
+            reply_ioreq(dev, ioreq, UHIOERR_NO_ERROR, dev->xfer_offset);
             break;
+        }
         case USB_STATUS_STALL:
-            reply_xfer(dev, ioreq, UHIOERR_STALL);
+            dev->current_ioreq = NULL;
+            reply_ioreq(dev, ioreq, UHIOERR_STALL, dev->xfer_offset);
             break;
         case USB_STATUS_NAK_TIMEOUT:
-            reply_xfer(dev, ioreq, UHIOERR_NAKTIMEOUT);
+            dev->current_ioreq = NULL;
+            reply_ioreq(dev, ioreq, UHIOERR_NAKTIMEOUT, dev->xfer_offset);
             break;
         default:
-            reply_xfer(dev, ioreq, UHIOERR_HOSTERROR);
+            dev->current_ioreq = NULL;
+            reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, dev->xfer_offset);
             break;
     }
 }
 
-// Send A314 WRITE (sync), then SendIO an async A314 READ.
-// When the read completes we'll process the response.
-static void send_xfer_request(struct UsbDevice *dev, struct IOUsbHWReq *ioreq,
-                               UBYTE *req_buf, UWORD req_len,
-                               UBYTE resp_type, UBYTE is_in, UWORD max_len)
+// A reply to an interrupt transfer; its IN data comes with it.
+static void handle_int_reply(struct UsbDevice *dev, UBYTE status,
+                             UWORD actual_length, ULONG req_id, UBYTE *data)
 {
-    dev->write_ior->a314_Request.io_Command = A314_WRITE;
-    dev->write_ior->a314_Socket = dev->a314_socket;
-    dev->write_ior->a314_Buffer = (STRPTR)req_buf;
-    dev->write_ior->a314_Length = req_len;
-
-    DoIO(&dev->write_ior->a314_Request);
-
-    if (dev->write_ior->a314_Request.io_Error != A314_WRITE_OK)
+    struct ParkedXfer *p = NULL;
+    for (UWORD i = 0; i < INT_PARKED_MAX; i++)
     {
-        kprintf("a314usb.device: A314_WRITE err=%ld",
-                (LONG)dev->write_ior->a314_Request.io_Error);
+        if (dev->parked[i].ioreq && dev->parked[i].req_id == req_id)
+        {
+            p = &dev->parked[i];
+            break;
+        }
+    }
+    if (!p)
+        return;     // aborted
+
+    struct IOUsbHWReq *ioreq = p->ioreq;
+    p->ioreq = NULL;
+
+    switch (status)
+    {
+        case USB_STATUS_OK:
+        {
+            UWORD copy_len = actual_length;
+            if (copy_len > p->length)
+                copy_len = p->length;
+            if (p->is_in && copy_len > 0 && ioreq->iouh_Data)
+                CopyMem(data, ioreq->iouh_Data, copy_len);
+            reply_ioreq(dev, ioreq, UHIOERR_NO_ERROR, copy_len);
+            break;
+        }
+        case USB_STATUS_STALL:
+            reply_ioreq(dev, ioreq, UHIOERR_STALL, 0);
+            break;
+        case USB_STATUS_NAK_TIMEOUT:
+            reply_ioreq(dev, ioreq, UHIOERR_NAKTIMEOUT, 0);
+            break;
+        default:
+            reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, 0);
+            break;
+    }
+}
+
+static void handle_a314_response(struct UsbDevice *dev)
+{
+    if (!dev->pending_read)
+        return;
+    if (!GetMsg(dev->a314_mp))
+        return;
+
+    WaitIO(&dev->read_ior->a314_Request);
+    dev->pending_read = FALSE;
+
+    if (dev->read_ior->a314_Request.io_Error != A314_READ_OK)
+    {
+        kprintf("a314usb.device: stream lost err=%ld",
+                (LONG)dev->read_ior->a314_Request.io_Error);
         disconnect_service(dev);
-        reply_xfer(dev, ioreq, UHIOERR_HOSTERROR);
         return;
     }
 
+    if (dev->read_ior->a314_Length < 8)
+    {
+        kprintf("a314usb.device: short reply len=%ld", dev->read_ior->a314_Length);
+    }
+    else
+    {
+        UBYTE *res = dev->res_msg_buf;
+        UBYTE kind = res[0];
+        UBYTE status = res[1];
+        UWORD actual_length = (res[2] << 8) | res[3];
+        ULONG req_id = get_be32(&res[4]);
+
+        if (kind == USB_INT_TRANSFER_RES)
+        {
+            if (8 + (ULONG)actual_length > dev->read_ior->a314_Length)
+                actual_length = dev->read_ior->a314_Length - 8;
+            handle_int_reply(dev, status, actual_length, req_id, &res[8]);
+        }
+        else
+        {
+            handle_buffer_reply(dev, kind, status, actual_length, req_id);
+        }
+    }
+
+    if (dev->connected && !dev->pending_read)
+        post_read(dev);
+}
+
+// Interrupt transfers go to the host at once and stay there until the device
+// has data; their data travels in the request and the reply, not the buffer.
+static void start_int_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq)
+{
+    UBYTE req_buf[16 + USB_INT_DATA_MAX];
+    UBYTE is_in = (ioreq->iouh_Dir == UHDIR_IN);
+    UBYTE endpoint = (UBYTE)(ioreq->iouh_Endpoint | (is_in ? 0x80 : 0x00));
+    ULONG length = ioreq->iouh_Length;
+
+    if (is_in && length > USB_INT_DATA_MAX)
+        length = USB_INT_DATA_MAX;
+    if (!is_in && length > USB_INT_DATA_MAX)
+    {
+        reply_ioreq(dev, ioreq, UHIOERR_BADPARAMS, 0);
+        return;
+    }
+
+    struct ParkedXfer *p = NULL;
+    for (UWORD i = 0; i < INT_PARKED_MAX; i++)
+    {
+        if (!dev->parked[i].ioreq)
+        {
+            p = &dev->parked[i];
+            break;
+        }
+    }
+    if (!p)
+    {
+        kprintf("a314usb.device: too many interrupt transfers");
+        reply_ioreq(dev, ioreq, UHIOERR_HOSTERROR, 0);
+        return;
+    }
+
+    ULONG req_id = dev->next_req_id++;
+    build_data_xfer_req(req_buf, USB_INT_TRANSFER_REQ, dev, ioreq, endpoint, length, req_id);
+    UWORD req_len = 16;
+    if (!is_in && length > 0 && ioreq->iouh_Data)
+    {
+        CopyMem(ioreq->iouh_Data, &req_buf[16], length);
+        req_len += length;
+    }
+
+    p->ioreq = ioreq;
+    p->req_id = req_id;
+    p->length = length;
+    p->is_in = is_in;
+    send_request(dev, req_buf, req_len);
+}
+
+// Take the new requests: interrupt transfers start, control and bulk transfers
+// queue for the shared buffer.
+static void handle_op_requests(struct UsbDevice *dev)
+{
+    while (TRUE)
+    {
+        // Under Forbid() a request is always on a list: dev_abort_io() can
+        // only queue it for handle_aborts().
+        Forbid();
+        struct IOUsbHWReq *ioreq = (struct IOUsbHWReq *)GetMsg(dev->op_req_mp);
+        if (ioreq && ioreq->iouh_Req.io_Command != UHCMD_INTXFER)
+            AddTail((struct List *)&dev->waiting, &ioreq->iouh_Req.io_Message.mn_Node);
+        Permit();
+
+        if (!ioreq)
+            return;
+        if (ioreq->iouh_Req.io_Command != UHCMD_INTXFER)
+            continue;
+
+        if (!dev->connected && !connect_service(dev))
+        {
+            reply_ioreq(dev, ioreq, UHIOERR_USBOFFLINE, 0);
+            continue;
+        }
+        start_int_xfer(dev, ioreq);
+    }
+}
+
+static BOOL remove_if_listed(struct List *list, struct IOUsbHWReq *ioreq)
+{
+    BOOL found = FALSE;
+    Forbid();
+    for (struct Node *n = list->lh_Head; n->ln_Succ; n = n->ln_Succ)
+    {
+        if (n == &ioreq->iouh_Req.io_Message.mn_Node)
+        {
+            Remove(n);
+            found = TRUE;
+            break;
+        }
+    }
+    Permit();
+    return found;
+}
+
+// Aborted requests: one not started yet is taken off its list, a pending
+// interrupt transfer is cancelled on the host too. A control or bulk transfer
+// in progress finishes.
+static void handle_aborts(struct UsbDevice *dev)
+{
+    while (TRUE)
+    {
+        Forbid();
+        struct IOUsbHWReq *ioreq = NULL;
+        if (dev->abort_count > 0)
+            ioreq = dev->abort_reqs[--dev->abort_count];
+        Permit();
+        if (!ioreq)
+            return;
+
+        if (remove_if_listed(&dev->op_req_mp->mp_MsgList, ioreq) ||
+            remove_if_listed((struct List *)&dev->waiting, ioreq))
+        {
+            reply_ioreq(dev, ioreq, IOERR_ABORTED, 0);
+            continue;
+        }
+
+        for (UWORD i = 0; i < INT_PARKED_MAX; i++)
+        {
+            if (dev->parked[i].ioreq == ioreq)
+            {
+                UBYTE req_buf[8];
+                req_buf[0] = USB_ABORT_TRANSFER_REQ;
+                req_buf[1] = 0;
+                req_buf[2] = 0;
+                req_buf[3] = 0;
+                put_be32(&req_buf[4], dev->parked[i].req_id);
+                dev->parked[i].ioreq = NULL;
+                reply_ioreq(dev, ioreq, IOERR_ABORTED, 0);
+                if (dev->connected)
+                    send_request(dev, req_buf, sizeof(req_buf));
+                break;
+            }
+        }
+    }
+}
+
+// Start the next control or bulk transfer once the shared buffer is free.
+static void start_buffer_xfer(struct UsbDevice *dev)
+{
+    while (!dev->current_ioreq)
+    {
+        Forbid();
+        struct IOUsbHWReq *ioreq = (struct IOUsbHWReq *)RemHead((struct List *)&dev->waiting);
+        Permit();
+        if (!ioreq)
+            return;
+
+        if (!dev->connected && !connect_service(dev))
+        {
+            reply_ioreq(dev, ioreq, UHIOERR_USBOFFLINE, 0);
+            continue;
+        }
+
+        dev->xfer_offset = 0;
+        if (ioreq->iouh_Req.io_Command == UHCMD_CONTROLXFER)
+            process_async_control_xfer(dev, ioreq);
+        else
+            process_async_bulk_xfer(dev, ioreq);
+    }
+}
+
+// Send a control or bulk request that uses the shared buffer, and wait for its
+// reply in handle_buffer_reply().
+static void send_buffer_request(struct UsbDevice *dev, struct IOUsbHWReq *ioreq,
+                                UBYTE *req_buf, UWORD req_len, ULONG req_id,
+                                UBYTE resp_type, UBYTE is_in, UWORD max_len)
+{
     dev->current_ioreq = ioreq;
+    dev->current_req_id = req_id;
     dev->current_resp_type = resp_type;
     dev->current_is_in = is_in;
     dev->current_max_len = max_len;
-
-    dev->read_ior->a314_Request.io_Command = A314_READ;
-    dev->read_ior->a314_Socket = dev->a314_socket;
-    dev->read_ior->a314_Buffer = (STRPTR)dev->res_msg_buf;
-    dev->read_ior->a314_Length = sizeof(dev->res_msg_buf);
-    SendIO(&dev->read_ior->a314_Request);
-    dev->pending_read = TRUE;
-}
-
-// Dequeue one Poseidon request (if any) and start a transfer.
-// Skips if a transfer is currently in flight.
-static void handle_op_requests(struct UsbDevice *dev)
-{
-    struct IOUsbHWReq *ioreq;
-
-    if (dev->pending_read)
-        return;
-
-    ioreq = (struct IOUsbHWReq *)GetMsg(dev->op_req_mp);
-    if (!ioreq)
-        return;
-
-    dev->xfer_offset = 0;
-    ioreq->iouh_Actual = 0;
-
-    if (!dev->connected && !connect_service(dev))
-    {
-        reply_xfer(dev, ioreq, UHIOERR_USBOFFLINE);
-        return;
-    }
-
-    switch (ioreq->iouh_Req.io_Command)
-    {
-        case UHCMD_CONTROLXFER:
-            process_async_control_xfer(dev, ioreq);
-            break;
-        case UHCMD_INTXFER:
-            process_async_int_xfer(dev, ioreq);
-            break;
-        case UHCMD_BULKXFER:
-            process_async_bulk_xfer(dev, ioreq);
-            break;
-        default:
-            reply_xfer(dev, ioreq, IOERR_NOCMD);
-            break;
-    }
+    send_request(dev, req_buf, req_len);
 }
 
 
@@ -773,8 +1048,7 @@ static void process_async_control_xfer(struct UsbDevice *dev, struct IOUsbHWReq 
     {
         if (wLength > dev->dataBufferSize)
         {
-            ioreq->iouh_Req.io_Error = UHIOERR_BADPARAMS;
-            ReplyMsg(&ioreq->iouh_Req.io_Message);
+            reply_ioreq(dev, ioreq, UHIOERR_BADPARAMS, 0);
             return;
         }
         WriteMemA314(dev->dataBufferAddr, ioreq->iouh_Data, wLength);
@@ -794,18 +1068,12 @@ static void process_async_control_xfer(struct UsbDevice *dev, struct IOUsbHWReq 
     req_buf[8] = (wLength >> 8) & 0xFF;
     req_buf[9] = wLength & 0xFF;
     // Shared buffer address (BE)
-    req_buf[10] = (dev->dataBufferAddr >> 24) & 0xFF;
-    req_buf[11] = (dev->dataBufferAddr >> 16) & 0xFF;
-    req_buf[12] = (dev->dataBufferAddr >> 8) & 0xFF;
-    req_buf[13] = dev->dataBufferAddr & 0xFF;
+    put_be32(&req_buf[10], dev->dataBufferAddr);
     // Request ID (BE)
-    req_buf[14] = (req_id >> 24) & 0xFF;
-    req_buf[15] = (req_id >> 16) & 0xFF;
-    req_buf[16] = (req_id >> 8) & 0xFF;
-    req_buf[17] = req_id & 0xFF;
+    put_be32(&req_buf[14], req_id);
 
-    send_xfer_request(dev, ioreq, req_buf, 18,
-                       USB_CONTROL_TRANSFER_RES, is_in, wLength);
+    send_buffer_request(dev, ioreq, req_buf, 18, req_id,
+                        USB_CONTROL_TRANSFER_RES, is_in, wLength);
 }
 
 static void build_data_xfer_req(UBYTE *req_buf, UBYTE kind,
@@ -822,50 +1090,15 @@ static void build_data_xfer_req(UBYTE *req_buf, UBYTE kind,
     req_buf[5] = ioreq->iouh_MaxPktSize & 0xFF;
     req_buf[6] = (length >> 8) & 0xFF;
     req_buf[7] = length & 0xFF;
-    req_buf[8] = (dev->dataBufferAddr >> 24) & 0xFF;
-    req_buf[9] = (dev->dataBufferAddr >> 16) & 0xFF;
-    req_buf[10] = (dev->dataBufferAddr >> 8) & 0xFF;
-    req_buf[11] = dev->dataBufferAddr & 0xFF;
-    req_buf[12] = (req_id >> 24) & 0xFF;
-    req_buf[13] = (req_id >> 16) & 0xFF;
-    req_buf[14] = (req_id >> 8) & 0xFF;
-    req_buf[15] = req_id & 0xFF;
-}
-
-static void process_async_int_xfer(struct UsbDevice *dev, struct IOUsbHWReq *ioreq)
-{
-    UBYTE req_buf[16];
-    ULONG req_id;
-    UBYTE is_in = (ioreq->iouh_Dir == 2);  // UHDIR_IN
-    UBYTE endpoint = (UBYTE)(ioreq->iouh_Endpoint | (is_in ? 0x80 : 0x00));
-    ULONG length = ioreq->iouh_Length;
-
-    // The host writes IN data to the shared buffer, so never ask for more.
-    if (is_in && length > dev->dataBufferSize)
-        length = dev->dataBufferSize;
-
-    if (!is_in && length > 0 && ioreq->iouh_Data)
-    {
-        if (length > dev->dataBufferSize)
-        {
-            ioreq->iouh_Req.io_Error = UHIOERR_BADPARAMS;
-            ReplyMsg(&ioreq->iouh_Req.io_Message);
-            return;
-        }
-        WriteMemA314(dev->dataBufferAddr, ioreq->iouh_Data, length);
-    }
-
-    req_id = dev->next_req_id++;
-    build_data_xfer_req(req_buf, USB_INT_TRANSFER_REQ, dev, ioreq, endpoint, length, req_id);
-    send_xfer_request(dev, ioreq, req_buf, 16,
-                       USB_INT_TRANSFER_RES, is_in, length);
+    put_be32(&req_buf[8], dev->dataBufferAddr);
+    put_be32(&req_buf[12], req_id);
 }
 
 // Send the next piece of a bulk transfer, starting at xfer_offset.
 static void send_bulk_piece(struct UsbDevice *dev, struct IOUsbHWReq *ioreq)
 {
     UBYTE req_buf[16];
-    UBYTE is_in = (ioreq->iouh_Dir == 2);
+    UBYTE is_in = (ioreq->iouh_Dir == UHDIR_IN);
     UBYTE endpoint = (UBYTE)(ioreq->iouh_Endpoint | (is_in ? 0x80 : 0x00));
     ULONG length = ioreq->iouh_Length - dev->xfer_offset;
 
@@ -875,10 +1108,10 @@ static void send_bulk_piece(struct UsbDevice *dev, struct IOUsbHWReq *ioreq)
     if (!is_in && length > 0 && ioreq->iouh_Data)
         WriteMemA314(dev->dataBufferAddr, (UBYTE *)ioreq->iouh_Data + dev->xfer_offset, length);
 
-    build_data_xfer_req(req_buf, USB_BULK_TRANSFER_REQ, dev, ioreq, endpoint, length,
-                        dev->next_req_id++);
-    send_xfer_request(dev, ioreq, req_buf, 16,
-                       USB_BULK_TRANSFER_RES, is_in, length);
+    ULONG req_id = dev->next_req_id++;
+    build_data_xfer_req(req_buf, USB_BULK_TRANSFER_REQ, dev, ioreq, endpoint, length, req_id);
+    send_buffer_request(dev, ioreq, req_buf, 16, req_id,
+                        USB_BULK_TRANSFER_RES, is_in, length);
 }
 
 // A transfer larger than the shared buffer goes in pieces that are whole

@@ -28,6 +28,10 @@
 #define USB_ABORT_TRANSFER_REQ    13
 #define USB_ABORT_TRANSFER_RES    14
 
+// Interrupt transfer data travels in the request (OUT) or reply (IN) message,
+// after its header; this is the most it can carry.
+#define USB_INT_DATA_MAX         192
+
 // Transfer Status Codes
 #define USB_STATUS_OK              0
 #define USB_STATUS_STALL           1
