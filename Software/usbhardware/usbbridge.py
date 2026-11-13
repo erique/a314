@@ -608,7 +608,7 @@ class UsbBridgeService:
             # Other addresses -> real libusb device
             port, dev = self.dev_addr_map.get(dev_addr, (None, None))
             if dev is None:
-                logger.warning(f"Unknown dev_addr {dev_addr}")
+                logger.debug(f"Unknown dev_addr {dev_addr}")
                 self.send_control_transfer_res(req_id, USB_STATUS_ERROR, 0)
                 return
             self._handle_dev_control(dev, bmRT, bReq, wValue, wIndex, wLength,
@@ -734,7 +734,7 @@ class UsbBridgeService:
 
         port, dev = self.dev_addr_map.get(dev_addr, (None, None))
         if dev is None:
-            logger.warning(f"Interrupt: unknown dev_addr {dev_addr}")
+            logger.debug(f"Interrupt: unknown dev_addr {dev_addr}")
             self.send_interrupt_transfer_res(req_id, USB_STATUS_ERROR)
             return
         if hasattr(dev, 'read_interrupt'):
@@ -764,7 +764,7 @@ class UsbBridgeService:
 
         port, dev = self.dev_addr_map.get(dev_addr, (None, None))
         if dev is None:
-            logger.warning(f"Interrupt: unknown dev_addr {dev_addr}")
+            logger.debug(f"Interrupt: unknown dev_addr {dev_addr}")
             return (USB_STATUS_ERROR, b'')
 
         # Virtual device
@@ -836,7 +836,7 @@ class UsbBridgeService:
 
         port, dev = self.dev_addr_map.get(dev_addr, (None, None))
         if dev is None:
-            logger.warning(f"Bulk: unknown dev_addr {dev_addr}")
+            logger.debug(f"Bulk: unknown dev_addr {dev_addr}")
             self.send_bulk_transfer_res(req_id, USB_STATUS_ERROR, 0)
             return
 
