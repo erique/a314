@@ -23,6 +23,10 @@ USB_RESET_DEVICE_RES = 12
 USB_ABORT_TRANSFER_REQ = 13
 USB_ABORT_TRANSFER_RES = 14
 
+# Interrupt transfer data travels in the request (OUT) or reply (IN) message,
+# after its header; this is the most it can carry.
+USB_INT_DATA_MAX = 192
+
 # Transfer Status Codes
 USB_STATUS_OK = 0
 USB_STATUS_STALL = 1
