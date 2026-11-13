@@ -44,7 +44,13 @@ any. Hubs are never passed through.
     }
 
 A device the Amiga gets is taken from its Linux driver while the Amiga uses
-it, and given back when Poseidon takes the hardware offline.
+it, and given back when Poseidon takes the hardware offline. Only drivers the
+bridge took are given back; an interface that had no driver bound stays
+unbound.
+
+Dismount the volumes of a USB drive (`Assign <volume>: DISMOUNT`) before taking
+the hardware offline. Offline aborts the transfers in progress, and a file
+system still using the drive shows read or write errors.
 
 `port_count` is the number of ports on the Amiga's root hub, and so the most
 devices the Amiga can have at once.
