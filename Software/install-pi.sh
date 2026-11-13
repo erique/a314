@@ -41,6 +41,15 @@ install_common() {
 	[ -f /etc/opt/a314/scsi.conf ] || modinstall scsi/scsi.conf /etc/opt/a314
 	[ -f /etc/opt/a314/usbbridge.conf ] || modinstall usbhardware/usbbridge.conf /etc/opt/a314
 
+	# Let usbbridge open the USB devices that usbbridge.conf lets through.
+	# Run install-pi.sh again after changing the filters in usbbridge.conf.
+	python3 usbhardware/udev-rules.py /etc/opt/a314/usbbridge.conf ${A314_GROUP} > /etc/udev/rules.d/99-a314usb.rules
+	udevadm control --reload-rules
+	udevadm trigger --subsystem-match=usb
+
+	# Keep Logitech receivers out of DJ mode
+	install -m644 usbhardware/a314usb-blacklist.conf /etc/modprobe.d
+
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
 
