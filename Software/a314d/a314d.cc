@@ -1859,6 +1859,10 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
             }
             else if (child == 0)
             {
+                // a314d blocks SIGTERM, and a blocked signal stays blocked
+                // across exec: unblock it, so the service can be stopped.
+                sigprocmask(SIG_SETMASK, &original_sigset, NULL);
+
                 close(fds[0]);
                 int fd = fds[1];
 
