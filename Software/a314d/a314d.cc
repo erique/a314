@@ -527,54 +527,119 @@ static int check_spidev_bufsiz()
 #if defined(MODEL_TF)
 // CE0 is the SPI flash's chip select, on the same SPI bus as the A314. It is
 // asserted while the Amiga reads the flash. An SPI transfer made then reads or
-// writes garbage without any ioctl() error. This only keeps the Pi from
-// starting during a flash access: the Amiga side does not wait for the Pi.
-#define CE0_WAIT_FIRST_US   10
-#define CE0_WAIT_MAX_US     (100*1000)
-#define CE0_WAIT_WARN_US    (1000*1000)
+// writes garbage without any ioctl() error.
 
-// True if CE0 is asserted, or its state can't be read.
+// True if CE0 is asserted, or its state can't be read (no transfer is started
+// then). A failed read is logged once, until a read works again.
 static bool ce0_asserted()
 {
+    static bool read_failed = false;
     gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
     if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state))
+    {
+        if (!read_failed)
+            logger_warning("Unable to get GPIO state; %d / %s -- taking CE0 as asserted\n", errno, strerror(errno));
+        read_failed = true;
         return true;
+    }
+    read_failed = false;
     return gpio_state.bits == 0;
 }
 
-// Waits for CE0 to be released. The callers can't handle a failed transfer, so
-// there is no time limit. The GPIO line is requested after the first SPI
-// transfers (init_driver()); those are not checked.
-static void wait_for_ce0_released()
-{
-    if (gpio_irq_fd < 0)
-        return;
+#define NS_PER_US           1000ull
+#define US_PER_MS           1000ull
+#define US_PER_S            1000000ull
 
-    unsigned long waited = 0;
-    __useconds_t timeout = CE0_WAIT_FIRST_US;
-    bool warned = false;
-    while (ce0_asserted())
-    {
-        if (!warned && waited >= CE0_WAIT_WARN_US)
-        {
-            logger_warning("CE0 still asserted -- waiting to make an SPI transfer\n");
-            warned = true;
-        }
-        usleep(timeout);
-        waited += timeout;
-        if (timeout < CE0_WAIT_MAX_US)
-            timeout *= 2;
-    }
-    if (warned)
-        logger_warning("CE0 is deasserted; continuing..\n");
+static uint64_t mono_us()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * US_PER_S + ts.tv_nsec / NS_PER_US;
 }
 
 // The FPGA gives the SPI bus to the Amiga's flash reads only while CE1 (the
-// A314 select) is released, and asserts CE0 while the Amiga has it. So before
-// a transfer: wait for CE0 released, assert CE1 (an spidev message with no data
-// and cs_change set leaves it asserted), and read CE0 again: if the Amiga got
-// the bus in that same instant, release CE1 and wait again. The transfer then
-// runs with CE1 already asserted and releases it.
+// A314 select) is released, and asserts CE0 while the Amiga has it. So a314d
+// asks for the bus by asserting CE1 (an spidev message with no data and
+// cs_change set leaves it asserted) and then waits for CE0 to be released: the
+// Amiga finishes the flash read it is in, and the FPGA starts no other while
+// CE1 is asserted. The transfer then runs with CE1 asserted and releases it.
+// This needs FPGA firmware v0.8.2 or newer, which arbitrates the SPI bus.
+// A flash read holds the bus for 20-30 ms (spiromfs reads 4 KB at a time, a
+// byte per CPU access), longer when the Amiga switches away from spiromfs in
+// the middle of one (up to 400 ms seen with ten busy Shells). Holding CE1 that
+// long is fine: the FPGA's limit for a stuck select (about 80 ms) only counts
+// while an Amiga request waits.
+// Between the last CE0 check and the transfer, an Amiga request waits for CE1.
+// Nothing that can block (logging) runs there, but Linux can pre-empt a314d
+// there. The FPGA's limit for a stuck select counts from the Amiga's request
+// until CE1 is released, so it covers that gap and the transfer: if both take
+// longer, the Amiga gets the bus in the middle of the Pi's transfer, and
+// nothing detects it. The longest transfer (64 KB at 12 MHz) takes about
+// 44 ms. The longest gap measured was 1.7 ms with ten busy Shells on the
+// Amiga, and 10.2 ms with all four cores of the Pi (a Zero 2 W) busy as well.
+// CE0 still asserted after BUS_REQUEST_MAX_US means the FPGA isn't running
+// (Amiga off, FPGA being flashed): the transfer fails (spi_error), and until
+// CE0 is seen released transfers are only tried every BUS_PROBE_EVERY_US,
+// waiting at most BUS_PROBE_US each, so the main loop stays responsive.
+#define BUS_REQUEST_MAX_US  (5 * US_PER_S)      // half the Amiga's a314fs request timeout
+#define BUS_PROBE_US        (100 * US_PER_MS)   // longest wait per try while held off
+#define BUS_PROBE_EVERY_US  (500 * US_PER_MS)   // time between tries while held off
+#define BUS_HELD_OFF_POLL_US (10 * US_PER_MS)   // handle_a314_irq() sleep while held off
+#define BUS_POLL_US         20                  // CE0 poll interval while waiting
+#define BUS_LONG_WAIT_US    (50 * US_PER_MS)    // waits longer than this are counted
+#define BUS_LOG_INTERVAL_US (60 * US_PER_S)     // wait statistics are logged at most this often
+
+static bool bus_stuck = false;          // the FPGA didn't hand the bus over
+static bool bus_back = false;           // ... and has again; not logged yet
+static uint64_t bus_probe_at_us = 0;    // the last try while bus_stuck
+
+// Waits for the Amiga's flash reads, logged by log_bus_waits().
+static unsigned long bus_waits = 0, bus_long_waits = 0;
+static uint64_t bus_wait_total_us = 0, bus_wait_max_us = 0;
+static uint64_t bus_log_at_us = 0;
+
+static void count_bus_wait(uint64_t waited_us)
+{
+    bus_waits++;
+    bus_wait_total_us += waited_us;
+    if (waited_us > BUS_LONG_WAIT_US)
+        bus_long_waits++;
+    if (waited_us > bus_wait_max_us)
+        bus_wait_max_us = waited_us;
+}
+
+// Only called between transfers (CE1 released).
+static void log_bus_waits()
+{
+    if (bus_back)
+    {
+        logger_info("CE0 released -- SPI transfers resume\n");
+        bus_back = false;
+    }
+    uint64_t now = mono_us();
+    if (bus_log_at_us == 0)
+        bus_log_at_us = now;
+    if (now - bus_log_at_us < BUS_LOG_INTERVAL_US)
+        return;
+    if (bus_waits)
+        logger_info("SPI bus: waited %lu times for the Amiga's flash reads in the last %llu s, "
+                    "average %llu us, longest %llu us, %lu over %llu ms\n",
+                    bus_waits, (unsigned long long)((now - bus_log_at_us) / US_PER_S),
+                    (unsigned long long)(bus_wait_total_us / bus_waits),
+                    (unsigned long long)bus_wait_max_us, bus_long_waits,
+                    (unsigned long long)(BUS_LONG_WAIT_US / US_PER_MS));
+    bus_waits = bus_long_waits = 0;
+    bus_wait_total_us = bus_wait_max_us = 0;
+    bus_log_at_us = now;
+}
+
+// True while the FPGA isn't handing the bus over, until CE0 is seen released
+// or the next try is due.
+static bool bus_held_off()
+{
+    return bus_stuck && ce0_asserted() && mono_us() - bus_probe_at_us < BUS_PROBE_EVERY_US;
+}
+
 static void cs_only(bool hold)
 {
     struct spi_ioc_transfer tr = {};
@@ -585,18 +650,43 @@ static void cs_only(bool hold)
         spi_error = true;
 }
 
-static void acquire_bus()
+// True with CE1 asserted and the bus handed over; false, with CE1 released,
+// if the FPGA didn't hand it over in time.
+static bool acquire_bus()
 {
+    // The first transfers (init_driver()) run before the GPIO line is
+    // requested; those are not checked.
     if (gpio_irq_fd < 0)
-        return;
-    for (;;)
+        return true;
+    cs_only(true);
+    uint64_t start = mono_us();
+    uint64_t max_us = bus_stuck ? BUS_PROBE_US : BUS_REQUEST_MAX_US;
+    bool waited = false;
+    while (ce0_asserted())
     {
-        wait_for_ce0_released();
-        cs_only(true);
-        if (!ce0_asserted())
-            return;
-        cs_only(false);
+        uint64_t now = mono_us();
+        if (now - start >= max_us)
+        {
+            cs_only(false);
+            if (!bus_stuck)
+                logger_warning("CE0 still asserted after %llu ms -- FPGA not running? SPI transfers held off\n",
+                               (unsigned long long)((now - start) / US_PER_MS));
+            bus_stuck = true;
+            bus_back = false;
+            bus_probe_at_us = mono_us();
+            return false;
+        }
+        waited = true;
+        usleep(BUS_POLL_US);
     }
+    if (waited)
+        count_bus_wait(mono_us() - start);
+    if (bus_stuck)
+    {
+        bus_stuck = false;
+        bus_back = true;
+    }
+    return true;
 }
 
 // The Pi's SPI block drives SCLK and MOSI whenever the pins are in ALT0, also
@@ -659,7 +749,12 @@ static void init_spi_pins()
 static int spi_transfer(int len)
 {
 #if defined(MODEL_TF)
-    acquire_bus();
+    if (!acquire_bus())
+    {
+        spi_error = true;
+        memset(rx_buf, 0, len);     // nothing read
+        return -1;
+    }
     spi_pins(true);
 #endif
 
@@ -688,7 +783,14 @@ static int spi_protocol_version()
     tx_buf[0] = (uint8_t)SPI_PROTO_VER_CMD;
     tx_buf[1] = 0;
     tx_buf[2] = 0;
+#if defined(MODEL_TF)
+    spi_error = false;
+#endif
     spi_transfer(1 /* 1 byte spi proto ver*/ + SPI_PROTO_HDR_LEN);
+#if defined(MODEL_TF)
+    if (spi_error)
+        return -1;      // no bus (FPGA not running): handle_a314_irq() tries again
+#endif
     logger_info("SPI protocol version = %d\n", rx_buf[SPI_PROTO_HDR_LEN]);
     return (int)rx_buf[SPI_PROTO_HDR_LEN];
 }
@@ -1699,7 +1801,8 @@ static void handle_pkt_connect(int channel_id, uint8_t *data, int plen)
     {
         // The Amiga reuses a stream id only after it has sent a RESET for it,
         // so this channel is left over from an Amiga reset that a314d did not
-        // see (e.g. while backing off for CE0). Reset just this channel, as
+        // see (RESET was cleared again before a314d next read the IRQ register,
+        // e.g. while it restarted). Reset just this channel, as
         // for a PKT_RESET, and accept the CONNECT: other channels may already
         // be in use by the new boot.
         logger_warning("Received a CONNECT packet on a channel that was believed to be previously allocated -- missed Amiga reset? Resetting that channel\n");
@@ -2299,40 +2402,14 @@ static void handle_a314_irq()
 #elif defined(MODEL_TF)
 static void handle_a314_irq()
 {
-    // check ICE40 bus activity, and back-off if CE0 is asserted
+    // Every SPI transfer asks the FPGA for the bus (acquire_bus()) and waits
+    // for the flash read in progress. Transfers are held off only while the
+    // FPGA doesn't hand the bus over (bus_held_off()).
+    log_bus_waits();
+    if (bus_held_off())
     {
-        static bool old_ce0_state = 1;
-        gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
-        if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state))
-        {
-            logger_warning("Unable to get GPIO state; %d / %s\n", errno, strerror(errno));
-            return;
-        }
-
-        bool ce0_asserted = (gpio_state.bits == 0);
-
-        if (old_ce0_state != ce0_asserted)
-        {
-            if (ce0_asserted)
-                logger_warning("CE0 is asserted; backing off!\n");
-            else
-                logger_warning("CE0 is deasserted; continuing..\n");
-
-            old_ce0_state = ce0_asserted;
-        }
-
-        static __useconds_t timeout = 10;
-        if (ce0_asserted)
-        {
-            usleep(timeout);
-            if (timeout < 100*1000)
-                timeout *= 2;
-            return;
-        }
-        else
-        {
-            timeout = 10;
-        }
+        usleep(BUS_HELD_OFF_POLL_US);
+        return;
     }
 
     // if spi_proto_ver doesn't match most likely the ICE40 isn't running (amiga powered off?)
@@ -2429,14 +2506,11 @@ static void handle_a314_irq()
 // last handle_a314_irq() may be from before an Amiga reset. Read them again,
 // and publish nothing while the Amiga driver is not set up (RESET still set);
 // if channels are open then, the Amiga was reset, so close them first.
-// Nothing is published while the FPGA is busy either; handle_a314_irq() does
-// it later.
+// Nothing is published while the FPGA doesn't hand the bus over
+// (bus_held_off()); handle_a314_irq() publishes once it does.
 static bool com_area_ready()
 {
-    // Not while the FPGA is busy (CE0) or not answering: handle_a314_irq()
-    // backs off then, and publishes once it is back.
-    gpio_v2_line_values gpio_state = { 0, (uint64_t)-1 };
-    if (ioctl(gpio_irq_fd, GPIO_V2_LINE_GET_VALUES_IOCTL, &gpio_state) || gpio_state.bits == 0)
+    if (bus_held_off())
         return false;
     if (spi_proto_ver != 2)
         return false;
