@@ -11,7 +11,10 @@ response via MSG_DATA.
 
 import sys
 import os
+import errno
 import select
+import threading
+import collections
 import struct
 import json
 import logging
@@ -65,6 +68,66 @@ USB_PORT_FEAT_C_ENABLE = 17
 USB_PORT_FEAT_C_SUSPEND = 18
 USB_PORT_FEAT_C_OVER_CURRENT = 19
 USB_PORT_FEAT_C_RESET = 20
+
+# Packet size to round IN reads to when the Amiga doesn't give one
+DEFAULT_MAX_PACKET = 64
+
+# An interrupt reader's read timeout; a stop request waits for it at most
+INT_READ_TIMEOUT_MS = 500
+# Reports an interrupt reader holds for the Amiga; older ones are dropped
+INT_QUEUE_MAX = 64
+
+
+def in_read_length(length, max_pkt):
+    """Round an IN read up to whole packets. A device may always send a full
+    packet, and a read buffer smaller than that overruns."""
+    if max_pkt <= 0:
+        max_pkt = DEFAULT_MAX_PACKET
+    return max(max_pkt, -(-length // max_pkt) * max_pkt)
+
+
+class InterruptReader:
+    """Keeps a read pending on one interrupt IN endpoint and queues what
+    arrives, so the Amiga's polls are answered at once and a report that
+    arrives between them isn't lost."""
+
+    def __init__(self, dev, endpoint, max_pkt):
+        self.dev = dev
+        self.endpoint = endpoint
+        self.max_pkt = max_pkt
+        self.queue = collections.deque(maxlen=INT_QUEUE_MAX)
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def run(self):
+        while not self.stopping.is_set():
+            try:
+                data = bytes(self.dev.read(self.endpoint, self.max_pkt,
+                                           timeout=INT_READ_TIMEOUT_MS))
+                self.queue.append((USB_STATUS_OK, data))
+            except usb.core.USBTimeoutError:
+                pass
+            except usb.core.USBError as e:
+                if e.errno == errno.EPIPE:
+                    self.queue.append((USB_STATUS_STALL, b''))
+                else:
+                    self.queue.append((USB_STATUS_ERROR, b''))
+                if e.errno == errno.ENODEV:
+                    return
+                # Wait for the Amiga to clear the halt instead of spinning
+                self.stopping.wait(INT_READ_TIMEOUT_MS / 1000)
+
+    def get(self):
+        """The next (status, data) report, or None if there is none."""
+        try:
+            return self.queue.popleft()
+        except IndexError:
+            return None
+
+    def stop(self):
+        self.stopping.set()
+        self.thread.join()
 
 
 def str_desc(s):
@@ -263,6 +326,9 @@ class UsbBridgeService:
 
         self.next_dev_addr = 2
 
+        self.claimed = {}       # libusb device -> claimed interface numbers
+        self.int_readers = {}   # (libusb device, endpoint) -> InterruptReader
+
     def load_config(self):
         paths = [
             CONFIG_FILE,
@@ -285,6 +351,28 @@ class UsbBridgeService:
             if (fv == '*' or fv == f"{vid:04x}") and (fp == '*' or fp == f"{pid:04x}"):
                 return True
         return False
+
+    # ---- claimed interfaces ----
+    def release_device(self, dev):
+        """Stop the interrupt readers, release the claimed interfaces and free
+        libusb's resources, so that the device can be configured again."""
+        if dev is None or hasattr(dev, 'handle_control_transfer'):
+            return
+        for key in [k for k in self.int_readers if k[0] is dev]:
+            self.int_readers.pop(key).stop()
+        for intf in self.claimed.pop(dev, []):
+            try:
+                usb.util.release_interface(dev, intf)
+            except usb.core.USBError:
+                pass
+        try:
+            usb.util.dispose_resources(dev)
+        except usb.core.USBError:
+            pass
+
+    def release_all_devices(self):
+        for dev in list(self.devices.values()):
+            self.release_device(dev)
 
     def find_free_port(self):
         for port in range(1, self.port_count + 1):
@@ -351,6 +439,7 @@ class UsbBridgeService:
                 key = (dev.idVendor, dev.idProduct)
                 if key not in current_vidpids:
                     logger.info(f"Device removed from port {port}: {key[0]:04x}:{key[1]:04x}")
+                    self.release_device(dev)
                     for addr, (p, d) in list(self.dev_addr_map.items()):
                         if p == port:
                             del self.dev_addr_map[addr]
@@ -428,6 +517,10 @@ class UsbBridgeService:
                     if (wValue & 0xFF) == USB_PORT_FEAT_RESET:
                         port = wIndex & 0xFF
                         if port in self.devices:
+                            self.release_device(self.devices[port])
+                            for addr, (p, d) in list(self.dev_addr_map.items()):
+                                if p == port:
+                                    del self.dev_addr_map[addr]
                             self.enumerating_device = (port, self.devices[port])
                             logger.info(f"Port {port} reset -> enumerate at addr 0")
                 data_out, status = self.root_hub.handle_control_transfer(
@@ -460,6 +553,10 @@ class UsbBridgeService:
             config_val = wValue
             logger.info(f"SET_CONFIGURATION {config_val} for addr {dev_addr}")
             try:
+                # A configured device is configured again after the Amiga
+                # goes offline and online, or resets it.
+                self.release_device(dev)
+
                 # Detach kernel driver before configuring (needed on Linux,
                 # and usually needed on macOS to actually claim the device).
                 for cfg in dev:
@@ -475,6 +572,7 @@ class UsbBridgeService:
                 cfg = dev.get_active_configuration()
                 for intf in cfg:
                     usb.util.claim_interface(dev, intf.bInterfaceNumber)
+                    self.claimed.setdefault(dev, []).append(intf.bInterfaceNumber)
                     logger.info(f"Claimed intf {intf.bInterfaceNumber}")
                     # Force HID boot protocol on HID Mouse (3/1/2)
                     if (intf.bInterfaceClass == 3 and
@@ -487,6 +585,13 @@ class UsbBridgeService:
                             logger.info(f"Boot protocol set on intf {intf.bInterfaceNumber}")
                         except usb.core.USBError as e:
                             logger.warning(f"SET_PROTOCOL failed: {e}")
+                for intf in cfg:
+                    for ep in intf:
+                        if (usb.util.endpoint_type(ep.bmAttributes) == usb.util.ENDPOINT_TYPE_INTR and
+                                usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN):
+                            self.int_readers[(dev, ep.bEndpointAddress)] = InterruptReader(
+                                dev, ep.bEndpointAddress, ep.wMaxPacketSize)
+                            logger.info(f"Reading interrupt endpoint {ep.bEndpointAddress:02x}")
             except usb.core.USBError as e:
                 logger.error(f"SET_CONFIGURATION failed: {e}")
                 self.send_control_transfer_res(req_id, USB_STATUS_ERROR, 0)
@@ -570,11 +675,19 @@ class UsbBridgeService:
 
             # Real libusb device
             if is_in:
-                # Request up to max packet to avoid overflow on devices sending
-                # larger HID reports than the boot-protocol size.
-                read_len = max(length, 64)
-                result = dev.read(endpoint, read_len, timeout=100)
-                data_bytes = bytes(result)
+                reader = self.int_readers.get((dev, endpoint))
+                if reader is not None:
+                    report = reader.get()
+                    if report is None:
+                        self.send_interrupt_transfer_res(req_id, USB_STATUS_OK, 0)
+                        return
+                    status, data_bytes = report
+                    if status != USB_STATUS_OK:
+                        self.send_interrupt_transfer_res(req_id, status, 0)
+                        return
+                else:
+                    read_len = in_read_length(length, max_pkt)
+                    data_bytes = bytes(dev.read(endpoint, read_len, timeout=100))
                 logger.debug(f"IntIN dev={dev_addr} ep={endpoint:02x} "
                               f"req_len={length} got={len(data_bytes)}: {data_bytes.hex()}")
 
@@ -630,8 +743,12 @@ class UsbBridgeService:
 
         try:
             if is_in:
-                result = dev.read(endpoint, length, timeout=5000)
-                data_out = bytes(result)[:length]
+                result = dev.read(endpoint, in_read_length(length, max_pkt), timeout=5000)
+                data_out = bytes(result)
+                if len(data_out) > length:
+                    logger.warning(f"Bulk IN overrun: ep={endpoint:02x} asked {length}, got {len(data_out)}")
+                    self.send_bulk_transfer_res(req_id, USB_STATUS_ERROR, 0)
+                    return
                 if data_out:
                     self.a314d.write_mem(data_addr, data_out)
                 self.send_bulk_transfer_res(req_id, USB_STATUS_OK, len(data_out))
@@ -679,6 +796,7 @@ class UsbBridgeService:
             elif ptype == self.a314d.MSG_RESET:
                 logger.info("Client disconnected")
                 self.current_stream_id = None
+                self.release_all_devices()
                 self.dev_addr_map.clear()
 
     def run(self):
