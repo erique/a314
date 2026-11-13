@@ -121,16 +121,22 @@ struct UsbDevice
     APTR task_stack;
     ULONG next_req_id;
 
+    struct Task *expunge_task;        // waits for the device task to exit
+
     // A314 communication state
-    BOOL connected;
+    BOOL task_ready;
+    BOOL connected;                   // stream open and data buffer allocated
+    BOOL connect_failed;              // last connect attempt failed
     BOOL pending_read;
     UBYTE res_msg_buf[256];
 
-    // Current in-flight transfer
+    // Current in-flight transfer; a bulk transfer goes in pieces
     struct IOUsbHWReq *current_ioreq;
     UBYTE current_resp_type;
     UBYTE current_is_in;
-    UWORD current_max_len;
+    UWORD current_max_len;            // length of the piece in flight
+    ULONG xfer_offset;                // bytes done before the piece in flight
+    ULONG xfer_piece_max;             // largest bulk piece
 
     // Shared memory data buffer
     ULONG dataBufferAddr;
