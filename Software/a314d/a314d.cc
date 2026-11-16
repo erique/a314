@@ -26,10 +26,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <deque>
 #include <list>
 #include <map>
 #include <string>
@@ -257,6 +259,14 @@ static int loglevel = LOGLEVEL_INFO;
 #define SPI_PROTO_HDR_LEN       3           // 1 cmd byte + 2 delay
 #define READ_SRAM_HDR_LEN       5           // 3 cmd bytes + 2 delay
 #define READ_SINT_HDR_LEN       3           // 1 cmd byte + 2 delay
+#define READ_SER_CMD            0xa0        // fake serial port, see serial_poll()
+#define WRITE_SER_CMD           0xa1
+#define READ_SER_HDR_LEN        4           // cmd, delay, count, free space
+#define READ_SER_COUNT          2           // ... the byte with the count of bytes waiting
+#define READ_SER_ROOM           3           // ... the byte with the free space for WRITE_SER
+#define WRITE_SER_HDR_LEN       1           // cmd, then the bytes
+#define SER_TX_FIFO             8           // Amiga -> Pi FIFO in the FPGA (bytes)
+#define SER_RX_FIFO             8           // Pi -> Amiga
 
 // Bit 7 Set/Clear on write 
 // Bit 6 Amiga Interrupts Enabled (INT2). 1 = Enabled, 0 = Disabled
@@ -264,7 +274,7 @@ static int loglevel = LOGLEVEL_INFO;
 // Bit 4 Amiga Interrupt.  1 = Pending, 0 = Not Pending (Amiga can clear but not set, RPi Can set but not clear)
 // Bit 3 Unused
 // Bit 2 Unused
-// Bit 1 Unused
+// Bit 1 Fake serial port has data (read only, READ_SINT only)
 // Bit 0 Reset Event 
 
 #define REG_IRQ_SET             0x80
@@ -273,6 +283,7 @@ static int loglevel = LOGLEVEL_INFO;
 #define REG_IRQ_RPI             0x20
 #define REG_IRQ_AMIGA           0x10
 #define REG_IRQ_RESET           0x01
+#define REG_IRQ_SER             0x02
 #endif
 
 // Global variables.
@@ -855,6 +866,193 @@ static void spi_write_sint(unsigned int data)
     spi_transfer(1);
 }
 
+// The FPGA's fake serial port. The Amiga's RawPutChar and RawMayGetChar
+// (patched by the TF4060 SSBL) use two small FIFOs in the FPGA, outside the
+// shared memory, so the port works from early boot, before a314.device.
+// READ_SER returns the number of bytes waiting at byte 2, the free space for
+// WRITE_SER at byte 3 and the bytes from byte 4; a byte leaves the FIFO only
+// once it has been sent in full. READ_SINT bit 1 says bytes are waiting.
+// The output goes to a pty (SER_DIR/tty, for screen or minicom) and to
+// SER_DIR/serial.log; what is typed into the pty goes to the Amiga. The port
+// is read every SER_KEEPALIVE_US even when empty: the Amiga's RawPutChar
+// waits for room only while the FPGA has seen a read within its reader
+// timeout (2^27 FPGA clocks, a few seconds).
+#define SER_DIR             "/run/a314d"        // RuntimeDirectory=a314d in the unit
+#define SER_DIR_FALLBACK    "/tmp/a314d"
+#define SER_DIR_MODE        0755
+#define SER_LOG_MODE        0644
+#define SER_TTY_NAME        "tty"               // in SER_DIR: a link to the pty
+#define SER_LOG_NAME        "serial.log"        // in SER_DIR: everything the Amiga sent
+#define SER_LOG_PREV_NAME   "serial.log.1"      // ... the part before the last SER_LOG_MAX
+#define SER_LOG_MAX         (1024 * 1024)       // then SER_LOG_NAME becomes SER_LOG_PREV_NAME
+#define SER_IN_MAX          4096                // typed bytes waiting for room in the FPGA
+#define SER_PTY_READ        256                 // bytes read from the pty at a time
+#define SER_KEEPALIVE_US    (250 * US_PER_MS)   // read interval while nothing waits
+#define SER_INPUT_US        (2 * US_PER_MS)     // read interval while typed bytes wait
+#define SER_ABSENT_US       (5 * US_PER_S)      // read interval while the FPGA has no port
+
+static int ser_pty = -1;            // pty master
+static int ser_pty_slave = -1;      // kept open, so the master never sees a hangup
+static int ser_log = -1;
+static off_t ser_log_size = 0;
+static std::string ser_log_path, ser_log_prev_path;
+static std::deque<uint8_t> ser_in;
+static uint64_t ser_read_at_us = 0;
+static bool ser_absent = false;
+static bool ser_last_cr = false;
+
+static const char *serial_dir()
+{
+    static const char *dirs[] = { SER_DIR, SER_DIR_FALLBACK };
+    for (const char *d : dirs)
+    {
+        if (mkdir(d, SER_DIR_MODE) != 0 && errno != EEXIST)
+            continue;
+        if (access(d, W_OK) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+static void init_serial()
+{
+    const char *dir = serial_dir();
+    if (!dir)
+    {
+        logger_warning("Serial port: neither %s nor %s is writable -- no pty, no log\n", SER_DIR, SER_DIR_FALLBACK);
+        return;
+    }
+
+    ser_pty = posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+    if (ser_pty < 0 || grantpt(ser_pty) != 0 || unlockpt(ser_pty) != 0 || !ptsname(ser_pty))
+    {
+        logger_warning("Serial port: no pty (%s)\n", strerror(errno));
+        if (ser_pty >= 0)
+            close(ser_pty);
+        ser_pty = -1;
+    }
+    else
+    {
+        std::string pts = ptsname(ser_pty);
+        ser_pty_slave = open(pts.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
+        struct termios t;
+        if (ser_pty_slave >= 0 && tcgetattr(ser_pty_slave, &t) == 0)
+        {
+            cfmakeraw(&t);
+            tcsetattr(ser_pty_slave, TCSANOW, &t);
+        }
+        std::string link = std::string(dir) + "/" SER_TTY_NAME;
+        unlink(link.c_str());
+        if (symlink(pts.c_str(), link.c_str()) != 0)
+            logger_warning("Serial port: can't link %s to %s (%s)\n", link.c_str(), pts.c_str(), strerror(errno));
+        logger_info("Serial port: %s (%s)\n", link.c_str(), pts.c_str());
+    }
+
+    ser_log_path = std::string(dir) + "/" SER_LOG_NAME;
+    ser_log_prev_path = std::string(dir) + "/" SER_LOG_PREV_NAME;
+    ser_log = open(ser_log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, SER_LOG_MODE);
+    struct stat st;
+    if (ser_log >= 0 && fstat(ser_log, &st) == 0)
+        ser_log_size = st.st_size;
+    if (ser_log < 0)
+        logger_warning("Serial port: can't open %s (%s)\n", ser_log_path.c_str(), strerror(errno));
+}
+
+static void serial_out(const uint8_t *d, int n)
+{
+    if (ser_log >= 0)
+    {
+        if (ser_log_size + n > SER_LOG_MAX)
+        {
+            close(ser_log);
+            rename(ser_log_path.c_str(), ser_log_prev_path.c_str());
+            ser_log = open(ser_log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC, SER_LOG_MODE);
+            ser_log_size = 0;
+        }
+        if (ser_log >= 0 && write(ser_log, d, n) == n)
+            ser_log_size += n;
+    }
+
+    if (ser_pty >= 0)
+    {
+        // a terminal wants CR LF; the Amiga mostly sends LF alone
+        uint8_t buf[2 * SER_TX_FIFO];   // each LF may become CR LF
+        int k = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (d[i] == '\n' && !ser_last_cr)
+                buf[k++] = '\r';
+            buf[k++] = d[i];
+            ser_last_cr = d[i] == '\r';
+        }
+        if (write(ser_pty, buf, k) < 0 && errno == EAGAIN)
+        {
+            // nothing reads the pty and its buffer is full: keep the newest
+            tcflush(ser_pty_slave, TCIFLUSH);
+            ssize_t r = write(ser_pty, buf, k);
+            (void)r;
+        }
+    }
+}
+
+// Bytes typed into the pty, for the Amiga.
+static void serial_pty_input()
+{
+    uint8_t buf[SER_PTY_READ];
+    ssize_t r = read(ser_pty, buf, sizeof(buf));
+    for (ssize_t i = 0; i < r && ser_in.size() < SER_IN_MAX; i++)
+        ser_in.push_back(buf[i]);
+}
+
+// Called with every READ_SINT result; true if bytes moved either way.
+static bool serial_poll(uint8_t irq)
+{
+    uint64_t now = mono_us();
+    uint64_t every = ser_absent ? SER_ABSENT_US : !ser_in.empty() ? SER_INPUT_US : SER_KEEPALIVE_US;
+    if (!(irq & REG_IRQ_SER) && now - ser_read_at_us < every)
+        return false;
+    ser_read_at_us = now;
+
+    tx_buf[0] = READ_SER_CMD;
+    memset(&tx_buf[1], 0, READ_SER_HDR_LEN - 1 + SER_TX_FIFO);
+    spi_error = false;
+    spi_transfer(READ_SER_HDR_LEN + SER_TX_FIFO);
+    if (spi_error)
+        return false;
+
+    unsigned int n = rx_buf[READ_SER_COUNT], room = rx_buf[READ_SER_ROOM];
+    if (n > SER_TX_FIFO || room > SER_RX_FIFO)
+    {
+        if (!ser_absent)
+            logger_info("Serial port: not in this FPGA firmware\n");
+        ser_absent = true;
+        return false;
+    }
+    if (ser_absent)
+        logger_info("Serial port: found in the FPGA firmware\n");
+    ser_absent = false;
+
+    if (n)
+        serial_out(&rx_buf[READ_SER_HDR_LEN], n);
+    bool moved = n != 0;
+
+    if (!ser_in.empty() && room)
+    {
+        unsigned int k = std::min<size_t>(room, ser_in.size());
+        tx_buf[0] = WRITE_SER_CMD;
+        for (unsigned int i = 0; i < k; i++)
+            tx_buf[WRITE_SER_HDR_LEN + i] = ser_in[i];
+        spi_error = false;
+        spi_transfer(WRITE_SER_HDR_LEN + k);
+        if (!spi_error)
+        {
+            ser_in.erase(ser_in.begin(), ser_in.begin() + k);
+            moved = true;
+        }
+    }
+    return moved;
+}
+
 #else
 
 static uint8_t spi_read_cmem(unsigned int address)
@@ -1393,6 +1591,7 @@ static int init_driver()
         logger_info("SPI speed limited to %d\n", speed);
     }
     init_spi_pins();
+    init_serial();
 #endif
 
     spi_proto_ver = spi_protocol_version();
@@ -1418,6 +1617,16 @@ static int init_driver()
     ev.data.fd = server_socket;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, server_socket, &ev) != 0)
         return -1;
+
+#if defined(MODEL_TF)
+    if (ser_pty >= 0)
+    {
+        ev.events = EPOLLIN;
+        ev.data.fd = ser_pty;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, ser_pty, &ev) != 0)
+            return -1;
+    }
+#endif
 
     return 0;
 }
@@ -2432,6 +2641,9 @@ static void handle_a314_irq()
     if (spi_error)
         return;     // not a real value: try again on the next pass
 
+    // the serial port works whatever the state of the Amiga driver
+    bool ser_moved = serial_poll(irq);
+
     // RESET is cleared by the Amiga-side driver, and set again on Amiga reset
     if ((irq & REG_IRQ_RESET))
     {
@@ -2444,7 +2656,8 @@ static void handle_a314_irq()
 
         if (channels.empty())
         {
-            usleep(10*1000);    // the amiga driver isn't active; sleep a bit..
+            if (!ser_moved)
+                usleep(10*1000);    // the amiga driver isn't active; sleep a bit..
             return;
         }
 
@@ -2461,6 +2674,14 @@ static void handle_a314_irq()
         bool idle_poll = false;
         if (!(irq & REG_IRQ_RPI))
         {
+            if (ser_moved)
+            {
+                // the serial port moves data: poll at full rate
+                if (sleep_counter > cooldown)
+                    logger_info("PI became active!\n");
+                sleep_counter = 1;
+            }
+
             // after N checks w/o activity, sleep some extra
             if (sleep_counter == cooldown)
                 logger_info("PI became inactive!\n");
@@ -2785,6 +3006,10 @@ static void main_loop()
                 logger_trace("GPIO interupted\n");
                 handle_a314_irq();
             }
+#if defined(MODEL_TF)
+            else if (ev.data.fd == ser_pty)
+                serial_pty_input();
+#endif
             else if (ev.data.fd == server_socket)
             {
                 logger_trace("Epoll event: server socket is ready, events = %d\n", ev.events);
