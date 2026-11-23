@@ -28,6 +28,7 @@
 #define FSPF_TYPE       (1 << 0)
 #define FSPF_STACKSIZE  (1 << 4)
 #define FSPF_PRIORITY   (1 << 5)
+#define FSPF_SEGLIST    (1 << 7)
 #define FSPF_GLOBALVEC  (1 << 8)
 
 struct MountEntry
@@ -196,7 +197,13 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     struct FileSysEntry* fse = fsr ? find_filesystem(fsr, dostype) : NULL;
     if (fse)
     {
-        me->dev_node.dn_SegList = fse->fse_SegList;
+        // Only the fields whose fse_PatchFlags bit is set are there: Kickstart's
+        // own entries for its ROM filesystem (DOS\1-DOS\5) have no flags and end
+        // after fse_PatchFlags, so the partition keeps the ROM filesystem.
+        if (fse->fse_PatchFlags & FSPF_SEGLIST)
+        {
+            me->dev_node.dn_SegList = fse->fse_SegList;
+        }
         if (fse->fse_PatchFlags & FSPF_GLOBALVEC)
         {
             me->dev_node.dn_GlobalVec = fse->fse_GlobalVec;
