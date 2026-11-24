@@ -24,12 +24,8 @@
 
 #define RDB_SCAN_LIMIT 16 // the RDB must live within the first 16 blocks
 
-// fhb_PatchFlags bits (which DeviceNode fields the FSHB overrides).
-#define FSPF_TYPE       (1 << 0)
-#define FSPF_STACKSIZE  (1 << 4)
-#define FSPF_PRIORITY   (1 << 5)
-#define FSPF_SEGLIST    (1 << 7)
-#define FSPF_GLOBALVEC  (1 << 8)
+#define FSE_PATCH_FIELDS ((offsetof(struct FileSysEntry, fse_GlobalVec) - offsetof(struct FileSysEntry, fse_Type)) / sizeof(ULONG) + 1)
+#define FSE_PATCH_MASK   ((1UL << FSE_PATCH_FIELDS) - 1)
 
 struct MountEntry
 {
@@ -197,28 +193,16 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     struct FileSysEntry* fse = fsr ? find_filesystem(fsr, dostype) : NULL;
     if (fse)
     {
-        // Only the fields whose fse_PatchFlags bit is set are there: Kickstart's
-        // own entries for its ROM filesystem (DOS\1-DOS\5) have no flags and end
-        // after fse_PatchFlags, so the partition keeps the ROM filesystem.
-        if (fse->fse_PatchFlags & FSPF_SEGLIST)
+        ULONG* src = &fse->fse_Type;
+        ULONG* dst = (ULONG*)&me->dev_node.dn_Type;
+        for (ULONG patch = fse->fse_PatchFlags & FSE_PATCH_MASK; patch; patch >>= 1)
         {
-            me->dev_node.dn_SegList = fse->fse_SegList;
-        }
-        if (fse->fse_PatchFlags & FSPF_GLOBALVEC)
-        {
-            me->dev_node.dn_GlobalVec = fse->fse_GlobalVec;
-        }
-        if (fse->fse_PatchFlags & FSPF_TYPE)
-        {
-            me->dev_node.dn_Type = fse->fse_Type;
-        }
-        if (fse->fse_PatchFlags & FSPF_STACKSIZE)
-        {
-            me->dev_node.dn_StackSize = fse->fse_StackSize;
-        }
-        if (fse->fse_PatchFlags & FSPF_PRIORITY)
-        {
-            me->dev_node.dn_Priority = fse->fse_Priority;
+            if (patch & 1)
+            {
+                *dst = *src;
+            }
+            src++;
+            dst++;
         }
     }
     Permit();
