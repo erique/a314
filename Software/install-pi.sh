@@ -53,6 +53,9 @@ install_common() {
 	# Add shared directory for a314fs
 	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314shared
 
+	# Add directory for the a314scsi hdf images
+	sudo -u $A314_USER mkdir -p ${A314_HOME}/a314hdfs
+
 	# Install Python packages in virtual environment
 	python3 -m virtualenv /opt/a314/venv
 	/opt/a314/venv/bin/pip install pyusb pyudev "websockets>=14" python-pytun bpls2gif/
