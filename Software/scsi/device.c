@@ -327,11 +327,22 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
             break;
 
         case HD_SCSICMD:
-            ior->io_Error = a314_scsi(base, d, (struct SCSICmd*)ior->io_Data);
+            if (ior->io_Length < sizeof(struct SCSICmd))
+            {
+                ior->io_Error = IOERR_BADLENGTH;
+            }
+            else
+            {
+                ior->io_Error = a314_scsi(base, d, (struct SCSICmd*)ior->io_Data);
+            }
             break;
 
         case TD_GETGEOMETRY:
-            if (d && (d->flags & DRVF_PRESENT))
+            if (ior->io_Length < sizeof(struct DriveGeometry))
+            {
+                ior->io_Error = IOERR_BADLENGTH;
+            }
+            else if (d && (d->flags & DRVF_PRESENT))
             {
                 get_geometry(d, ior);
             }
@@ -633,7 +644,11 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
     switch (ior->io_Command)
     {
         case NSCMD_DEVICEQUERY:
-            if (!device_query(ior))
+            if (ior->io_Length < sizeof(struct NSDeviceQueryResult))
+            {
+                ior->io_Error = IOERR_BADLENGTH;
+            }
+            else if (!device_query(ior))
             {
                 ior->io_Error = IOERR_NOCMD;
             }

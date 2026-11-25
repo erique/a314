@@ -393,10 +393,6 @@ static LONG a314_scsi_once(struct A314ScsiBase* base, struct Drive* d, struct SC
     req.kind = A314SCSI_CMD_REQ;
     req.unit = d ? (UBYTE)d->number : 0;
     req.cdb_len = (UBYTE)cmd->scsi_CmdLength;
-    if (req.cdb_len > A314SCSI_MAX_CDB)
-    {
-        req.cdb_len = A314SCSI_MAX_CDB;
-    }
     memcpy(req.cdb, cmd->scsi_Command, req.cdb_len);
     req.direction = dir;
     req.data_length = cmd->scsi_Length;
@@ -534,6 +530,10 @@ static LONG a314_scsi_split(struct A314ScsiBase* base, struct Drive* d, struct S
 
 LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
 {
+    if (cmd->scsi_CmdLength > A314SCSI_MAX_CDB)
+    {
+        return IOERR_BADLENGTH;
+    }
     if (cmd->scsi_Length > A314SCSI_MAX_XFER && d && cmd->scsi_CmdLength &&
         is_read_write(cmd->scsi_Command[0]))
     {
