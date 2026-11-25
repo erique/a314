@@ -6,11 +6,11 @@
 
     incdir  "/opt/ndk32/Include_I"
 
+    include exec/nodes.i
     include exec/resident.i
     include libraries/configregs.i
     include lvo/exec_lib.i
 
-NT_DEVICE:      equ    3
 VERSION:        equ    1
 PRIORITY:       equ    -5
 
