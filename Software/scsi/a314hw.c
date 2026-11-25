@@ -421,6 +421,7 @@ static LONG a314_scsi_once(struct A314ScsiBase* base, struct Drive* d, struct SC
     }
 
     cmd->scsi_Status = res.scsi_status;
+    cmd->scsi_SenseActual = 0;
     cmd->scsi_Actual = (res.actual_length > cmd->scsi_Length) ? cmd->scsi_Length : res.actual_length;
 
     if (dir == A314SCSI_DIR_READ && bounced && res.actual_length)
@@ -441,7 +442,7 @@ static LONG a314_scsi_once(struct A314ScsiBase* base, struct Drive* d, struct SC
             base->uaunits |= 1 << d->number;
         }
 
-        if (cmd->scsi_SenseData && cmd->scsi_SenseLength >= 14)
+        if ((cmd->scsi_Flags & SCSIF_AUTOSENSE) && cmd->scsi_SenseData && cmd->scsi_SenseLength >= 14)
         {
             memset(cmd->scsi_SenseData, 0, cmd->scsi_SenseLength);
             cmd->scsi_SenseData[0] = SCSI_SENSE_CURRENT_FIXED;

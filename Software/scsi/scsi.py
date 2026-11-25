@@ -46,7 +46,14 @@ ASC_MEDIUM_CHANGED = 0x28
 ASC_LUN_NOT_SUPPORTED = 0x25
 ASC_MEDIUM_NOT_PRESENT = 0x3A
 
+OP_REQUEST_SENSE = 0x03
 OP_INQUIRY = 0x12
+
+# Fixed-format sense data, as REQUEST SENSE returns it.
+SENSE_RESPONSE_FIXED = 0x70
+SENSE_DATA_LEN = 18
+SENSE_HEADER_LEN = 8    # the bytes the additional sense length leaves out
+NO_SENSE = (0, 0, 0)    # key, asc, ascq
 
 
 class DiskImage(object):
@@ -136,6 +143,7 @@ class Unit(object):
         self.image: Optional[DiskImage] = None
         self.ident = None           # identity of the hdf file behind image
         self.attention = False
+        self.sense = NO_SENSE       # of the last command, for REQUEST SENSE
 
     def file_ident(self):
         try:
@@ -310,6 +318,33 @@ class ScsiService(object):
     def reply(self, stream_id, status, sk, asc, ascq, actual):
         self.a314d.send_data(stream_id, struct.pack(RES_FMT, CMD_RES, status, sk, asc, ascq, 0, 0, actual))
 
+    # Reply for a unit, and keep the sense for a REQUEST SENSE after it.
+    def answer(self, stream_id, u, status, sk, asc, ascq, actual):
+        if u:
+            u.sense = (sk, asc, ascq) if status == STATUS_CHECK_CONDITION else NO_SENSE
+        self.reply(stream_id, status, sk, asc, ascq, actual)
+
+    def sense_data(self, sense) -> bytes:
+        sk, asc, ascq = sense
+        d = bytearray(SENSE_DATA_LEN)
+        d[0] = SENSE_RESPONSE_FIXED
+        d[2] = sk
+        d[7] = SENSE_DATA_LEN - SENSE_HEADER_LEN
+        d[12] = asc
+        d[13] = ascq
+        return bytes(d)
+
+    # Send a command's data, if any, then its result.
+    def complete(self, stream_id, u, direction, address, data_length, status, sk, asc, ascq, respdata):
+        if len(respdata) > data_length:
+            respdata = respdata[:data_length]
+        if direction == DIR_READ and respdata and address:
+            u.sense = (sk, asc, ascq) if status == STATUS_CHECK_CONDITION else NO_SENSE
+            self.mem_write_queue.append((stream_id, status, sk, asc, ascq, len(respdata)))
+            self.a314d.send_write_mem_req(address, respdata)
+        else:
+            self.answer(stream_id, u, status, sk, asc, ascq, len(respdata))
+
     def process_stream_data(self, stream_id: int, data: bytes):
         kind, unit, cdb_len, _, cdb, direction, _, _, data_length, address = struct.unpack(REQ_FMT, data)
         cdb = cdb[:cdb_len]
@@ -319,14 +354,21 @@ class ScsiService(object):
             self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, ASC_LUN_NOT_SUPPORTED, 0, 0)
             return
 
+        # The sense of the command before; it is then cleared.
+        if cdb[0] == OP_REQUEST_SENSE:
+            alloc = cdb[4] if len(cdb) > 4 else SENSE_DATA_LEN
+            respdata = self.sense_data(u.sense)[:alloc]
+            self.complete(stream_id, u, direction, address, data_length, STATUS_GOOD, 0, 0, 0, respdata)
+            return
+
         # INQUIRY describes the unit, not the medium, so it always answers.
         if cdb[0] != OP_INQUIRY:
             if u.attention:
                 u.attention = False
-                self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_UNIT_ATTENTION, ASC_MEDIUM_CHANGED, 0, 0)
+                self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_UNIT_ATTENTION, ASC_MEDIUM_CHANGED, 0, 0)
                 return
             if u.image is None:
-                self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
+                self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
                 return
         img = u.image
 
@@ -336,15 +378,7 @@ class ScsiService(object):
             return
 
         status, sk, asc, ascq, respdata = self.exec_read(img, cdb, data_length)
-
-        if len(respdata) > data_length:
-            respdata = respdata[:data_length]
-
-        if direction == DIR_READ and respdata and address:
-            self.mem_write_queue.append((stream_id, status, sk, asc, ascq, len(respdata)))
-            self.a314d.send_write_mem_req(address, respdata)
-        else:
-            self.reply(stream_id, status, sk, asc, ascq, len(respdata))
+        self.complete(stream_id, u, direction, address, data_length, status, sk, asc, ascq, respdata)
 
     def process_write_mem_res(self):
         stream_id, status, sk, asc, ascq, actual = self.mem_write_queue.pop(0)
@@ -358,16 +392,16 @@ class ScsiService(object):
         u = self.units.get(unit)
         img = u.image if u else None
         if img is None:
-            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
+            self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_NOT_READY, ASC_MEDIUM_NOT_PRESENT, 0, 0)
             return
         if cdb[0] not in (0x0A, 0x2A):  # WRITE(6)/WRITE(10)
-            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x20, 0, 0)
+            self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x20, 0, 0)
             return
         lba, _ = self.rw_params(cdb)
         if img.write(lba, data):
-            self.reply(stream_id, STATUS_GOOD, 0, 0, 0, len(data))
+            self.answer(stream_id, u, STATUS_GOOD, 0, 0, 0, len(data))
         else:
-            self.reply(stream_id, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x21, 0, 0)
+            self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x21, 0, 0)
 
     def process_drv_msg(self, stream_id: int, ptype: int, payload: bytes):
         if ptype == self.a314d.MSG_CONNECT:
