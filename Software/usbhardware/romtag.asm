@@ -2,9 +2,11 @@
 	XREF	_id_string
 	XREF	_auto_init_tables
 
-RTC_MATCHWORD:	equ	$4afc
-RTF_AUTOINIT:	equ	(1<<7)
-NT_DEVICE:	equ	3
+	incdir	"/opt/ndk32/Include_I"
+
+	include	exec/nodes.i
+	include	exec/resident.i
+
 VERSION:	equ	1
 PRIORITY:	equ	0
 
