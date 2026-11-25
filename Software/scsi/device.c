@@ -83,6 +83,8 @@ static UBYTE probe_medium(struct A314ScsiBase* base, struct Drive* d, BOOL* chan
         return MEDIUM_UNKNOWN;
     }
 
+    // A new medium can be a unit of another type, e.g. a CD image.
+    scsi_inquiry(base, d);
     d->flags &= ~DRVF_WRITEPROT;
     scsi_mode_sense_wp(base, d);
     d->flags |= DRVF_PRESENT;

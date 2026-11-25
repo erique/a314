@@ -46,8 +46,21 @@ ASC_MEDIUM_CHANGED = 0x28
 ASC_LUN_NOT_SUPPORTED = 0x25
 ASC_MEDIUM_NOT_PRESENT = 0x3A
 
+PDT_DISK = 0x00        # INQUIRY peripheral device types
+PDT_CDROM = 0x05
+
 OP_REQUEST_SENSE = 0x03
 OP_INQUIRY = 0x12
+OP_READ_TOC = 0x43
+
+# READ TOC: a CD image is one data track, then the lead-out.
+TOC_FORMAT_TOC = 0
+TOC_FORMAT_SESSION = 1
+TOC_MSF = 0x02              # CDB byte 1: addresses as minute/second/frame
+TOC_DATA_TRACK = 0x14       # ADR 1 (position), control 4 (data track)
+TOC_LEAD_OUT = 0xAA
+CD_FRAMES_PER_SECOND = 75
+CD_PREGAP_FRAMES = 150      # LBA 0 is at MSF 00:02:00
 
 # Fixed-format sense data, as REQUEST SENSE returns it.
 SENSE_RESPONSE_FIXED = 0x70
@@ -136,10 +149,11 @@ class DiskImage(object):
 # missing, removed or replaced at any time, and the unit then reports the
 # medium as not present, or once as changed (UNIT ATTENTION).
 class Unit(object):
-    def __init__(self, filename: str, writable: bool, block_size: int):
+    def __init__(self, filename: str, writable: bool, block_size: int, cdrom: bool):
         self.filename = filename
         self.writable = writable
         self.block_size = block_size
+        self.cdrom = cdrom
         self.image: Optional[DiskImage] = None
         self.ident = None           # identity of the hdf file behind image
         self.attention = False
@@ -199,18 +213,19 @@ class ScsiService(object):
 
         conf = {}
         for e in j.get('units', []):
-            conf[e['unit']] = (e['filename'], e.get('rw', False), e.get('block_size', 512))
+            cdrom = e.get('cdrom', False)
+            conf[e['unit']] = (e['filename'], e.get('rw', False) and not cdrom, e.get('block_size', 512), cdrom)
 
         changed = []
         for unit in list(self.units):
             u = self.units[unit]
-            if conf.get(unit) != (u.filename, u.writable, u.block_size):
+            if conf.get(unit) != (u.filename, u.writable, u.block_size, u.cdrom):
                 u.close()
                 del self.units[unit]
                 changed.append(unit)
-        for unit, (filename, rw, block_size) in conf.items():
+        for unit, (filename, rw, block_size, cdrom) in conf.items():
             if unit not in self.units:
-                self.units[unit] = Unit(filename, rw, block_size)
+                self.units[unit] = Unit(filename, rw, block_size, cdrom)
                 if unit not in changed:
                     changed.append(unit)
         self.check_media(changed)
@@ -228,9 +243,9 @@ class ScsiService(object):
 
     # --- SCSI CDB execution --------------------------------------------------
 
-    def inquiry_data(self, img: DiskImage) -> bytes:
+    def inquiry_data(self, u: Unit) -> bytes:
         d = bytearray(36)
-        d[0] = 0x00              # direct-access block device
+        d[0] = PDT_CDROM if u.cdrom else PDT_DISK
         d[1] = 0x80              # removable
         d[2] = 0x02              # SCSI-2
         d[3] = 0x02              # response data format
@@ -280,17 +295,46 @@ class ScsiService(object):
         header = bytes([3 + len(body), 0, wp, 0])
         return header + body
 
+    def toc_address(self, lba: int, msf: bool) -> bytes:
+        if not msf:
+            return struct.pack('>I', lba)
+        frames = lba + CD_PREGAP_FRAMES
+        seconds = frames // CD_FRAMES_PER_SECOND
+        return bytes([0, seconds // 60, seconds % 60, frames % CD_FRAMES_PER_SECOND])
+
+    # READ TOC formats 0 (tracks) and 1 (sessions); None for any other format.
+    def read_toc(self, img: DiskImage, cdb: bytes):
+        msf = bool(cdb[1] & TOC_MSF)
+        fmt = cdb[2] & 0x0F
+        track = cdb[6]
+        if fmt == TOC_FORMAT_TOC:
+            entries = []
+            if track <= 1:
+                entries.append((1, 0))
+            entries.append((TOC_LEAD_OUT, img.blocks))
+        elif fmt == TOC_FORMAT_SESSION:
+            entries = [(1, 0)]
+        else:
+            return None
+        body = b''.join(bytes([0, TOC_DATA_TRACK, t, 0]) + self.toc_address(lba, msf) for t, lba in entries)
+        # Header: TOC data length (the bytes after it), first and last track or session.
+        return struct.pack('>HBB', 2 + len(body), 1, 1) + body
+
     # Execute a device->host / no-data command, returning (status, sk, asc, ascq, data).
-    def exec_read(self, img: DiskImage, cdb: bytes, alloc: int):
+    def exec_read(self, u: Unit, img: DiskImage, cdb: bytes, alloc: int):
         op = cdb[0]
         if op == 0x00:                                   # TEST UNIT READY
             return (STATUS_GOOD, 0, 0, 0, b'')
         if op == 0x12:                                   # INQUIRY
-            return (STATUS_GOOD, 0, 0, 0, self.inquiry_data(img)[:alloc or 36])
+            return (STATUS_GOOD, 0, 0, 0, self.inquiry_data(u)[:alloc or 36])
         if op == 0x25:                                   # READ CAPACITY(10)
             return (STATUS_GOOD, 0, 0, 0, self.read_capacity10(img))
         if op == 0x1A:                                   # MODE SENSE(6)
             return (STATUS_GOOD, 0, 0, 0, self.mode_sense6(img, cdb)[:alloc or 255])
+        if op == OP_READ_TOC and u.cdrom:
+            toc = self.read_toc(img, cdb)
+            if toc is not None:
+                return (STATUS_GOOD, 0, 0, 0, toc[:alloc])
         if op == 0x35:                                   # SYNCHRONIZE CACHE(10)
             if not img.sync():
                 return (STATUS_CHECK_CONDITION, SENSE_MEDIUM_ERROR, ASC_WRITE_ERROR, 0, b'')
@@ -377,7 +421,7 @@ class ScsiService(object):
             self.a314d.send_read_mem_req(address, data_length)
             return
 
-        status, sk, asc, ascq, respdata = self.exec_read(img, cdb, data_length)
+        status, sk, asc, ascq, respdata = self.exec_read(u, img, cdb, data_length)
         self.complete(stream_id, u, direction, address, data_length, status, sk, asc, ascq, respdata)
 
     def process_write_mem_res(self):
