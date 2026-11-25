@@ -180,6 +180,18 @@ static void do_read_write(struct A314ScsiBase* base, struct Drive* d, struct IOS
         off_hi = ior->io_Actual; // TD64: high 32 bits of the byte offset
     }
 
+    ior->io_Actual = 0;
+    if ((off_lo | ior->io_Length) & (d->blocksize - 1))
+    {
+        ior->io_Error = IOERR_BADLENGTH;
+        return;
+    }
+    if (off_hi >> shift)
+    {
+        ior->io_Error = IOERR_BADADDRESS; // beyond a 32-bit LBA
+        return;
+    }
+
     // Byte offset (off_hi:off_lo) -> 32-bit LBA in block units (<= 2 TB).
     ULONG lba = (off_lo >> shift) | (shift ? (off_hi << (32 - shift)) : 0);
     ULONG blocks = ior->io_Length >> shift;
