@@ -348,7 +348,7 @@ static LONG a314_txn(struct A314ScsiBase* base, struct A314ScsiReq* req, struct 
     }
 }
 
-LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
+static LONG a314_scsi_once(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
 {
     struct A314ScsiReq req;
     struct A314ScsiRes res;
@@ -459,4 +459,85 @@ LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
     }
 
     return 0;
+}
+
+// A READ or WRITE larger than the bounce buffer goes out as READ(10)/WRITE(10)
+// commands of at most A314SCSI_MAX_XFER each.
+static BOOL is_read_write(UBYTE op)
+{
+    return op == SCSI_CMD_READ_6 || op == SCSI_CMD_WRITE_6 ||
+           op == SCSI_CMD_READ_10 || op == SCSI_CMD_WRITE_10;
+}
+
+static LONG a314_scsi_split(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
+{
+    const UBYTE* cdb = cmd->scsi_Command;
+    UBYTE op = cdb[0];
+
+    ULONG lba;
+    ULONG blocks;
+    if (op == SCSI_CMD_READ_6 || op == SCSI_CMD_WRITE_6)
+    {
+        lba = ((ULONG)(cdb[1] & SCSI_CDB6_LBA_MASK) << 16) | ((ULONG)cdb[2] << 8) | cdb[3];
+        blocks = cdb[4] ? cdb[4] : SCSI_CDB6_ZERO_BLOCKS;
+    }
+    else
+    {
+        lba = ((ULONG)cdb[2] << 24) | ((ULONG)cdb[3] << 16) | ((ULONG)cdb[4] << 8) | cdb[5];
+        blocks = ((ULONG)cdb[7] << 8) | cdb[8];
+    }
+
+    BOOL write = (op == SCSI_CMD_WRITE_6 || op == SCSI_CMD_WRITE_10);
+    UBYTE part_cdb[10];
+    memset(part_cdb, 0, sizeof(part_cdb));
+    part_cdb[0] = write ? SCSI_CMD_WRITE_10 : SCSI_CMD_READ_10;
+
+    struct SCSICmd part = *cmd;
+    part.scsi_Command = part_cdb;
+    part.scsi_CmdLength = sizeof(part_cdb);
+
+    UWORD shift = d->blockshift;
+    ULONG max_blocks = A314SCSI_MAX_XFER >> shift;
+    ULONG room = cmd->scsi_Length >> shift;
+    if (blocks > room)
+    {
+        blocks = room;
+    }
+
+    UBYTE* data = (UBYTE*)cmd->scsi_Data;
+    ULONG done = 0;
+    LONG err = 0;
+    while (blocks > 0 && err == 0)
+    {
+        ULONG n = (blocks > max_blocks) ? max_blocks : blocks;
+        part_cdb[2] = (UBYTE)(lba >> 24);
+        part_cdb[3] = (UBYTE)(lba >> 16);
+        part_cdb[4] = (UBYTE)(lba >> 8);
+        part_cdb[5] = (UBYTE)lba;
+        part_cdb[7] = (UBYTE)(n >> 8);
+        part_cdb[8] = (UBYTE)n;
+        part.scsi_Data = (UWORD*)(data + done);
+        part.scsi_Length = n << shift;
+
+        err = a314_scsi_once(base, d, &part);
+        done += part.scsi_Actual;
+
+        lba += n;
+        blocks -= n;
+    }
+
+    cmd->scsi_Actual = done;
+    cmd->scsi_Status = part.scsi_Status;
+    cmd->scsi_SenseActual = part.scsi_SenseActual;
+    return err;
+}
+
+LONG a314_scsi(struct A314ScsiBase* base, struct Drive* d, struct SCSICmd* cmd)
+{
+    if (cmd->scsi_Length > A314SCSI_MAX_XFER && d && cmd->scsi_CmdLength &&
+        is_read_write(cmd->scsi_Command[0]))
+    {
+        return a314_scsi_split(base, d, cmd);
+    }
+    return a314_scsi_once(base, d, cmd);
 }

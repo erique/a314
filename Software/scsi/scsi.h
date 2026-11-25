@@ -4,12 +4,18 @@
 // Command operation codes (CDB byte 0).
 #define SCSI_CMD_TEST_UNIT_READY 		0x00
 #define SCSI_CMD_REQUEST_SENSE 			0x03
+#define SCSI_CMD_READ_6 				0x08
+#define SCSI_CMD_WRITE_6 				0x0A
 #define SCSI_CMD_INQUIRY 				0x12
 #define SCSI_CMD_MODE_SENSE_6 			0x1A
 #define SCSI_CMD_READ_CAPACITY_10 		0x25
 #define SCSI_CMD_READ_10 				0x28
 #define SCSI_CMD_WRITE_10 				0x2A
 #define SCSI_CMD_SYNCHRONIZE_CACHE_10 	0x35
+
+// READ(6)/WRITE(6): a 21-bit LBA in bytes 1-3, the block count in byte 4.
+#define SCSI_CDB6_LBA_MASK 		0x1F // byte 1: the top bits of the LBA
+#define SCSI_CDB6_ZERO_BLOCKS 	256  // the block count a 0 in byte 4 means
 
 // INQUIRY standard data.
 #define SCSI_INQ_PDT_MASK 	0x1F // byte 0: peripheral device type
