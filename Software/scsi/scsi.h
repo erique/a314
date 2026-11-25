@@ -19,6 +19,7 @@
 
 // INQUIRY standard data.
 #define SCSI_INQ_PDT_MASK 	0x1F // byte 0: peripheral device type
+#define SCSI_PDT_CDROM 		0x05 // a CD-ROM drive
 #define SCSI_INQ_RMB 		0x80 // byte 1: removable medium bit
 
 // MODE SENSE(6).

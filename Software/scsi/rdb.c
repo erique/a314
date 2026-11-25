@@ -18,11 +18,22 @@
 #include <string.h>
 
 #include "a314scsi.h"
+#include "scsi.h"
 #include "kprintf.h"
 
 #define SysBase (*(struct ExecBase**)4)
 
 #define RDB_SCAN_LIMIT 16 // the RDB must live within the first 16 blocks
+
+// A CD image has no RDB: the whole disc is one partition for the CD
+// filesystem (DosType CD01) in FileSystem.resource.
+#define CD_DOSTYPE      0x43443031UL    // 'CD01'
+#define ISO_PVD_OFFSET  (16UL * 2048)   // byte offset of the ISO 9660 primary volume descriptor
+#define ISO_PVD_ID      "CD001"         // bytes 1-5 of the volume descriptor
+#define CD_BOOTPRI      (-10)           // below the usual hard disk partitions
+#define CD_BUFFERS      16
+#define CD_MAXTRANSFER  0x100000UL
+#define CD_MASK         0x7FFFFFFEUL
 
 #define FSE_PATCH_FIELDS ((offsetof(struct FileSysEntry, fse_GlobalVec) - offsetof(struct FileSysEntry, fse_Type)) / sizeof(ULONG) + 1)
 #define FSE_PATCH_MASK   ((1UL << FSE_PATCH_FIELDS) - 1)
@@ -142,7 +153,10 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
     return n;
 }
 
-static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct PartitionBlock* pb,
+// Add a partition to the MountList: its DosEnvec, its drive name as a BCPL
+// string, and whether it can be booted from.
+static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, const ULONG* env,
+                            const UBYTE* drive_name, BOOL bootable,
                             struct FileSysResource* fsr, struct ExpansionBase* expansion)
 {
     struct MountEntry* me = (struct MountEntry*)AllocMem(sizeof(struct MountEntry), MEMF_PUBLIC | MEMF_CLEAR);
@@ -151,7 +165,6 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
         return FALSE;
     }
 
-    const ULONG* env = (const ULONG*)pb->pb_Environment;
     ULONG env_longs = env[0] + 1; // de_TableSize + 1
     if (env_longs > 20)
     {
@@ -166,12 +179,12 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
         me->env_vec[0] = env_longs - 1;
 
     // Drive name (from the partition) and exec device name, as BCPL strings.
-    UBYTE dn_len = ((const UBYTE*)pb->pb_DriveName)[0];
+    UBYTE dn_len = drive_name[0];
     if (dn_len > 34)
     {
         dn_len = 34;
     }
-    set_bcpl(me->drive_name, (const char*)&pb->pb_DriveName[1], dn_len);
+    set_bcpl(me->drive_name, (const char*)&drive_name[1], dn_len);
     set_bcpl(me->exec_name, device_name, (UBYTE)strlen(device_name));
 
     me->fssm.fssm_Unit          = d->number * A314SCSI_UNIT_STEP;
@@ -212,7 +225,6 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, struct P
     }
 
     LONG bootpri = (LONG)env[DE_BOOTPRI];
-    BOOL bootable = (pb->pb_Flags & PBFF_BOOTABLE) ? TRUE : FALSE;
 
     me->boot_node.bn_Node.ln_Type   = NT_BOOTNODE;
     me->boot_node.bn_Node.ln_Pri    = bootable ? (BYTE)bootpri : -128;
@@ -242,7 +254,49 @@ void free_partition(struct DeviceNode* dn)
     FreeMem(dn, sizeof(struct MountEntry));
 }
 
-// Add the drive's RDB partitions to the MountList. TRUE if any were added.
+// Does the medium hold an ISO 9660 file system? buf takes one block.
+static BOOL is_iso9660(struct A314ScsiBase* base, struct Drive* d, UBYTE* buf)
+{
+    return read_block(base, d, ISO_PVD_OFFSET >> d->blockshift, buf)
+        && memcmp(buf + 1, ISO_PVD_ID, sizeof(ISO_PVD_ID) - 1) == 0;
+}
+
+// Add the disc as partition CD<unit>, bootable, if FileSystem.resource has a
+// CD filesystem to mount it with.
+static BOOL mount_cdrom(struct A314ScsiBase* base, struct Drive* d, struct ExpansionBase* expansion)
+{
+    struct FileSysResource* fsr = (struct FileSysResource*)OpenResource((STRPTR)FSRNAME);
+    Forbid();
+    BOOL have_fs = fsr && find_filesystem(fsr, CD_DOSTYPE);
+    Permit();
+    if (!have_fs)
+    {
+        kprintf("a314scsi: no CD filesystem for unit %ld\n", (ULONG)d->number);
+        return FALSE;
+    }
+
+    ULONG env[DE_DOSTYPE + 1];
+    memset(env, 0, sizeof(env));
+    env[DE_TABLESIZE]    = DE_DOSTYPE;
+    env[DE_SIZEBLOCK]    = d->blocksize / sizeof(ULONG);
+    env[DE_NUMHEADS]     = 1;
+    env[DE_SECSPERBLK]   = 1;
+    env[DE_BLKSPERTRACK] = 1;
+    env[DE_UPPERCYL]     = d->blocks - 1;
+    env[DE_NUMBUFFERS]   = CD_BUFFERS;
+    env[DE_BUFMEMTYPE]   = MEMF_PUBLIC;
+    env[DE_MAXTRANSFER]  = CD_MAXTRANSFER;
+    env[DE_MASK]         = CD_MASK;
+    env[DE_BOOTPRI]      = (ULONG)CD_BOOTPRI;
+    env[DE_DOSTYPE]      = CD_DOSTYPE;
+
+    UBYTE name[] = { 3, 'C', 'D', (UBYTE)('0' + d->number) };
+    kprintf("a314scsi: ISO 9660 on unit %ld\n", (ULONG)d->number);
+    return mount_partition(base, d, env, name, TRUE, fsr, expansion);
+}
+
+// Add the drive's partitions to the MountList: those in its RDB, or the
+// disc of a CD-ROM unit. TRUE if any were added.
 BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
 {
     BOOL added = FALSE;
@@ -323,7 +377,9 @@ BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
                 ULONG next = pb->pb_Next;
                 if (!(pb->pb_Flags & PBFF_NOMOUNT))
                 {
-                    if (mount_partition(base, d, pb, fsr, expansion))
+                    BOOL bootable = (pb->pb_Flags & PBFF_BOOTABLE) ? TRUE : FALSE;
+                    if (mount_partition(base, d, (const ULONG*)pb->pb_Environment,
+                                        (const UBYTE*)pb->pb_DriveName, bootable, fsr, expansion))
                     {
                         added = TRUE;
                     }
@@ -333,6 +389,16 @@ BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d)
             CloseLibrary((struct Library*)expansion);
         }
 
+        d->flags |= DRVF_MOUNTED;
+    }
+    else if (d->devtype == SCSI_PDT_CDROM && is_iso9660(base, d, buf))
+    {
+        struct ExpansionBase* expansion = (struct ExpansionBase*)OpenLibrary((STRPTR)EXPANSIONNAME, 0);
+        if (expansion)
+        {
+            added = mount_cdrom(base, d, expansion);
+            CloseLibrary((struct Library*)expansion);
+        }
         d->flags |= DRVF_MOUNTED;
     }
     else
