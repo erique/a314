@@ -42,6 +42,9 @@
 // Every unit is removable: the host's hdf can be removed or replaced.
 #define ALL_UNITS_MASK ((1UL << A314SCSI_MAX_DRIVES) - 1)
 
+// Longest BCPL drive name a partition gets, a suffix included.
+#define MAX_DRIVE_NAME 34
+
 // Drive flags.
 #define DRVF_PRESENT (1 << 0)
 #define DRVF_WRITEPROT (1 << 1)

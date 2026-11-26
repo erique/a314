@@ -25,7 +25,6 @@
 #define SysBase (*(struct ExecBase**)4)
 
 #define MAX_PENDING 16
-#define MAX_DRIVE_NAME 34   // longest BCPL drive name rdb.c stores
 
 // Is this DeviceNode one of ours (its exec device name == a314scsi.device)?
 static BOOL is_ours(struct DeviceNode* dn)

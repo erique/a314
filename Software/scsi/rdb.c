@@ -153,6 +153,66 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
     return n;
 }
 
+// Are these BCPL names the same? DOS names are compared without regard to case.
+static BOOL same_name(const char* a, const char* b)
+{
+    if (a[0] != b[0])
+    {
+        return FALSE;
+    }
+    for (UBYTE i = 1; i <= (UBYTE)a[0]; i++)
+    {
+        char ca = (a[i] >= 'a' && a[i] <= 'z') ? a[i] - ('a' - 'A') : a[i];
+        char cb = (b[i] >= 'a' && b[i] <= 'z') ? b[i] - ('a' - 'A') : b[i];
+        if (ca != cb)
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+// Does a BootNode on the MountList have this BCPL name? Call under Forbid.
+static BOOL boot_name_taken(struct ExpansionBase* expansion, const char* bname)
+{
+    for (struct Node* n = expansion->MountList.lh_Head; n->ln_Succ; n = n->ln_Succ)
+    {
+        struct DeviceNode* dn = (struct DeviceNode*)((struct BootNode*)n)->bn_DeviceNode;
+        if (dn && dn->dn_Name && same_name((const char*)BADDR(dn->dn_Name), bname))
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// DOS mounts the MountList's BootNodes at boot without checking their names,
+// so a name another BootNode has gets a suffix: "DH0" -> "DH0_1" .. "DH0_9".
+// Call under Forbid. FALSE: no free name.
+static BOOL unique_boot_name(struct ExpansionBase* expansion, char* bname)
+{
+    if (!boot_name_taken(expansion, bname))
+    {
+        return TRUE;
+    }
+    UBYTE len = bname[0];
+    if (len + 2 > MAX_DRIVE_NAME)
+    {
+        return FALSE;
+    }
+    bname[0] = len + 2;
+    bname[len + 1] = '_';
+    for (char c = '1'; c <= '9'; c++)
+    {
+        bname[len + 2] = c;
+        if (!boot_name_taken(expansion, bname))
+        {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 // Add a partition to the MountList: its DosEnvec, its drive name as a BCPL
 // string, and whether it can be booted from.
 static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, const ULONG* env,
@@ -180,9 +240,9 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, const UL
 
     // Drive name (from the partition) and exec device name, as BCPL strings.
     UBYTE dn_len = drive_name[0];
-    if (dn_len > 34)
+    if (dn_len > MAX_DRIVE_NAME)
     {
-        dn_len = 34;
+        dn_len = MAX_DRIVE_NAME;
     }
     set_bcpl(me->drive_name, (const char*)&drive_name[1], dn_len);
     set_bcpl(me->exec_name, device_name, (UBYTE)strlen(device_name));
@@ -233,10 +293,21 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, const UL
 
     kprintf("a314scsi: mount partition (bootpri=%ld bootable=%ld)\n", bootpri, (ULONG)bootable);
 
+    // Once DOS runs, the mount process renames against the DOS list instead.
     Forbid();
-    Enqueue(&expansion->MountList, &me->boot_node.bn_Node);
+    BOOL dosup = FindName(&SysBase->LibList, (STRPTR)DOSNAME) != NULL;
+    BOOL named = dosup || unique_boot_name(expansion, me->drive_name);
+    if (named)
+    {
+        Enqueue(&expansion->MountList, &me->boot_node.bn_Node);
+    }
     Permit();
-    return TRUE;
+    if (!named)
+    {
+        kprintf("a314scsi: no free name for a partition\n");
+        FreeMem(me, sizeof(struct MountEntry));
+    }
+    return named;
 }
 
 // Was this DeviceNode made by mount_partition()?
