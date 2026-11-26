@@ -24,8 +24,8 @@ CD image (ISO 9660) with `"block_size": 2048`.
 The images go in `~/a314hdfs`.
 
 Every unit is removable. `scsi.py` checks the images every two seconds: an
-hdf that is removed, copied in or replaced is seen by the Amiga as a disk
-change. After editing `scsi.conf`, reload it with
+hdf that is removed, copied in, replaced or overwritten is seen by the Amiga
+as a disk change. After editing `scsi.conf`, reload it with
 
     sudo pkill -HUP -f /opt/a314/scsi.py
 

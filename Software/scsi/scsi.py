@@ -145,6 +145,11 @@ class DiskImage(object):
         return True
 
 
+# What identifies an hdf: the file, its size and when it was last written.
+def stat_ident(st):
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 # A configured unit and the hdf in it. Every unit is removable: the hdf may be
 # missing, removed or replaced at any time, and the unit then reports the
 # medium as not present, or once as changed (UNIT ATTENTION).
@@ -161,8 +166,7 @@ class Unit(object):
 
     def file_ident(self):
         try:
-            st = os.stat(self.filename)
-            return (st.st_dev, st.st_ino, st.st_size)
+            return stat_ident(os.stat(self.filename))
         except OSError:
             return None
 
@@ -442,7 +446,12 @@ class ScsiService(object):
             self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x20, 0, 0)
             return
         lba, _ = self.rw_params(cdb)
+        # The write changes the hdf's mtime. Unless the hdf had changed
+        # already, it is still the same medium.
+        same = u.file_ident() == u.ident
         if img.write(lba, data):
+            if same:
+                u.ident = stat_ident(os.fstat(img.f.fileno()))
             self.answer(stream_id, u, STATUS_GOOD, 0, 0, 0, len(data))
         else:
             self.answer(stream_id, u, STATUS_CHECK_CONDITION, SENSE_ILLEGAL_REQUEST, 0x21, 0, 0)
