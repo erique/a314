@@ -87,6 +87,10 @@ class DiskImage(object):
             self.f = open(self.filename, 'r+b' if self.writable else 'rb', buffering=0)
             self.f.seek(0, 2)
             self.blocks = self.f.tell() // self.block_size
+            if self.blocks == 0:
+                logger.info('No medium: %s is smaller than one block', self.filename)
+                self.close()
+                return False
             self._compute_geometry()
             logger.info('Opened %s: %d blocks x %d bytes (%dc/%dh/%ds)%s',
                         self.filename, self.blocks, self.block_size,
