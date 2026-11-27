@@ -400,7 +400,7 @@ static BOOL dos_running(void)
 
 // Bring a unit up to date with its medium. A unit seen for the first time is
 // discovered. TRUE if the mount process has work: partitions were added to
-// the MountList, or the unit is held ejected.
+// the MountList, or the unit is held.
 static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
 {
     UBYTE bit = 1 << number;
@@ -437,20 +437,18 @@ static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
     d->flags &= ~DRVF_MOUNTED;
 
     // Once DOS runs, a new medium is an eject followed by an insert: the
-    // filesystems see no medium until the mount process has retired the DOS
-    // devices it doesn't have, and inserts it (see mount_boot_nodes).
-    BOOL hold = now && dos_running();
+    // filesystems see no medium until the mount process has inhibited the
+    // unit's DOS devices, retired those the medium doesn't have, and inserts
+    // it (see mount_boot_nodes). A removed medium goes to the mount process
+    // too, for filesystems that notice a change only when inhibited.
+    BOOL hold = dos_running();
     Forbid();
-    d->ejected = hold;
+    d->ejected = now && hold;
     base->heldunits &= ~bit;
     Permit();
     notify_change(d);
-    if (!now)
-    {
-        return FALSE;
-    }
 
-    BOOL added = mount_drive(base, d);
+    BOOL added = now && mount_drive(base, d);
     if (hold)
     {
         Forbid();

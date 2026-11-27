@@ -41,7 +41,8 @@ LoadModule), it mounts them at boot, and a partition with a boot priority can
 be booted from.
 
 When a disk changes, the partitions of the new disk are mounted, and those
-the new disk doesn't have are removed. A partition still in use, by an open
+the new disk doesn't have are removed. Every filesystem sees the change, also
+one such as PFS3 that treats a partition as fixed. A partition still in use, by an open
 file or a shell's current directory, stays but can't be used until a later
 disk has it again, or until it is no longer in use when the disk changes
 again. A DOS name already in use gets a suffix: `DH0` becomes `DH0_1`.

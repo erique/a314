@@ -122,8 +122,9 @@ struct A314ScsiBase
     // Held while partitions are taken from the MountList and mounted
     struct SignalSemaphore  mountsem;
 
-    // Ejected units whose new partitions are all on the MountList, for the
-    // mount process to sort out and insert
+    // Changed units whose DOS devices the mount process sorts out: an ejected
+    // unit once its new partitions are all on the MountList, or a unit whose
+    // medium was removed
     UBYTE                   heldunits;
 
     // DOS devices the mount process left inhibited: their partition is not on

@@ -158,7 +158,7 @@ static WORD parked_slot(struct A314ScsiBase* base, struct DeviceNode* dn)
 }
 
 // Remove a DOS device of ours whose partition the unit's new medium doesn't
-// have. A running handler is inhibited and asked to quit. One that is still
+// have. Its handler, inhibited already, is asked to quit. One that is still
 // in use, or won't quit, keeps its device and stays inhibited (parked), so it
 // can't take the new medium.
 static void retire_device(struct Library* DOSBase, struct A314ScsiBase* base, struct DeviceNode* dn)
@@ -174,27 +174,14 @@ static void retire_device(struct Library* DOSBase, struct A314ScsiBase* base, st
     // name, so looking the device up by name could find the volume instead.
     struct MsgPort* port = dn->dn_Task;
     WORD slot = parked_slot(base, dn);
-    if (port)
+    if (port && (handler_in_use(DOSBase, port) || !DoPkt(port, ACTION_DIE, 0, 0, 0, 0, 0)))
     {
-        if (slot < 0)
+        if (slot < 0 && (slot = parked_slot(base, NULL)) >= 0)
         {
-            if (!DoPkt(port, ACTION_INHIBIT, DOSTRUE, 0, 0, 0, 0))
-            {
-                kprintf("a314scsi: %s stays, not inhibited\n", name);
-                return;
-            }
-            // Let Workbench and others let go of the volume that just went away.
-            Delay(TICKS_PER_SECOND);
+            base->parked[slot] = dn;
         }
-        if (handler_in_use(DOSBase, port) || !DoPkt(port, ACTION_DIE, 0, 0, 0, 0, 0))
-        {
-            if (slot < 0 && (slot = parked_slot(base, NULL)) >= 0)
-            {
-                base->parked[slot] = dn;
-            }
-            kprintf("a314scsi: %s stays inhibited, its handler is in use or won't quit\n", name);
-            return;
-        }
+        kprintf("a314scsi: %s stays inhibited, its handler is in use or won't quit\n", name);
+        return;
     }
     if (slot >= 0)
     {
@@ -202,10 +189,12 @@ static void retire_device(struct Library* DOSBase, struct A314ScsiBase* base, st
     }
 
     struct DosList* dl = LockDosList(LDF_DEVICES | LDF_WRITE);
-    BOOL removed = on_dos_list(DOSBase, dl, dn) && dn->dn_Task == port && RemDosEntry((struct DosList*)dn);
+    // A handler may remove its device itself when it quits.
+    BOOL listed = on_dos_list(DOSBase, dl, dn);
+    BOOL removed = listed && dn->dn_Task == port && RemDosEntry((struct DosList*)dn);
     UnLockDosList(LDF_DEVICES | LDF_WRITE);
 
-    kprintf("a314scsi: %s %s\n", name, removed ? "retired" : "stays");
+    kprintf("a314scsi: %s %s\n", name, removed || !listed ? "retired" : "stays");
 
     // A handler that quit may still be finishing with its DeviceNode, so only
     // a node whose handler never ran is freed.
@@ -215,16 +204,19 @@ static void retire_device(struct Library* DOSBase, struct A314ScsiBase* base, st
     }
 }
 
-// Retire our DOS devices on the held units whose partitions, under the same
-// name, are not on the new media. A parked device whose partition is back is
-// uninhibited.
-static void retire_orphans(struct Library* DOSBase, struct A314ScsiBase* base, UBYTE held,
-                           struct DeviceNode** pending, UWORD count)
+// Inhibit our DOS devices on the held units, so that every filesystem lets go
+// of the old medium, also one that ignores change interrupts. Those whose
+// partitions, under the same name, are not on the unit's new medium are
+// retired; a unit whose medium was removed keeps its devices. The handlers to
+// uninhibit once the media are inserted go to release, a parked one whose
+// partition is back among them. Returns how many.
+static UWORD retire_orphans(struct Library* DOSBase, struct A314ScsiBase* base, UBYTE held, UBYTE newmedia,
+                            struct DeviceNode** pending, UWORD count, struct MsgPort** release)
 {
-    struct DeviceNode* orphans[MAX_PENDING];
-    struct DeviceNode* back[MAX_PARKED];
+    struct DeviceNode* devs[MAX_PENDING];
+    BOOL kept[MAX_PENDING];
+    BOOL fresh[MAX_PENDING];
     UWORD n = 0;
-    UWORD nback = 0;
 
     struct DosList* dl = LockDosList(LDF_DEVICES | LDF_READ);
     while (n < MAX_PENDING && (dl = NextDosEntry(dl, LDF_DEVICES)))
@@ -236,32 +228,60 @@ static void retire_orphans(struct Library* DOSBase, struct A314ScsiBase* base, U
             continue;
         }
 
-        BOOL kept = FALSE;
-        for (UWORD i = 0; i < count && !kept; i++)
+        fresh[n] = (newmedia & (1 << d->number)) != 0;
+        kept[n] = !fresh[n];
+        for (UWORD i = 0; i < count && !kept[n]; i++)
         {
-            kept = same_name((const char*)BADDR(dn->dn_Name), (const char*)BADDR(pending[i]->dn_Name)) &&
-                   same_partition(dl, pending[i]);
+            kept[n] = same_name((const char*)BADDR(dn->dn_Name), (const char*)BADDR(pending[i]->dn_Name)) &&
+                      same_partition(dl, pending[i]);
         }
-        if (!kept)
-        {
-            orphans[n++] = dn;
-        }
-        else if (dn->dn_Task && parked_slot(base, dn) >= 0)
-        {
-            back[nback++] = dn;
-        }
+        devs[n++] = dn;
     }
     UnLockDosList(LDF_DEVICES | LDF_READ);
 
-    for (UWORD i = 0; i < nback; i++)
-    {
-        base->parked[parked_slot(base, back[i])] = NULL;
-        DoPkt(back[i]->dn_Task, ACTION_INHIBIT, DOSFALSE, 0, 0, 0, 0);
-    }
+    UWORD nrelease = 0;
+    UWORD nretire = 0;
     for (UWORD i = 0; i < n; i++)
     {
-        retire_device(DOSBase, base, orphans[i]);
+        struct MsgPort* port = devs[i]->dn_Task;
+        WORD slot = parked_slot(base, devs[i]);
+        if (slot >= 0)
+        {
+            // Parked, so inhibited already. It comes back with its partition.
+            if (kept[i] && fresh[i])
+            {
+                base->parked[slot] = NULL;
+                if (port)
+                {
+                    release[nrelease++] = port;
+                }
+            }
+        }
+        else if (port && !DoPkt(port, ACTION_INHIBIT, DOSTRUE, 0, 0, 0, 0))
+        {
+            kprintf("a314scsi: %b: stays, not inhibited\n", devs[i]->dn_Name);
+            continue;
+        }
+        else if (port && kept[i])
+        {
+            release[nrelease++] = port;
+        }
+        if (!kept[i])
+        {
+            devs[nretire++] = devs[i];
+        }
     }
+
+    if (nretire)
+    {
+        // Let Workbench and others let go of the volumes that just went away.
+        Delay(TICKS_PER_SECOND);
+    }
+    for (UWORD i = 0; i < nretire; i++)
+    {
+        retire_device(DOSBase, base, devs[i]);
+    }
+    return nrelease;
 }
 
 int memcmp(const void* a, const void* b, size_t n)
@@ -292,9 +312,11 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
 
     struct List* ml = &((struct ExpansionBase*)ExpansionBase)->MountList;
 
-    // A held unit is taken with its partitions. Those of a unit that is
-    // ejected but not held yet are still being read, and are left.
+    // A held unit is taken with its partitions; one with a new medium is
+    // ejected. Those of a unit that is ejected but not held yet are still
+    // being read, and are left.
     ULONG heldcount[A314SCSI_MAX_DRIVES];
+    UBYTE newmedia = 0;
     Forbid();
     UBYTE held = base->heldunits;
     base->heldunits = 0;
@@ -303,6 +325,10 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
         if (held & (1 << u))
         {
             heldcount[u] = base->drives[u]->changecount;
+            if (base->drives[u]->ejected)
+            {
+                newmedia |= 1 << u;
+            }
         }
     }
     struct Node* n = ml->lh_Head;
@@ -343,11 +369,13 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
     count = current;
 
     // A DOS device whose partition, under the same name, is on the new medium
-    // is kept: its filesystem takes the medium when it is inserted. Another
-    // device with the same name gets the partition renamed.
+    // is kept: it is uninhibited once the medium is inserted, and reads it.
+    // Another device with the same name gets the partition renamed.
+    struct MsgPort* release[MAX_PENDING];
+    UWORD nrelease = 0;
     if (DOSBase)
     {
-        retire_orphans(DOSBase, base, held, pending, count);
+        nrelease = retire_orphans(DOSBase, base, held, newmedia, pending, count, release);
     }
     for (UWORD u = 0; u < A314SCSI_MAX_DRIVES; u++)
     {
@@ -355,6 +383,10 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base)
         {
             insert_medium(base->drives[u], heldcount[u]);
         }
+    }
+    for (UWORD i = 0; i < nrelease; i++)
+    {
+        DoPkt(release[i], ACTION_INHIBIT, DOSFALSE, 0, 0, 0, 0);
     }
 
     UWORD added = 0;
