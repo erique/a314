@@ -46,6 +46,8 @@ struct MountEntry
     char            drive_name[36];  // BCPL string
     char            exec_name[24];   // BCPL string
     struct BootNode boot_node;
+    struct Drive*   drive;
+    ULONG           changecount;     // the drive's, when the partition was read
 };
 
 static ULONG sum_block(const ULONG* p, ULONG longs)
@@ -154,7 +156,7 @@ static ULONG load_filesystems(struct A314ScsiBase* base, struct Drive* d, ULONG 
 }
 
 // Are these BCPL names the same? DOS names are compared without regard to case.
-static BOOL same_name(const char* a, const char* b)
+BOOL same_name(const char* a, const char* b)
 {
     if (a[0] != b[0])
     {
@@ -247,6 +249,9 @@ static BOOL mount_partition(struct A314ScsiBase* base, struct Drive* d, const UL
     set_bcpl(me->drive_name, (const char*)&drive_name[1], dn_len);
     set_bcpl(me->exec_name, device_name, (UBYTE)strlen(device_name));
 
+    me->drive = d;
+    me->changecount = d->changecount;
+
     me->fssm.fssm_Unit          = d->number * A314SCSI_UNIT_STEP;
     me->fssm.fssm_Device        = MKBADDR(me->exec_name);
     me->fssm.fssm_Environ       = MKBADDR(me->env_vec);
@@ -323,6 +328,19 @@ BOOL is_mount_entry(struct DeviceNode* dn)
 void free_partition(struct DeviceNode* dn)
 {
     FreeMem(dn, sizeof(struct MountEntry));
+}
+
+// The drive of a DeviceNode made by mount_partition(), or NULL.
+struct Drive* partition_drive(struct DeviceNode* dn)
+{
+    return is_mount_entry(dn) ? ((struct MountEntry*)dn)->drive : NULL;
+}
+
+// Was the partition read from its drive's current medium?
+BOOL partition_current(struct DeviceNode* dn)
+{
+    struct MountEntry* me = (struct MountEntry*)dn;
+    return me->changecount == me->drive->changecount;
 }
 
 // Does the medium hold an ISO 9660 file system? buf takes one block.

@@ -280,6 +280,12 @@ static BOOL device_query(struct IOStdReq* ior)
     return TRUE;
 }
 
+// Is there a medium for filesystems? A held one is not (see check_unit).
+static BOOL medium_in(struct Drive* d)
+{
+    return d && (d->flags & DRVF_PRESENT) && !d->ejected;
+}
+
 static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
 {
     struct Drive* d = (struct Drive*)ior->io_Unit;
@@ -300,7 +306,7 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
         case CMD_READ:
         case TD_READ64:
         case NSCMD_TD_READ64:
-            if (!d || !(d->flags & DRVF_PRESENT))
+            if (!medium_in(d))
             {
                 ior->io_Error = TDERR_DiskChanged;
             }
@@ -314,7 +320,7 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
         case TD_FORMAT:
         case TD_WRITE64:
         case NSCMD_TD_WRITE64:
-            if (!d || !(d->flags & DRVF_PRESENT))
+            if (!medium_in(d))
             {
                 ior->io_Error = TDERR_DiskChanged;
             }
@@ -344,7 +350,7 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
             {
                 ior->io_Error = IOERR_BADLENGTH;
             }
-            else if (d && (d->flags & DRVF_PRESENT))
+            else if (medium_in(d))
             {
                 get_geometry(d, ior);
             }
@@ -370,9 +376,8 @@ static void process_request(struct A314ScsiBase* base, struct IOStdReq* ior)
 // Tell everyone who asked (TD_ADDCHANGEINT, TD_REMOVE) that the medium changed.
 static void notify_change(struct Drive* d)
 {
-    d->changecount++;
-
     Forbid();
+    d->changecount++;
     for (struct MinNode* n = d->changeints.mlh_Head; n->mln_Succ; n = n->mln_Succ)
     {
         struct IOStdReq* ior = (struct IOStdReq*)n;
@@ -385,8 +390,17 @@ static void notify_change(struct Drive* d)
     Permit();
 }
 
+static BOOL dos_running(void)
+{
+    Forbid();
+    BOOL up = FindName(&SysBase->LibList, (STRPTR)DOSNAME) != NULL;
+    Permit();
+    return up;
+}
+
 // Bring a unit up to date with its medium. A unit seen for the first time is
-// discovered. TRUE if partitions were added to the MountList.
+// discovered. TRUE if the mount process has work: partitions were added to
+// the MountList, or the unit is held ejected.
 static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
 {
     UBYTE bit = 1 << number;
@@ -421,8 +435,42 @@ static BOOL check_unit(struct A314ScsiBase* base, UWORD number)
 
     kprintf("a314scsi: unit %ld medium %s\n", (ULONG)number, now ? "changed" : "removed");
     d->flags &= ~DRVF_MOUNTED;
+
+    // Once DOS runs, a new medium is an eject followed by an insert: the
+    // filesystems see no medium until the mount process has retired the DOS
+    // devices it doesn't have, and inserts it (see mount_boot_nodes).
+    BOOL hold = now && dos_running();
+    Forbid();
+    d->ejected = hold;
+    base->heldunits &= ~bit;
+    Permit();
     notify_change(d);
-    return now && mount_drive(base, d);
+    if (!now)
+    {
+        return FALSE;
+    }
+
+    BOOL added = mount_drive(base, d);
+    if (hold)
+    {
+        Forbid();
+        base->heldunits |= bit;
+        Permit();
+    }
+    return added || hold;
+}
+
+// Show the filesystems the medium a unit was held ejected for, unless the
+// unit has changed again since changecount was read.
+void insert_medium(struct Drive* d, ULONG changecount)
+{
+    Forbid();
+    if (d->ejected && d->changecount == changecount)
+    {
+        d->ejected = FALSE;
+        notify_change(d);
+    }
+    Permit();
 }
 
 // Entry of the process that mounts partitions found after DOS is running.
@@ -445,20 +493,17 @@ static void mounter(void)
 
 // Drives found before DOS runs are mounted by DOS at boot, from the MountList.
 // Once DOS runs, nothing reads the MountList, so a process mounts them.
-static void start_mounter(void)
+static BOOL start_mounter(void)
 {
-    Forbid();
-    BOOL dosup = FindName(&SysBase->LibList, (STRPTR)DOSNAME) != NULL;
-    Permit();
-    if (!dosup)
+    if (!dos_running())
     {
-        return;
+        return FALSE;
     }
 
     struct Library* DOSBase = OpenLibrary((STRPTR)DOSNAME, 36);
     if (!DOSBase)
     {
-        return;
+        return FALSE;
     }
 
     // Everything a process would take from its parent is given, as the io
@@ -479,12 +524,14 @@ static void start_mounter(void)
         { NP_CopyVars,      FALSE },
         { TAG_DONE,         0 },
     };
-    if (!CreateNewProc(tags))
+    BOOL started = CreateNewProc(tags) != NULL;
+    if (!started)
     {
         kprintf("a314scsi: CreateNewProc FAILED\n");
     }
 
     CloseLibrary(DOSBase);
+    return started;
 }
 
 static void start_rescan_timer(struct A314ScsiBase* base)
@@ -513,9 +560,19 @@ static void process_changes(struct A314ScsiBase* base)
             }
         }
     }
-    if (mounted)
+    if (mounted && !start_mounter())
     {
-        start_mounter();
+        // Without a mount process, the held units get their media now.
+        Forbid();
+        for (UWORD unit = 0; unit < A314SCSI_MAX_DRIVES; unit++)
+        {
+            if (base->heldunits & (1 << unit))
+            {
+                insert_medium(base->drives[unit], base->drives[unit]->changecount);
+            }
+        }
+        base->heldunits = 0;
+        Permit();
     }
 }
 
@@ -659,7 +716,7 @@ static void begin_io(__reg("a6") struct A314ScsiBase* base,
         case TD_CHANGESTATE:
         {
             struct Drive* d = (struct Drive*)ior->io_Unit;
-            ior->io_Actual = (d && (d->flags & DRVF_PRESENT)) ? 0 : 1;
+            ior->io_Actual = medium_in(d) ? 0 : 1;
             break;
         }
 

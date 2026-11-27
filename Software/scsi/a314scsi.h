@@ -45,6 +45,9 @@
 // Longest BCPL drive name a partition gets, a suffix included.
 #define MAX_DRIVE_NAME 34
 
+// Most DOS devices left inhibited at a time (see retire_device in cli.c).
+#define MAX_PARKED 8
+
 // Drive flags.
 #define DRVF_PRESENT (1 << 0)
 #define DRVF_WRITEPROT (1 << 1)
@@ -72,6 +75,7 @@ struct Drive
 
     // Medium changes (TD_CHANGENUM, TD_ADDCHANGEINT, TD_REMOVE)
     ULONG           changecount;
+    UBYTE           ejected;        // the medium is hidden from filesystems (see check_unit)
     struct MinList  changeints;     // TD_ADDCHANGEINT requests, io_Data = Interrupt
     struct MinList  removeints;     // TD_REMOVE, struct RemoveInt
 };
@@ -118,6 +122,14 @@ struct A314ScsiBase
     // Held while partitions are taken from the MountList and mounted
     struct SignalSemaphore  mountsem;
 
+    // Ejected units whose new partitions are all on the MountList, for the
+    // mount process to sort out and insert
+    UBYTE                   heldunits;
+
+    // DOS devices the mount process left inhibited: their partition is not on
+    // the unit's medium, but they are still in use
+    struct DeviceNode*      parked[MAX_PARKED];
+
     // io-task startup handshake back to init_device
     struct Task*            inittask;
     ULONG                   initsig;
@@ -131,6 +143,7 @@ extern UBYTE diag_area[];
 extern const char device_name[];
 struct Drive* find_drive(struct A314ScsiBase* base, UWORD number);
 struct Drive* make_drive(struct A314ScsiBase* base, UWORD number);
+void insert_medium(struct Drive* d, ULONG changecount);
 
 // scsicmd.c
 LONG scsi_test_ready(struct A314ScsiBase* base, struct Drive* d);
@@ -153,6 +166,9 @@ void mount_boot_nodes(struct Library* ExpansionBase, struct A314ScsiBase* base);
 BOOL mount_drive(struct A314ScsiBase* base, struct Drive* d);
 BOOL is_mount_entry(struct DeviceNode* dn);
 void free_partition(struct DeviceNode* dn);
+struct Drive* partition_drive(struct DeviceNode* dn);
+BOOL partition_current(struct DeviceNode* dn);
+BOOL same_name(const char* a, const char* b);
 
 // lseg.c
 BPTR load_seglist(struct A314ScsiBase* base, struct Drive* d, ULONG first_block);
